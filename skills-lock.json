@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "help-me-understand": {
+      "source": "jehudarajasa/skills",
+      "sourceType": "github",
+      "skillPath": "plugins/agency-skills/skills/help-me-understand/SKILL.md",
+      "computedHash": "664fe1bd85d9dd5694d08f530a54d8e54daa2f55abf320f980530c703a23f290"
+    }
+  }
+}
