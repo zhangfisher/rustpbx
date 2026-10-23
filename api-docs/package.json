@@ -1,0 +1,15 @@
+{
+  "name": "rustpbx-docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "RustPBX 文档：指南 + REST/AMI API 参考 (VitePress)",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}

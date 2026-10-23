@@ -1,0 +1,9 @@
+node_modules/
+.vitepress/dist/
+.vitepress/cache/
+*.log
+
+# 根 .gitignore 全局忽略了 *.md 与 package-lock.json，
+# 但文档站的 Markdown 源文件与依赖锁（CI npm ci 需要）必须入库，此处定向重新包含
+!*.md
+!package-lock.json
