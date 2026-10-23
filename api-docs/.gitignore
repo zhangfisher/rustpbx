@@ -3,7 +3,9 @@ node_modules/
 .vitepress/cache/
 *.log
 
-# 根 .gitignore 全局忽略了 *.md 与 package-lock.json，
-# 但文档站的 Markdown 源文件与依赖锁（CI npm ci 需要）必须入库，此处定向重新包含
+# 根 .gitignore 全局忽略了 *.md、package-lock.json 与任意名为 config/ 的目录，
+# 但文档站的 Markdown 源文件、依赖锁（CI npm ci 需要）与 config/ 章节必须入库，
+# 此处定向重新包含（目录被排除时需先恢复目录本身，内部文件才能被 !*.md 恢复）
+!config/
 !*.md
 !package-lock.json
