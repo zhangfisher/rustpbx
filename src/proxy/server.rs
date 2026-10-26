@@ -939,11 +939,25 @@ impl SipServerBuilder {
             .with_option(endpoint_option)
             .with_transport_layer(transport_layer);
 
+        let database = self.database.clone();
+
+        let data_context = if let Some(ref context) = self.data_context {
+            context.clone()
+        } else {
+            let dc = Arc::new(
+                ProxyDataContext::new(self.config.clone(), database.clone())
+                    .await
+                    .map_err(|err| anyhow!("failed to initialize proxy data context: {err}"))?,
+            );
+            self.data_context = Some(dc.clone());
+            dc
+        };
+
         let advertised_methods = Arc::new(OnceLock::new());
         let mut inspectors: Vec<Box<dyn MessageInspector>> = self.message_inspectors;
-        if self.config.nat_fix {
-            inspectors.insert(0, Box::new(super::nat::NatInspector::new()));
-        }
+        // Always installed: trunks may enable `nat_fix` even when the global
+        // switch is off. The data context keeps its trunk list current.
+        inspectors.insert(0, Box::new(data_context.nat_inspector().clone()));
         inspectors.push(Box::new(
             super::capability_headers::CapabilityHeadersInspector::new(advertised_methods.clone()),
         ));
@@ -1051,19 +1065,6 @@ impl SipServerBuilder {
         }
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
-        let database = self.database.clone();
-
-        let data_context = if let Some(ref context) = self.data_context {
-            context.clone()
-        } else {
-            let dc = Arc::new(
-                ProxyDataContext::new(self.config.clone(), database.clone())
-                    .await
-                    .map_err(|err| anyhow!("failed to initialize proxy data context: {err}"))?,
-            );
-            self.data_context = Some(dc.clone());
-            dc
-        };
         // Wire up the SIP endpoint for trunk registration BEFORE reconciling,
         // so trunks with register_enabled=true are registered on startup.
         data_context
@@ -2334,17 +2335,23 @@ impl SipServerInner {
     /// (`all` / `whitelist` / `blacklist` / `x_only`); a trunk without the
     /// config forwards no custom headers (legacy behaviour).
     ///
-    /// `trunk_dest_hint` is the `dest` string of the trunk the route table
-    /// actually selected (`OutboundTrunkContext.dest`), which is preferred
-    /// over matching `callee_uri` host:port against the trunk list.
+    /// `routed_trunk` is the name of the trunk the route table selected
+    /// (`OutboundTrunkContext.name`): its rule applies directly. Legs that
+    /// reach a trunk without a route (app/queue/transfer) fall back to
+    /// matching `callee_uri` host:port against the trunk list.
     pub async fn header_passthrough_for(
         &self,
         target: &crate::call::Location,
         callee_is_same_realm: bool,
         callee_uri: &rsipstack::sip::Uri,
-        trunk_dest_hint: Option<&str>,
+        routed_trunk: Option<&str>,
     ) -> Option<crate::proxy::routing::HeaderPassthrough> {
-        use crate::proxy::routing::{HeaderPassthrough, find_trunk_by_dest, trunk_dest_host_port};
+        use crate::proxy::routing::{HeaderPassthrough, find_trunk_by_dest};
+
+        let trunks = self.data_context.trunks_snapshot();
+        if let Some(name) = routed_trunk {
+            return trunks.get(name).and_then(|trunk| trunk.header_passthrough.clone());
+        }
 
         let internal =
             callee_is_same_realm || target.registered_aor.is_some() || target.home_proxy.is_some();
@@ -2352,16 +2359,9 @@ impl SipServerInner {
             return Some(HeaderPassthrough::all());
         }
 
-        let trunks = self.data_context.trunks_snapshot();
-        let matched = trunk_dest_hint
-            .and_then(trunk_dest_host_port)
-            .and_then(|(host, port)| find_trunk_by_dest(&trunks, &host, port))
-            .or_else(|| {
-                let host = callee_uri.host().to_string();
-                let port = callee_uri.host_with_port.port.map(|p| p.0).unwrap_or(5060);
-                find_trunk_by_dest(&trunks, &host, port)
-            });
-        matched.and_then(|trunk| trunk.header_passthrough.clone())
+        let host = callee_uri.host().to_string();
+        let port = callee_uri.host_with_port.port.map(|p| p.0).unwrap_or(5060);
+        find_trunk_by_dest(&trunks, &host, port).and_then(|trunk| trunk.header_passthrough.clone())
     }
 }
 
