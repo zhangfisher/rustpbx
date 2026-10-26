@@ -16,6 +16,12 @@ mod test_media_e2e;
 #[path = "proxy_e2e/test_early_media_sdp_change_regression.rs"]
 mod test_early_media_sdp_change_regression;
 
+#[path = "proxy_e2e/test_p_early_media_e2e.rs"]
+mod test_p_early_media_e2e;
+
+#[path = "proxy_e2e/test_header_passthrough_e2e.rs"]
+mod test_header_passthrough_e2e;
+
 #[path = "proxy_e2e/test_inbound_refer.rs"]
 mod test_inbound_refer;
 
@@ -63,3 +69,6 @@ mod test_voicemail_fallback_e2e;
 
 #[path = "proxy_e2e/test_ivr_transfer_handoff_e2e.rs"]
 mod test_ivr_transfer_handoff_e2e;
+
+#[path = "proxy_e2e/test_trunk_nat_fix_e2e.rs"]
+mod test_trunk_nat_fix_e2e;
