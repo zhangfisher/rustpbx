@@ -28,12 +28,14 @@
 | 命令 | 关键 params | 说明 |
 |---|---|---|
 | `call.originate` | `destination`、`caller_id`、`timeout_secs`、`extra_headers`、`trunk`、`route_originated_calls`、`record` | 主动外呼 |
-| `call.answer` | `session_id` | 接听 |
-| `call.reject` | `session_id`、`status` | 拒接 |
-| `call.ring` | `session_id` | 振铃指示 |
-| `call.hangup` | `session_id` | 挂断 |
-| `call.bridge` / `call.unbridge` | `session_id`（+ `leg_id`） | 桥接 / 拆桥 |
-| `call.leg_add` / `call.leg_remove` | `session_id` | 多腿管理 |
+| `call.answer` | `call_id` | 接听 |
+| `call.reject` | `call_id`、`reason`（`busy` / `decline` / `unavailable` / `reject`，映射 486 / 603 / 480 / 403，缺省 603） | 拒接 |
+| `call.ring` | `call_id` | 振铃指示 |
+| `call.hangup` | `call_id`、`reason`、`code` | 挂断 |
+| `call.bridge` / `call.unbridge` | `call_id`（bridge 另有 `leg_a` / `leg_b`） | 桥接 / 拆桥 |
+| `call.leg_add` / `call.leg_remove` | `call_id` | 多腿管理 |
+
+`call_id` 传 Call-ID 或 `session_id` 均可（活动通话注册表两者都索引）。
 
 `call.originate` 的三个重要参数：
 
@@ -56,13 +58,15 @@
 
 ## 转接
 
-| 命令 | 说明 |
-|---|---|
-| `call.transfer` | 盲转（target 为目标 URI） |
-| `call.transfer.attended` | 咨询转接（先建立咨询腿） |
-| `call.transfer.complete` | 完成咨询转接 |
-| `call.transfer.cancel` | 取消咨询腿 |
-| `call.transfer.replace` | Replaces 语义替换（席位替换 / 出席转接） |
+| 命令 | 关键 params | 说明 |
+|---|---|---|
+| `call.transfer` | `call_id`、`target` | 盲转（SIP REFER，失败自动回退 B2BUA 转接） |
+| `call.transfer.attended` | `call_id`、`target` | 咨询转接（先建立咨询腿，响应返回 `consultation_call_id`） |
+| `call.transfer.complete` | `call_id`、`consultation_call_id` | 完成咨询转接 |
+| `call.transfer.cancel` | `consultation_call_id` | 取消咨询腿 |
+| `call.transfer.replace` | `call_id`、`target` | Replaces 语义替换（席位替换 / 出席转接） |
+
+详见 [呼叫转移](/development/call-transfer)。
 
 ## 保持与媒体
 
@@ -100,13 +104,15 @@
 
 ## 监听与强插（Supervisor）
 
-| 命令 | 说明 |
-|---|---|
-| `supervisor.listen` | 静默监听（坐席与客户无感知） |
-| `supervisor.whisper` | 耳语（只有坐席听到主管） |
-| `supervisor.barge` | 强插（三方都听到） |
-| `supervisor.takeover` | 接管通话 |
-| `supervisor.stop` | 结束旁路会话 |
+| 命令 | 关键 params | 说明 |
+|---|---|---|
+| `supervisor.listen` | `supervisor_call_id`、`target_call_id` | 静默监听（坐席与客户无感知） |
+| `supervisor.whisper` | 同上（+ 可选 `agent_leg`） | 耳语（只有坐席听到主管） |
+| `supervisor.barge` | 同上（+ 可选 `agent_leg`） | 强插（三方都听到） |
+| `supervisor.takeover` | `supervisor_call_id`、`target_call_id` | 接管通话（顶替坐席，坐席腿被挂断） |
+| `supervisor.stop` | `supervisor_call_id`、`target_call_id` | 结束旁路会话 |
+
+`supervisor_call_id` 必须是主管已建立的活动呼叫。详见 [监听与督导](/development/monitoring)。
 
 ## 会议
 
