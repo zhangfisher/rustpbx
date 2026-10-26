@@ -18,9 +18,13 @@ RustPBX 本身不含业务逻辑——呼叫怎么路由、振铃给谁、什么
 |---|---|
 | [同振](/development/simultaneous-ring) | 一个呼叫同时振铃多个终端，先接者赢 |
 | [顺振](/development/sequential-ring) | 按优先级逐个拨打，失败自动换下一个 |
-| [三方通话](/development/three-way) | 把两通通话合成三方混音（MCU） |
+| [呼叫转移](/development/call-transfer) | 分机前转（来电 / 遇忙 / 异常转移）与通话中转接（盲转 / 咨询转 / 替换转 / DTMF 热键） |
+| [监听与督导](/development/monitoring) | 监听 / 耳语 / 强插 / 接管：主管介入坐席通话 |
+| [多方会议](/development/conference-room) | N 人会议房间：SIP 拨入与 RWI 建房拉人（三方通话 = 三人会议） |
 | [录音录像](/development/recording) | 按需开启 / 分段录音，把录音送到你的存储 |
 | [DTMF 响应](/development/dtmf-response) | 收到用户按键后执行你的业务逻辑 |
+| [黑白名单](/development/call-screening) | 黑名单拒接 / 白名单放行：呼叫拦截的三个时机 |
+| [呼叫中心](/development/call-center) | 排队、坐席分配与技能组（ACD）调度 |
 
 ## 开发前准备
 
