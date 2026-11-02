@@ -56,8 +56,24 @@ pub struct EventCallContext {
     /// Queue (or skill-group queue label) the call is being served by, when any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_id: Option<String>,
+    /// Transfer-flow origin — present only from the moment a transfer
+    /// intent stashed it on the call meta (blind/REFER transfer start,
+    /// consult leg dial, conference merge). Lets consumers tell transfer
+    /// legs apart from ordinary call flow on ANY call-scoped event, not
+    /// just `call_transferred`. Absent when the call has no transfer
+    /// context (default none). An explicit `transfer_source` on the event
+    /// itself (e.g. `call_transferred`) always wins over this enrichment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_source: Option<crate::rwi::event::TransferSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<RootCallInfo>,
+    /// Addon-contributed typed event sections (top-level key → JSON),
+    /// refreshed at the emission choke point from the session/leg
+    /// extensions bags and merged into every call-scoped event payload.
+    /// Never serialized as part of the context itself — [`merge_event_context`]
+    /// folds each section under its reserved key.
+    #[serde(skip)]
+    pub sections: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Type alias for RWI event sender (used by the cc addon's agent event fanout).
@@ -90,13 +106,26 @@ pub struct CallMeta {
     /// `None` for calls without CC agent participation.
     pub agent_id: Option<String>,
     pub agent_name: Option<String>,
+    /// Preallocated agent-stage recording identity retained through terminal event dispatch.
+    pub recording_id: Option<String>,
     pub queue_id: Option<String>,
     pub root: Option<RootCallInfo>,
     /// Flow-origin snapshot captured when a transfer starts on the session
     /// (which IVR/node or queue the call was in, or the transferring agent).
-    /// Consumed by transfer events only — deliberately NOT mapped into
-    /// [`EventCallContext`] so ordinary call events stay unchanged.
+    /// Mapped into [`EventCallContext`] so EVERY call-scoped event dispatched
+    /// after the stash carries it — consumers distinguish transfer-flow legs
+    /// (blind target, consult, conference merge) from ordinary call flow on
+    /// any event, not just the transfer events.
     pub transfer_source: Option<crate::rwi::event::TransferSource>,
+    /// Departing stage identity captured before target attribution or stage cleanup.
+    pub transfer_recording_id: Option<String>,
+    /// Addon typed sections mirrored from the session extensions bag at the
+    /// emission choke point (see [`EventCallContext::sections`]).
+    pub sections: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Per-leg typed sections keyed by leg id — merged only into event
+    /// payloads that carry the matching `leg_id`.
+    pub leg_sections:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
 impl From<CallMeta> for EventCallContext {
@@ -114,7 +143,9 @@ impl From<CallMeta> for EventCallContext {
             agent_id: m.agent_id,
             agent_name: m.agent_name,
             queue_id: m.queue_id,
+            transfer_source: m.transfer_source,
             root: m.root,
+            sections: m.sections,
         }
     }
 }
@@ -142,6 +173,15 @@ impl CallMetaStore {
     /// Whether live call meta exists for `call_id`.
     pub fn contains_key(&self, call_id: &str) -> bool {
         self.store.contains_key(call_id)
+    }
+
+    /// Whether a local call still consumes this session's business context.
+    pub(crate) fn uses_user_data(&self, session_id: &str) -> bool {
+        self.contains_key(session_id)
+            || self
+                .store
+                .iter()
+                .any(|entry| entry.session_id.as_deref() == Some(session_id))
     }
 
     pub fn remove(&self, call_id: &str) {

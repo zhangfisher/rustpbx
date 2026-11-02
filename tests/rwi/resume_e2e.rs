@@ -36,6 +36,8 @@ async fn test_full_session_resume_flow() {
             gw.fan_out(
                 "resume-test",
                 &rustpbx::rwi::CallCreated {
+                    leg_id: None,
+                    leg_role: None,
                     call_id: "resume-call-1".to_string(),
                     context: "resume-test".to_string(),
                     caller: "sip:alice@test.com".to_string(),
@@ -59,14 +61,16 @@ async fn test_full_session_resume_flow() {
                     early_media: false,
                     agent_id: None,
                     agent_name: None,
-                },
+                    leg_role: None,
+},
             );
             gw.fan_out(
                 "resume-test",
                 &rustpbx::rwi::CallAnswered {
                     leg_id: None,
                     call_id: "resume-call-1".to_string(),
-                },
+                    leg_role: None,
+},
             );
         }
 
@@ -139,24 +143,26 @@ async fn test_call_resume_filters_by_call_id() {
         // Call A events
         gw.cache_event(
             &"call-a".to_string(),
-            &rustpbx::rwi::event::to_legacy_event(
+            &rustpbx::rwi::event::RwiEvent::from_spec(
                 &rustpbx::rwi::CallRinging {
                     leg_id: None,
                     call_id: "call-a".to_string(),
                     early_media: false,
                     agent_id: None,
                     agent_name: None,
-                },
+                    leg_role: None,
+},
                 None,
             ),
         );
         gw.cache_event(
             &"call-a".to_string(),
-            &rustpbx::rwi::event::to_legacy_event(
+            &rustpbx::rwi::event::RwiEvent::from_spec(
                 &rustpbx::rwi::CallAnswered {
                     leg_id: None,
                     call_id: "call-a".to_string(),
-                },
+                    leg_role: None,
+},
                 None,
             ),
         );
@@ -164,20 +170,21 @@ async fn test_call_resume_filters_by_call_id() {
         // Call B events
         gw.cache_event(
             &"call-b".to_string(),
-            &rustpbx::rwi::event::to_legacy_event(
+            &rustpbx::rwi::event::RwiEvent::from_spec(
                 &rustpbx::rwi::CallRinging {
                     leg_id: None,
                     call_id: "call-b".to_string(),
                     early_media: false,
                     agent_id: None,
                     agent_name: None,
-                },
+                    leg_role: None,
+},
                 None,
             ),
         );
         gw.cache_event(
             &"call-b".to_string(),
-            &rustpbx::rwi::event::to_legacy_event(
+            &rustpbx::rwi::event::RwiEvent::from_spec(
                 &rustpbx::rwi::CallBridged {
                     leg_a: "call-b".to_string(),
                     leg_b: "call-c".to_string(),
