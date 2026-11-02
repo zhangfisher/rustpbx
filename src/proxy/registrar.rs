@@ -13,6 +13,14 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+const RESPONSE_HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolve addon-owned response headers before committing a registration.
+#[async_trait]
+pub trait RegistrationResponseHook: Send + Sync {
+    async fn headers(&self, username: &str) -> Result<Vec<Header>>;
+}
+
 #[derive(Clone)]
 pub struct RegistrarModule {
     server: SipServerRef,
@@ -501,6 +509,27 @@ impl ProxyModule for RegistrarModule {
             return Ok(ProxyAction::Abort);
         }
 
+        let mut response_headers = if let Some(hook) = &self.server.registration_response_hook {
+            match tokio::time::timeout(
+                RESPONSE_HEADERS_TIMEOUT,
+                hook.headers(registered_aor.user().unwrap_or_default()),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+            {
+                Ok(headers) => headers,
+                Err(error) => {
+                    info!(key = %tx.key, %error, "Registration response headers unavailable");
+                    metrics::sip::registration_failed(&realm, "storage_error");
+                    tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable).await?;
+                    return Ok(ProxyAction::Abort);
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         let wildcard_count = contact_entries.iter().filter(|c| c.is_wildcard()).count();
         if wildcard_count > 0 {
             if wildcard_count > 1 || contact_entries.len() > 1 {
@@ -545,8 +574,7 @@ impl ProxyModule for RegistrarModule {
             }
             drop(event_guard);
 
-            let headers = Vec::new();
-            tx.reply_with(rsipstack::sip::StatusCode::OK, headers, None)
+            tx.reply_with(rsipstack::sip::StatusCode::OK, response_headers, None)
                 .await
                 .ok();
             return Ok(ProxyAction::Abort);
@@ -562,7 +590,6 @@ impl ProxyModule for RegistrarModule {
             .max_registrar_expires
             .unwrap_or(50);
 
-        let mut response_headers = Vec::new();
         let mut max_contact_expires = 0u32;
         for entry in contact_entries {
             let expires = entry
@@ -654,6 +681,24 @@ impl ProxyModule for RegistrarModule {
             }
 
             let _event_guard = self.server.locator_event_lock.lock().await;
+            // An existing identity keeps its business presence when renewing
+            // or adding a Contact; only a new registration starts a login.
+            let is_refresh = if location.expires == 0 {
+                false
+            } else {
+                match self.server.locator
+                    .has_active_bindings(user.username.as_str(), user.realm.as_deref())
+                    .await
+                {
+                    Ok(active) => active,
+                    Err(e) => {
+                        info!("failed to verify registration bindings: {:?}", e);
+                        metrics::sip::registration_failed(&realm, "storage_error");
+                        tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable).await.ok();
+                        return Ok(ProxyAction::Abort);
+                    }
+                }
+            };
             match self
                 .server
                 .locator
@@ -679,7 +724,12 @@ impl ProxyModule for RegistrarModule {
                                     .ok();
                             }
                         } else {
-                            locator_events.send(LocatorEvent::Registered(location)).ok();
+                            let event = if is_refresh {
+                                LocatorEvent::Refreshed(location)
+                            } else {
+                                LocatorEvent::Registered(location)
+                            };
+                            locator_events.send(event).ok();
                         }
                     }
                 }

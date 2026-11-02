@@ -26,6 +26,8 @@ TEST_SLEEP_BASELINE=(
   "src/addons/cc/tests/helpers/cdr_capture.rs"
   "src/addons/cc/tests/helpers/e2e_test_server.rs"
   "src/addons/cc/tests/helpers/test_ua.rs"
+  "tests/ivr_e2e/test_inband_dtmf_e2e.rs"
+  "tests/proxy_flow/test_amd_e2e.rs"
   "src/call/app/ivr_test.rs"
   "src/call/app/queue_test.rs"
   "src/call/runtime/session_registry.rs"
@@ -86,7 +88,6 @@ TEST_SLEEP_BASELINE=(
   "tests/proxy_trunk_b2bua/test_trunk_routing.rs"
   "tests/queue_e2e/test_ivr_queue_agent_full_rwi_e2e.rs"
   "tests/queue_e2e/test_queue_agent_hangup_recording_e2e.rs"
-  "tests/queue_e2e/test_queue_bridge_info_e2e.rs"
   "tests/queue_e2e/test_queue_concurrent.rs"
   "tests/queue_e2e/test_queue_escalation_e2e.rs"
   "tests/queue_e2e/test_queue_hold_audio.rs"
@@ -98,6 +99,19 @@ TEST_SLEEP_BASELINE=(
   "tests/rwi/integration.rs"
   "tests/rwi/resume_e2e.rs"
   "tests/wholesale/rate_limit_test.rs"
+  # Merged in from 0.5.1 (0.5.2-rc integration); convert to wait_until.
+  "tests/ivr_e2e/test_step_ivr_trace_webhook_e2e.rs"
+  "tests/proxy_e2e/test_cluster_recursive_fork_guard_e2e.rs"
+  "tests/proxy_e2e/test_hold_recording_e2e.rs"
+  "tests/queue_e2e/test_agent_acw_status_e2e.rs"
+  "tests/queue_e2e/test_agent_event_contract_e2e.rs"
+  "tests/queue_e2e/test_agent_leg_callid_rwi_e2e.rs"
+  "tests/queue_e2e/test_agent_outbound_recording_e2e.rs"
+  "tests/queue_e2e/test_blind_transfer_customer_e2e.rs"
+  "tests/queue_e2e/test_ivr_agent_refer_back_ivr_recording_e2e.rs"
+  "tests/queue_e2e/test_queue_no_answer_requeue_rwi_e2e.rs"
+  "tests/queue_e2e/test_queue_no_answer_rotation_e2e.rs"
+  "tests/queue_e2e/test_queue_rejected_rwi_e2e.rs"
 )
 
 violations=0

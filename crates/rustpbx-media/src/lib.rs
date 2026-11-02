@@ -5,9 +5,11 @@
 
 pub mod app_ingress;
 pub mod audio_source;
+pub mod amd;
 pub mod conference_mixer;
 pub mod dtmf;
 pub mod egress;
+pub mod inband_dtmf;
 pub mod ingress_tap;
 pub mod leg;
 pub mod leg_id;
@@ -15,16 +17,21 @@ pub mod leg_stats;
 pub mod media_bridge;
 pub mod media_health;
 pub mod media_recorder;
-pub mod media_stream;
 pub mod mixer;
 pub mod negotiate;
+pub mod pcm_analysis_tap;
+pub mod quality_stats;
 pub mod recorder;
 pub mod rtc_track;
 pub mod rtp_track_builder;
 pub mod telemetry;
 pub mod telephone_event;
+pub mod volume_stats;
 pub mod wav_reader;
 pub mod wav_writer;
+
+// Test/synthesis helper: the DTMF dual-tone generator (record-common).
+pub use rustpbx_record_common::dtmf::DtmfGenerator;
 
 #[cfg(test)]
 mod media_track_tests;
@@ -37,11 +44,32 @@ pub use audio_codec::CodecType;
 pub use conference_mixer::ConferenceAudioMixer;
 
 pub use leg_id::LegId;
-pub use media_stream::{MediaStream, MediaStreamBuilder};
+pub use leg::{CaptureRoute, LegConfig};
 pub use mixer::AudioMixer;
 pub use negotiate::{CodecInfo, MediaNegotiator};
 pub use rtc_track::RtcTrack;
 pub use rtp_track_builder::RtpTrackBuilder;
+
+/// Create a media leg handle from a simplified [`LegConfig`].
+///
+/// The single construction seam for code outside this crate: callers never
+/// name [`leg::LegInner`] nor touch tap internals, keeping the constructor
+/// free to evolve (transports, pooling, capture wiring) without churn at
+/// the call layer. `recorder_sender` wires the leg's RTP tap into the
+/// call-scoped recording task; `route` picks the initial capture layout
+/// (classic caller layout vs. starts-fully-off for non-owner legs).
+pub fn create_leg(
+    id: impl Into<String>,
+    cfg: &LegConfig,
+    recorder_sender: Option<media_recorder::RecorderSender>,
+    route: CaptureRoute,
+) -> anyhow::Result<leg::Leg> {
+    let leg = leg::LegInner::new(id, cfg, recorder_sender)?;
+    if route == CaptureRoute::Deferred {
+        leg.ingress_tap().set_capture_route(None, None);
+    }
+    Ok(leg)
+}
 
 // ── Shared utility types ────────────────────────────────────────────
 

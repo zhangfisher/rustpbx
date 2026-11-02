@@ -82,6 +82,7 @@ pub struct SipServerInner {
     pub database: Option<DatabaseConnection>,
     pub user_backend: Box<dyn UserBackend>,
     pub auth_backend: Vec<Box<dyn AuthBackend>>,
+    pub registration_response_hook: Option<Arc<dyn super::registrar::RegistrationResponseHook>>,
     pub call_router: Option<Box<dyn CallRouter>>,
     pub dialplan_inspectors: Arc<
         parking_lot::RwLock<
@@ -190,6 +191,7 @@ pub struct SipServerBuilder {
     http_client: Option<reqwest::Client>,
     user_backend: Option<Box<dyn UserBackend>>,
     auth_backend: Vec<Box<dyn AuthBackend>>,
+    registration_response_hook: Option<Arc<dyn super::registrar::RegistrationResponseHook>>,
     call_router: Option<Box<dyn CallRouter>>,
     module_fns: HashMap<String, FnCreateProxyModule>,
     locator: Option<Box<dyn Locator>>,
@@ -250,6 +252,7 @@ impl SipServerBuilder {
             http_client: None,
             user_backend: None,
             auth_backend: Vec::new(),
+            registration_response_hook: None,
             call_router: None,
             module_fns: HashMap::new(),
             locator: None,
@@ -282,11 +285,6 @@ impl SipServerBuilder {
             trunk_health: None,
             session_hooks: Vec::new(),
         }
-    }
-
-    pub fn with_trunk_health(mut self, health: crate::proxy::trunk_health::HealthStateMap) -> Self {
-        self.trunk_health = Some(health);
-        self
     }
 
     pub fn with_cluster_peers(mut self, peers: Vec<SocketAddr>) -> Self {
@@ -342,18 +340,16 @@ impl SipServerBuilder {
         self
     }
 
-    pub fn with_ignore_out_of_dialog_request(mut self, ignore: bool) -> Self {
-        self.ignore_out_of_dialog_request = ignore;
-        self
-    }
-
     pub fn with_auth_backend(mut self, auth_backend: Box<dyn AuthBackend>) -> Self {
         self.auth_backend.push(auth_backend);
         self
     }
 
-    pub fn with_call_router(mut self, call_router: Box<dyn CallRouter>) -> Self {
-        self.call_router = Some(call_router);
+    pub fn with_registration_response_hook(
+        mut self,
+        hook: Arc<dyn super::registrar::RegistrationResponseHook>,
+    ) -> Self {
+        self.registration_response_hook = Some(hook);
         self
     }
 
@@ -442,21 +438,6 @@ impl SipServerBuilder {
 
     pub fn with_database_connection(mut self, db: DatabaseConnection) -> Self {
         self.database = Some(db);
-        self
-    }
-
-    pub fn with_data_context(mut self, context: Arc<ProxyDataContext>) -> Self {
-        self.data_context = Some(context);
-        self
-    }
-
-    pub fn with_locator_events(mut self, locator_events: Option<LocatorEventSender>) -> Self {
-        self.locator_events = locator_events;
-        self
-    }
-
-    pub fn with_frequency_limiter(mut self, limiter: Arc<dyn FrequencyLimiter>) -> Self {
-        self.frequency_limiter = Some(limiter);
         self
     }
 
@@ -922,8 +903,34 @@ impl SipServerBuilder {
 
         let mut endpoint_option = EndpointOption {
             callid_suffix: config.callid_suffix.clone(),
+            // RFC 7044: advertise `Supported: histinfo` when History-Info
+            // rendering is enabled so peers include their hi-entries.
+            history_info_enabled: config.history_info,
             ..Default::default()
         };
+
+        // Seed the global session-id generator from config. Invalid lengths
+        // are clamped into the legal band (defaults keep the legacy 32-hex
+        // behaviour when the keys are absent).
+        let session_id_length = crate::call::session_id::init_settings(
+            config.session_id_length,
+            config.session_id_header_mode,
+            config.session_id_inherit_callid,
+        );
+        if session_id_length != config.session_id_length {
+            warn!(
+                configured = config.session_id_length,
+                effective = session_id_length,
+                "proxy.session_id_length out of range, clamped"
+            );
+        } else if session_id_length != crate::call::session_id::LENGTH_MAX {
+            info!(
+                length = session_id_length,
+                mode = ?config.session_id_header_mode,
+                inherit_callid = config.session_id_inherit_callid,
+                "session id generator configured"
+            );
+        }
 
         if let Some(t1_timer) = config.t1_timer {
             endpoint_option.t1 = Duration::from_millis(t1_timer);
@@ -1061,6 +1068,7 @@ impl SipServerBuilder {
                 ArcSwap::new(Arc::new(self.config.media_proxy)),
                 self.config.enable_latching,
                 self.config.latching_probation_max_packets,
+                data_context.clone(),
             )));
         }
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
@@ -1076,7 +1084,10 @@ impl SipServerBuilder {
         }
 
         let active_call_registry = Arc::new(ActiveProxyCallRegistry::new());
-        let presence_manager = Arc::new(PresenceManager::new(database.clone()));
+        let presence_manager = Arc::new(
+            PresenceManager::new(database.clone())
+                .with_registration_guard(locator.clone(), locator_event_lock.clone()),
+        );
         presence_manager.load_from_db().await.ok();
 
         // Create cluster event hub for local event dispatch.
@@ -1114,13 +1125,14 @@ impl SipServerBuilder {
             let locator_event_lock_for_sweep = locator_event_lock.clone();
             let sweep_token = cancel_token.child_token();
             tokio::spawn(async move {
-                // Run roughly every quarter of the shortest typical registrar
+                // Run at a cadence below the shortest typical registrar
                 // expiry (the server caps Contact expiry at ~50s, see
-                // registrar.rs `max_registrar_expires`). 15s gives us <1 expiry
-                // interval of latency between the binding technically expiring
-                // and the agent being marked offline.
-                const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-                let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+                // registrar.rs `max_registrar_expires`); config-driven
+                // (default 15s) so e2e can shrink expiry-related waits.
+                let sweep_interval = std::time::Duration::from_secs(
+                    config.clamped_locator_sweep_secs() as u64,
+                );
+                let mut ticker = tokio::time::interval(sweep_interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the immediate first tick — there is nothing to sweep
                 // right after boot and we don't want to log a noisy "swept 0"
@@ -1138,8 +1150,12 @@ impl SipServerBuilder {
                                         count = removed.len(),
                                         "locator swept expired registrations"
                                     );
-                                    let _ = locator_events_for_sweep
-                                        .send(LocatorEvent::Offline(removed));
+                                    let _ = locator_events_for_sweep.send(
+                                        LocatorEvent::Offline(
+                                            removed,
+                                            crate::proxy::locator::LocatorOfflineReason::Expired,
+                                        ),
+                                    );
                                 }
                                 Ok(_) => {}
                                 Err(e) => warn!(error = %e, "locator sweep failed"),
@@ -1212,7 +1228,7 @@ impl SipServerBuilder {
                     // protection).  Harmless for a noop registry (no-op).
                     let live_ids_registry = active_call_registry.clone();
                     let live_call_ids: crate::call::runtime::LiveCallIdsFn =
-                        Arc::new(move || live_ids_registry.session_ids());
+                        Arc::new(move || live_ids_registry.live_call_ids());
                     let heartbeat_task = crate::call::runtime::NodeHeartbeat::spawn(
                         registry.clone(),
                         node_id,
@@ -1247,6 +1263,7 @@ impl SipServerBuilder {
             database: database.clone(),
             user_backend,
             auth_backend,
+            registration_response_hook: self.registration_response_hook,
             call_router,
             locator: locator.clone(),
             callrecord_sender: self.callrecord_sender,
@@ -1523,14 +1540,6 @@ impl SipServer {
         self.inner.clone()
     }
 
-    pub fn get_modules(&self) -> impl Iterator<Item = &Box<dyn ProxyModule>> {
-        self.modules.iter()
-    }
-
-    pub fn get_cancel_token(&self) -> CancellationToken {
-        self.inner.cancel_token.clone()
-    }
-
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {
         while let Some(mut tx) = incoming.recv().await {
             crate::metrics::transaction::received();
@@ -1546,16 +1555,20 @@ impl SipServer {
 
             let runnings_tx = self.inner.runnings_tx.clone();
 
-            let source_ip = tx
+            let remote_addr = tx
                 .connection
                 .as_ref()
-                .and_then(|conn| conn.get_remote_addr())
-                .and_then(crate::proxy::routing::source_addr_ip);
-            let source_transport = tx
-                .connection
-                .as_ref()
-                .and_then(|conn| conn.get_remote_addr())
-                .and_then(|addr| addr.r#type);
+                .and_then(|conn| conn.get_remote_addr());
+            let source_ip = remote_addr.and_then(crate::proxy::routing::source_addr_ip);
+            let source_transport = remote_addr.and_then(|addr| addr.r#type);
+            // Log-friendly "ip:port" / transport strings: Display formatting
+            // keeps the noisy `Some(...)` Debug wrappers out of the logs.
+            let source_addr = remote_addr
+                .map(|addr| addr.addr.to_string())
+                .unwrap_or_default();
+            let source_transport_str = source_transport
+                .map(|transport| transport.to_string())
+                .unwrap_or_default();
 
             if let Some(max_concurrency) = self.inner.proxy_config.load().max_concurrency
                 && runnings_tx.load(Ordering::Relaxed) >= max_concurrency
@@ -1593,7 +1606,7 @@ impl SipServer {
                     crate::metrics::transaction::rejected("shutting_down");
                     warn!(
                         key = %tx.key,
-                        method = ?tx.original.method,
+                        method = %tx.original.method,
                         "draining: rejecting out-of-dialog request"
                     );
                     tx.reply(code).await.ok();
@@ -1656,7 +1669,7 @@ impl SipServer {
                             false
                         };
                         if from_websocket || is_trunk || from_trusted_proxy {
-                            info!(key = %tx.key, via_ip = %via_ip_str, ?source_ip, ?source_transport, "responding 200 OK to connectivity OPTIONS");
+                            info!(key = %tx.key, via_ip = %via_ip_str, source = %source_addr, transport = %source_transport_str, "responding 200 OK to connectivity OPTIONS");
                             tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
                             continue;
                         }
@@ -1683,13 +1696,17 @@ impl SipServer {
                 let guard = token.clone().drop_guard();
                 select! {
                     r = Self::process_transaction(token.clone(), modules, cookie.clone(),  &mut tx) => {
-                        let final_status = tx.last_response.as_ref().map(|r| r.status_code());
+                        let final_status = tx
+                            .last_response
+                            .as_ref()
+                            .map(|r| r.status_code().code().to_string())
+                            .unwrap_or_default();
                         match r {
                             Ok(_) => {
-                                debug!(key = %tx.key, ?source_ip, ?final_status, "transaction processed in {:?}", start_time.elapsed());
+                                debug!(key = %tx.key, source = %source_addr, final_status = %final_status, "transaction processed in {:?}", start_time.elapsed());
                             },
                             Err(e) => {
-                                warn!(key = %tx.key, ?source_ip, ?final_status, "failed to process transaction: {} in {:?}", e, start_time.elapsed());
+                                warn!(key = %tx.key, source = %source_addr, final_status = %final_status, "failed to process transaction: {} in {:?}", e, start_time.elapsed());
                             }
                         }
                     }
@@ -1980,6 +1997,9 @@ impl SipServerInner {
             .with_relay_ready_timeout_secs(rtp.relay_ready_timeout_secs)
             .with_stall_detect_secs(rtp.stall_detect_secs)
             .with_media_trace_interval_secs(rtp.media_trace_interval_secs)
+            .with_quality_stats(rtp.quality_stats.clone())
+            .with_volume_stats(rtp.volume_stats.clone())
+            .with_inband_dtmf(rtp.inband_dtmf)
     }
 
     /// Hot-reload the full `[proxy]` section plus related platform settings
@@ -2100,6 +2120,21 @@ impl SipServerInner {
         }
         if old.queue_hold_music != new_proxy.queue_hold_music {
             parts.push("queue_hold_music".to_string());
+        }
+        if old.queue_transfer_prompt_enabled != new_proxy.queue_transfer_prompt_enabled {
+            parts.push("queue_transfer_prompt_enabled".to_string());
+        }
+        if old.queue_comfort_prompt_enabled != new_proxy.queue_comfort_prompt_enabled {
+            parts.push("queue_comfort_prompt_enabled".to_string());
+        }
+        if old.queue_busy_prompt_enabled != new_proxy.queue_busy_prompt_enabled {
+            parts.push("queue_busy_prompt_enabled".to_string());
+        }
+        if old.queue_agent_ringback_enabled != new_proxy.queue_agent_ringback_enabled {
+            parts.push("queue_agent_ringback_enabled".to_string());
+        }
+        if old.queue_no_answer_prompt_enabled != new_proxy.queue_no_answer_prompt_enabled {
+            parts.push("queue_no_answer_prompt_enabled".to_string());
         }
         if old.voicemail_greeting != new_proxy.voicemail_greeting {
             parts.push("voicemail_greeting".to_string());
@@ -2385,11 +2420,7 @@ fn resolve_cluster_self_addr_with_interfaces(
     local_addr_strs: &[String],
     interface_ips: &std::collections::HashSet<String>,
 ) -> Option<SipAddr> {
-    let matched = peers.iter().find(|p| {
-        let peer_sip_addr = format!("{}:{}", p.addr, p.sip_port);
-        local_addr_strs.iter().any(|la| la == &peer_sip_addr)
-    });
-    let matched = match matched {
+    let matched = match crate::config::match_self_peer_by_listeners(peers, local_addr_strs) {
         Some(peer) => peer,
         None => {
             let wildcard = local_addr_strs.iter().any(|la| {
@@ -2399,7 +2430,7 @@ fn resolve_cluster_self_addr_with_interfaces(
             if !wildcard {
                 return None;
             }
-            peers.iter().find(|p| interface_ips.contains(&p.addr))?
+            crate::config::match_self_peer_by_interfaces(peers, interface_ips)?
         }
     };
     let peer_sip_addr = format!("{}:{}", matched.addr, matched.sip_port);
