@@ -539,9 +539,7 @@ async fn match_invite_impl(
                             }
                         }
 
-                        apply_trunk_config(&mut option, trunk_config)?;
-                        merge_trunk_media_hints(&mut hints, trunk_config);
-                        attach_outbound_trunk_metadata(&mut hints, &selected_trunk, trunk_config);
+                        stamp_trunk(&mut option, &mut hints, &selected_trunk, trunk_config)?;
                         info!(
                             "Selected trunk: {} for destination: {}",
                             selected_trunk, trunk_config.dest
@@ -716,13 +714,7 @@ async fn match_invite_impl(
                                     ));
                                 }
                             }
-                            apply_trunk_config(&mut option, trunk_config)?;
-                            merge_trunk_media_hints(&mut hints, trunk_config);
-                            attach_outbound_trunk_metadata(
-                                &mut hints,
-                                &selected_trunk,
-                                trunk_config,
-                            );
+                            stamp_trunk(&mut option, &mut hints, &selected_trunk, trunk_config)?;
                         }
                     }
                 }
@@ -1173,7 +1165,11 @@ fn describe_rewrite_ops(rewrite: &crate::proxy::routing::RewriteRules) -> Vec<St
     push("request_uri.host", &rewrite.request_uri_host);
     push("request_uri.port", &rewrite.request_uri_port);
 
-    for header in rewrite.headers.keys() {
+    // HashMap iteration order is randomized per process; sort so that
+    // cluster consistency checks and UI display get a stable order.
+    let mut header_keys: Vec<&String> = rewrite.headers.keys().collect();
+    header_keys.sort();
+    for header in header_keys {
         ops.push(header.to_string());
     }
 
@@ -1453,6 +1449,22 @@ fn select_trunk_weighted(
     Ok(trunks[trunks.len() - 1].clone())
 }
 
+/// Dial through `trunk`: its next hop, credentials and rewrites on the
+/// INVITE, plus its media hints, ring time and CDR attribution. Every path
+/// that routes a call to a trunk (static rules, HTTP router targets) stamps
+/// it here so they treat the trunk the same way.
+pub fn stamp_trunk(
+    option: &mut InviteOption,
+    hints: &mut Option<DialplanHints>,
+    trunk_name: &str,
+    trunk: &TrunkConfig,
+) -> Result<()> {
+    apply_trunk_config(option, trunk)?;
+    merge_trunk_media_hints(hints, trunk);
+    attach_outbound_trunk_metadata(hints, trunk_name, trunk);
+    Ok(())
+}
+
 fn attach_outbound_trunk_metadata(
     hints: &mut Option<DialplanHints>,
     trunk_name: &str,
@@ -1546,6 +1558,9 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
         && trunk.bind_ip.is_none()
         && trunk.ice_lite.is_none()
         && trunk.profile.is_none()
+        && trunk.diversion_headers.is_none()
+        && trunk.history_info.is_none()
+        && trunk.amd.is_none()
     {
         return;
     }
@@ -1553,6 +1568,17 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
     let hints = hints.get_or_insert_with(DialplanHints::default);
     if trunk.profile.is_some() {
         hints.network_profile_id = trunk.profile.clone();
+    }
+    if trunk.diversion_headers.is_some() || trunk.history_info.is_some() {
+        let policy = hints
+            .diversion_policy
+            .get_or_insert_with(crate::proxy::routing::DiversionPolicy::default);
+        if let Some(v) = trunk.diversion_headers {
+            policy.diversion_headers = v;
+        }
+        if let Some(v) = trunk.history_info {
+            policy.history_info = v;
+        }
     }
     if !trunk.codec.is_empty() {
         hints.allow_codecs = Some(trunk.codec.clone());
@@ -1581,6 +1607,14 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
     }
     if let Some(ice_lite) = trunk.ice_lite {
         hints.ice_lite = Some(ice_lite);
+    }
+    // AMD: route hints outrank the trunk (per-field), the trunk fills gaps —
+    // the session then overlays `app_params` and falls back to `[proxy] amd`.
+    if let Some(trunk_amd) = &trunk.amd {
+        match &mut hints.amd {
+            Some(existing) => existing.overlay(trunk_amd.clone()),
+            None => hints.amd = Some(trunk_amd.clone()),
+        }
     }
 }
 
@@ -1631,6 +1665,67 @@ mod ice_lite_hint_tests {
             hints.is_none(),
             "no other media fields set: hints stay None"
         );
+    }
+
+    fn trunk_with_diversion(diversion: Option<bool>, history: Option<bool>) -> TrunkConfig {
+        TrunkConfig {
+            dest: "sip:carrier.example.com".to_string(),
+            diversion_headers: diversion,
+            history_info: history,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trunk_diversion_flags_propagate_to_hints() {
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &trunk_with_diversion(Some(true), Some(true)));
+        let policy = hints
+            .as_ref()
+            .and_then(|h| h.diversion_policy)
+            .expect("policy");
+        assert!(policy.diversion_headers);
+        assert!(policy.history_info);
+    }
+
+    #[test]
+    fn trunk_history_info_only_propagates() {
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &trunk_with_diversion(None, Some(true)));
+        let policy = hints
+            .as_ref()
+            .and_then(|h| h.diversion_policy)
+            .expect("policy");
+        assert!(!policy.diversion_headers);
+        assert!(policy.history_info);
+    }
+
+    #[test]
+    fn trunk_without_diversion_flags_leaves_hints_untouched() {
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &trunk_with_diversion(None, None));
+        assert!(
+            hints.is_none(),
+            "no other media fields set: hints stay None"
+        );
+    }
+
+    #[test]
+    fn diversion_policy_resolve_prefers_trunk_override() {
+        let policy = crate::proxy::routing::DiversionPolicy::resolve(
+            true,
+            false,
+            Some(crate::proxy::routing::DiversionPolicy {
+                diversion_headers: false,
+                history_info: true,
+            }),
+        );
+        assert!(!policy.diversion_headers);
+        assert!(policy.history_info);
+
+        let fallback = crate::proxy::routing::DiversionPolicy::resolve(true, false, None);
+        assert!(fallback.diversion_headers);
+        assert!(!fallback.history_info);
     }
 
     /// Destination trunk merges after the source trunk, so an explicit
@@ -1692,6 +1787,44 @@ mod apply_trunk_config_tests {
         assert_eq!(
             option.destination.unwrap().addr.to_string(),
             "registrar.carrier.example:5080"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rewrite_ops_tests {
+    use super::*;
+    use crate::proxy::routing::RewriteRules;
+
+    /// Header rewrite ops must come out in a deterministic order: the trace
+    /// feeds cluster consistency checks that compare the lists verbatim, and
+    /// HashMap iteration order varies between processes.
+    #[test]
+    fn describe_rewrite_ops_sorts_header_keys() {
+        let rewrite = RewriteRules {
+            from_user: Some("1001".to_string()),
+            headers: [
+                ("header.x-entry-node-id", "3420000"),
+                ("header.x-business-type", "34"),
+                ("header.tenantid", "didi"),
+                ("header.x-customer-type", "2"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            ..Default::default()
+        };
+
+        let ops = describe_rewrite_ops(&rewrite);
+        assert_eq!(
+            ops,
+            vec![
+                "from.user",
+                "header.tenantid",
+                "header.x-business-type",
+                "header.x-customer-type",
+                "header.x-entry-node-id",
+            ]
         );
     }
 }

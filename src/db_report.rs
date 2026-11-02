@@ -129,9 +129,57 @@ pub fn report_db_write_failure_with_detail(
     true
 }
 
-#[cfg(test)]
-mod tests {
+// Downstream addon crates' tests import the error-capture helper via the
+// `test-support` feature (see src/prelude.rs compatibility contract).
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::*;
+
+    /// Capture one entity's write failures without installing a global subscriber.
+    #[derive(Clone)]
+    pub struct DbErrors {
+        entity: &'static str,
+        pub errors: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DbErrors {
+        pub fn new(entity: &'static str) -> Self {
+            Self {
+                entity,
+                errors: Default::default(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ErrorFields {
+        entity: String,
+        error: String,
+    }
+
+    impl tracing::field::Visit for ErrorFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            match field.name() {
+                "entity" => self.entity = format!("{value:?}"),
+                "error" => self.error = format!("{value:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DbErrors {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = ErrorFields::default();
+            event.record(&mut fields);
+            if fields.entity == self.entity {
+                self.errors.lock().push(fields.error);
+            }
+        }
+    }
 
     #[test]
     fn noop_upsert_matches_record_not_inserted_only() {

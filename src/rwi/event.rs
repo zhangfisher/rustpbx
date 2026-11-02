@@ -1,52 +1,216 @@
-use serde::Serialize;
-use tracing::warn;
+use serde::{Deserialize, Serialize};
 
 use crate::rwi::proto::EventCallContext;
+
+/// Statically-declared event capabilities, declared by the `rwi_event!`
+/// macro as a `const`. Carried through type-erasure on [`RwiEvent::kind`]
+/// and used by the gateway instead of runtime string matching on
+/// `event_type` — the dispatch categories cannot drift out of sync with
+/// the event definitions.
+///
+/// bitflags-style API: compose with `|` at runtime (`EventKind::LIFECYCLE
+/// | EventKind::TRANSFER`), test with [`Self::contains`] /
+/// [`Self::intersects`].
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventKind(u8);
+
+impl EventKind {
+    /// No dispatch category — the default for events the gateway treats
+    /// uniformly (no identity snapshot, no DTMF tap, no transfer handling).
+    pub const EMPTY: Self = Self(0);
+    /// Call-lifecycle events covered by the recording-identity snapshot
+    /// (`call_created/ringing/answered/hangup/held/unheld/transferred`).
+    pub const LIFECYCLE: Self = Self(1 << 0);
+    /// DTMF digit events (feed the DTMF collect taps in dispatch).
+    pub const DTMF: Self = Self(1 << 1);
+    /// Transfer-flow events (transfer-source snapshot + target
+    /// normalization at enrichment).
+    pub const TRANSFER: Self = Self(1 << 2);
+    /// Every defined category — exhaustiveness guard for contract tests.
+    pub const ALL: Self = Self(Self::LIFECYCLE.0 | Self::DTMF.0 | Self::TRANSFER.0);
+
+    /// `self` carries every category in `other`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// `self` and `other` share at least one category.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl std::ops::BitOr for EventKind {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for EventKind {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::fmt::Debug for EventKind {
+    /// Renders the defined flag names, bitflags-style: `EventKind(LIFECYCLE | TRANSFER)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EventKind(")?;
+        let mut first = true;
+        for (bit, name) in [
+            (Self::LIFECYCLE.0, "LIFECYCLE"),
+            (Self::DTMF.0, "DTMF"),
+            (Self::TRANSFER.0, "TRANSFER"),
+        ] {
+            if self.0 & bit == bit {
+                if !first {
+                    f.write_str(" | ")?;
+                }
+                f.write_str(name)?;
+                first = false;
+            }
+        }
+        if first {
+            f.write_str("EMPTY")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// Typed extraction of the event's own dispatch/enrichment-relevant fields.
+/// Built once by [`RwiEventSpec::event_meta`] (macro `fields:` shape), so
+/// the gateway's hot path never reads payload keys — a lift naming a field
+/// the struct doesn't have is a compile error at the declaring call site.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EventMeta {
+    /// Leg attribution carried by leg-scoped events.
+    pub leg_id: Option<String>,
+    /// Agent attribution field (call_* events).
+    pub agent_id: Option<String>,
+    /// Transfer target (call_transferred).
+    pub transfer_target: Option<String>,
+    /// Agent id inside the transfer source (call_transferred).
+    pub transfer_source_agent: Option<String>,
+    /// DTMF digit (dtmf events) for the collect-tap feed.
+    pub dtmf_digit: Option<char>,
+    /// The payload's transfer-source object is authoritative — either the
+    /// event declared its own (call_transferred) or the identity snapshot
+    /// already merged/synthesized one. The meta merge must not touch it.
+    pub has_transfer_source: bool,
+    /// Set when the recording-identity snapshot stamped the payload — the
+    /// static re-entry guard replacing the historical `payload.get` probe.
+    pub has_recording_id: bool,
+}
 
 /// Type-erased RWI event for gateway dispatching.
 /// No enum, no match — just fields. Everything past this point is polymorphic.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RwiEvent {
     pub event_type: &'static str,
+    /// Static capability category copied from `E::KIND` at construction —
+    /// the gateway's dispatch basis (never serialized onto the wire).
+    #[serde(skip)]
+    pub kind: EventKind,
+    /// Typed field extraction (leg_id/agent_id/…) — the gateway reads these
+    /// instead of payload keys (never serialized onto the wire).
+    #[serde(skip)]
+    pub meta: EventMeta,
     pub call_id: Option<String>,
     pub payload: serde_json::Value,
+}
+
+/// Statically-shaped wire envelope: `event_type` is part of the serialized
+/// TYPE (declared once next to the spec), produced by a single
+/// `serde_json::to_value` pass — no post-serialization payload patching.
+#[derive(Serialize)]
+struct EventEnvelope<'a, E: Serialize + ?Sized> {
+    event_type: &'static str,
+    #[serde(flatten)]
+    spec: &'a E,
 }
 
 impl RwiEvent {
     /// Build from a typed RwiEventSpec. If context provided, merge it into payload.
     pub fn from_spec<E: RwiEventSpec>(event: &E, ctx: Option<&EventCallContext>) -> Self {
-        let mut payload = serde_json::to_value(event).unwrap_or_else(|e| {
-            warn!("RwiEventSpec serialization failed: {}", e);
-            serde_json::json!({})
-        });
-        payload["event_type"] = serde_json::Value::String(E::TYPE.into());
-        merge_event_context(&mut payload, ctx);
+        let payload = serde_json::to_value(EventEnvelope {
+            event_type: E::TYPE,
+            spec: event,
+        })
+        .expect("RwiEventSpec is a plain struct; serialization cannot fail");
+        let payload = match payload {
+            serde_json::Value::Object(map) => map,
+            other => unreachable!("event envelope must serialize to a JSON object, got: {other:?}"),
+        };
+        let mut payload = payload;
+        merge_event_context(&mut payload, ctx.cloned());
         RwiEvent {
             event_type: E::TYPE,
-            call_id: event.call_id().map(|s| s.to_owned()),
-            payload,
+            kind: E::KIND,
+            meta: event.event_meta(),
+            call_id: event.call_id().map(str::to_owned),
+            payload: serde_json::Value::Object(payload),
         }
     }
 }
 
-pub fn merge_event_context(payload: &mut serde_json::Value, ctx: Option<&EventCallContext>) {
-    if let Some(ctx) = ctx {
-        if let Ok(ctx_val) = serde_json::to_value(ctx) {
-            if let (Some(pobj), Some(cobj)) = (payload.as_object_mut(), ctx_val.as_object()) {
-                for (k, v) in cobj {
-                    if !v.is_null() && !pobj.contains_key(k) {
-                        pobj.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+/// Merge call-context fields into a payload object. Static per-field pass:
+/// every known field is inserted only when absent (the event's own field
+/// wins), `None` context fields are skipped, and addon sections merge under
+/// their reserved top-level key. Field additions to `EventCallContext` must
+/// extend this list — the wire contract tests catch a missing field.
+pub fn merge_event_context(
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    ctx: Option<EventCallContext>,
+) {
+    let Some(ctx) = ctx else { return };
+    let put = |map: &mut serde_json::Map<String, serde_json::Value>,
+                   key: &'static str,
+                   value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            map.entry(key.to_string()).or_insert(value);
         }
+    };
+    put(payload, "session_id", ctx.session_id.map(serde_json::Value::String));
+    put(payload, "caller", ctx.caller.map(serde_json::Value::String));
+    put(payload, "callee", ctx.callee.map(serde_json::Value::String));
+    put(payload, "caller_name", ctx.caller_name.map(serde_json::Value::String));
+    put(payload, "callee_name", ctx.callee_name.map(serde_json::Value::String));
+    put(payload, "direction", ctx.direction.map(serde_json::Value::String));
+    put(payload, "trunk", ctx.trunk.map(serde_json::Value::String));
+    put(payload, "app_id", ctx.app_id.map(serde_json::Value::String));
+    put(
+        payload,
+        "routing_target",
+        ctx.routing_target.map(serde_json::Value::String),
+    );
+    put(payload, "agent_id", ctx.agent_id.map(serde_json::Value::String));
+    put(payload, "agent_name", ctx.agent_name.map(serde_json::Value::String));
+    put(payload, "queue_id", ctx.queue_id.map(serde_json::Value::String));
+    if let Some(root) = ctx.root {
+        put(payload, "root", Some(serde_json::json!(root)));
+    }
+    for (key, val) in ctx.sections {
+        payload.entry(key).or_insert(val);
     }
 }
 
 /// Trait for typed event structs. Each event type implements this.
 pub trait RwiEventSpec: Serialize {
     const TYPE: &'static str;
+    /// Static dispatch category (see [`EventKind`]) — declared next to TYPE
+    /// so the gateway never string-matches on `event_type`.
+    const KIND: EventKind;
     fn call_id(&self) -> Option<&str>;
+    /// Typed field extraction for the gateway (macro `fields:` shape).
+    /// `Default` = the event exposes no lifted fields.
+    fn event_meta(&self) -> EventMeta {
+        EventMeta::default()
+    }
 }
 
 /// Build a flat payload from a spec, optionally enriched with context.
@@ -58,28 +222,234 @@ pub fn to_flat_payload<E: RwiEventSpec>(
     RwiEvent::from_spec(event, ctx).payload
 }
 
-/// Build a type-erased `RwiEvent` from a typed spec (optionally enriched with
-/// call context). Alias for [`RwiEvent::from_spec`].
+/// Macro to generate `RwiEventSpec` impls. Shapes:
 ///
-/// Retained for addons that translate heterogeneous internal events into
-/// `RwiEvent` values for the RWI gateway / webhook (e.g. the CC addon's queue,
-/// skill-group and agent event translators).
-pub fn to_legacy_event<E: RwiEventSpec>(event: &E, ctx: Option<&EventCallContext>) -> RwiEvent {
-    RwiEvent::from_spec(event, ctx)
+/// * `rwi_event!(Ty, "type")` — default: `call_id: String` field, no kind.
+/// * `rwi_event!(Ty, "type", none)` — the event has no call id.
+/// * `rwi_event!(Ty, "type", field: f)` — a required `f: String` field is
+///   the call id (serialized under its own name).
+/// * `rwi_event!(Ty, "type", option: f)` — an `f: Option<String>` field is
+///   the call id.
+/// * Any shape may append `, kind: flag [| flag]` to declare static dispatch
+///   categories (`kind: lifecycle | transfer` — composed const-wide, see
+///   [`EventKind`]).
+macro_rules! rwi_kind {
+    (empty)     => { EventKind::EMPTY };
+    (lifecycle) => { EventKind::LIFECYCLE };
+    (dtmf)      => { EventKind::DTMF };
+    (transfer)  => { EventKind::TRANSFER };
 }
 
-/// Macro to generate `RwiEventSpec` impls for events whose `call_id()`
-/// returns `Some(&self.call_id)`.
+/// Lift tokens → typed field extraction statements. Both idents come from
+/// the caller's hygiene context (`meta` is the local accumulator, `spec`
+/// the event reference), and the field name is compile-checked against the
+/// declaring struct.
+macro_rules! rwi_lift {
+    ($meta:ident, $spec:ident, leg_id) => { $meta.leg_id = $spec.leg_id.clone().into(); };
+    ($meta:ident, $spec:ident, agent_id) => { $meta.agent_id = $spec.agent_id.clone(); };
+    ($meta:ident, $spec:ident, transfer_target) => { $meta.transfer_target = $spec.transfer_target.clone(); };
+    ($meta:ident, $spec:ident, transfer_source) => {
+        $meta.has_transfer_source = $spec.transfer_source.is_some();
+        $meta.transfer_source_agent = $spec
+            .transfer_source
+            .as_ref()
+            .and_then(|s| s.agent_id.clone())
+            .filter(|id| !id.is_empty());
+    };
+    ($meta:ident, $spec:ident, digit) => { $meta.dtmf_digit = $spec.digit.chars().next(); };
+}
+
+/// Static declaration of one RWI event spec: `TYPE` + `KIND` + the
+/// `call_id()` shape + typed field lifts, all compile-checked.
+///
+/// Shapes (call-id resolution):
+/// * `rwi_event!(Ty, "type")` — default: `call_id: String` field.
+/// * `rwi_event!(Ty, "type", none)` — the event has no call id.
+/// * `rwi_event!(Ty, "type", field: f)` — a required `f: String` field is
+///   the call id (serialized under its own name).
+/// * `rwi_event!(Ty, "type", option: f)` — an `f: Option<String>` field is
+///   the call id.
+///
+/// Optional modifiers (before the shape keyword): `kind: flag [| flag]`
+/// declares static dispatch categories; `fields: lift [| lift]` declares
+/// typed field lifts for the gateway.
 macro_rules! rwi_event {
     ($ty:ident, $type:literal) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [], shape: [call_id]);
+    };
+    ($ty:ident, $type:literal, kind: $($flag:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [], shape: [call_id]);
+    };
+    ($ty:ident, $type:literal, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [$($lift)|+], shape: [call_id]);
+    };
+    ($ty:ident, $type:literal, kind: $($flag:ident)|+, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [$($lift)|+], shape: [call_id]);
+    };
+    ($ty:ident, $type:literal, none) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [], shape: [none]);
+    };
+    ($ty:ident, $type:literal, none, kind: $($flag:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [], shape: [none]);
+    };
+    ($ty:ident, $type:literal, none, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [$($lift)|+], shape: [none]);
+    };
+    ($ty:ident, $type:literal, none, kind: $($flag:ident)|+, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [$($lift)|+], shape: [none]);
+    };
+    ($ty:ident, $type:literal, field: $field:ident) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [], shape: [call $field]);
+    };
+    ($ty:ident, $type:literal, field: $field:ident, kind: $($flag:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [], shape: [call $field]);
+    };
+    ($ty:ident, $type:literal, field: $field:ident, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [$($lift)|+], shape: [call $field]);
+    };
+    ($ty:ident, $type:literal, field: $field:ident, kind: $($flag:ident)|+, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [$($lift)|+], shape: [call $field]);
+    };
+    ($ty:ident, $type:literal, option: $field:ident) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [], shape: [opt $field]);
+    };
+    ($ty:ident, $type:literal, option: $field:ident, kind: $($flag:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [], shape: [opt $field]);
+    };
+    ($ty:ident, $type:literal, option: $field:ident, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [empty], fields: [$($lift)|+], shape: [opt $field]);
+    };
+    ($ty:ident, $type:literal, option: $field:ident, kind: $($flag:ident)|+, fields: $($lift:ident)|+) => {
+        rwi_event!(@impl $ty, $type, kind: [$($flag)|+], fields: [$($lift)|+], shape: [opt $field]);
+    };
+    // Internal: one impl generator. The kind list composes const-wide by
+    // OR-ing raw bits (primitive ops are const-evaluable; the `|` operator
+    // trait is not). `self` appears only inside the generated method bodies.
+    (@impl $ty:ident, $type:literal, kind: [$($flag:ident)|*], fields: [$($lift:ident)|*], shape: [$($shape:tt)+]) => {
         impl RwiEventSpec for $ty {
             const TYPE: &'static str = $type;
-            fn call_id(&self) -> Option<&str> {
-                Some(&self.call_id)
-            }
+            const KIND: EventKind = rwi_event!(@kind_bits [$($flag)|*]);
+            rwi_event!(@shape_fn [$($shape)+]);
+            rwi_event!(@meta_fn [$($lift)|*]);
+        }
+    };
+    (@kind_bits []) => { EventKind::EMPTY };
+    (@kind_bits [$($flag:ident)|+]) => { EventKind($(rwi_kind!($flag).0)|+) };
+    (@shape_fn [call_id]) => {
+        fn call_id(&self) -> Option<&str> {
+            Some(&self.call_id)
+        }
+    };
+    (@shape_fn [none]) => {
+        fn call_id(&self) -> Option<&str> {
+            None
+        }
+    };
+    (@shape_fn [call $field:ident]) => {
+        fn call_id(&self) -> Option<&str> {
+            Some(&self.$field)
+        }
+    };
+    (@shape_fn [opt $field:ident]) => {
+        fn call_id(&self) -> Option<&str> {
+            self.$field.as_deref()
+        }
+    };
+    (@meta_fn []) => {
+        fn event_meta(&self) -> EventMeta {
+            EventMeta::default()
+        }
+    };
+    (@meta_fn [$($lift:ident)|+]) => {
+        fn event_meta(&self) -> EventMeta {
+            let mut meta = EventMeta::default();
+            $(rwi_lift!(meta, self, $lift);)+
+            meta
         }
     };
 }
+
+/// Static registry of every RWI event type string — the single source of
+/// truth for the uniqueness / naming-format contract tests. Keep in sync
+/// with the `rwi_event!` invocations below (the test below fails on drift).
+pub const EVENT_TYPES: &[&str] = &[
+    CallAnswered::TYPE,
+    CallBridged::TYPE,
+    CallBusy::TYPE,
+    CallCreated::TYPE,
+    CallError::TYPE,
+    CallHangup::TYPE,
+    CallHeld::TYPE,
+    CallNoAnswer::TYPE,
+    CallRinging::TYPE,
+    CallTransferAccepted::TYPE,
+    CallTransferFailed::TYPE,
+    CallTransferred::TYPE,
+    CallUnbridged::TYPE,
+    CallUnheld::TYPE,
+    CallUserDataUpdated::TYPE,
+    ConferenceAuthResult::TYPE,
+    ConferenceCreated::TYPE,
+    ConferenceDestroyed::TYPE,
+    ConferenceEndedByHost::TYPE,
+    ConferenceError::TYPE,
+    ConferenceJoined::TYPE,
+    ConferenceLeft::TYPE,
+    ConferenceMemberJoined::TYPE,
+    ConferenceMemberLeft::TYPE,
+    ConferenceMemberMuted::TYPE,
+    ConferenceMemberUnmuted::TYPE,
+    ConferenceMergeFailed::TYPE,
+    ConferenceMergeRequested::TYPE,
+    ConferenceMerged::TYPE,
+    ConferenceSeatReplaceFailed::TYPE,
+    ConferenceSeatReplaceStarted::TYPE,
+    ConferenceSeatReplaceSucceeded::TYPE,
+    ConsultSwitched::TYPE,
+    DbWriteFailed::TYPE,
+    Dtmf::TYPE,
+    DtmfCollected::TYPE,
+    DtmfCollectionTimeout::TYPE,
+    IvrFlowCompleted::TYPE,
+    IvrNodeEntered::TYPE,
+    IvrNodeExited::TYPE,
+    IvrStepTrace::TYPE,
+    MediaHoldStarted::TYPE,
+    MediaHoldStopped::TYPE,
+    MediaPlayFinished::TYPE,
+    MediaPlayStarted::TYPE,
+    MediaRingbackPassthroughStarted::TYPE,
+    QueueAgentConnected::TYPE,
+    QueueAgentNoAnswer::TYPE,
+    QueueAgentOffered::TYPE,
+    QueueAgentRejected::TYPE,
+    QueueCandidatesFound::TYPE,
+    QueueFallbackExecuted::TYPE,
+    QueueJoined::TYPE,
+    QueueLeft::TYPE,
+    QueueOverflowJoined::TYPE,
+    QueuePositionChanged::TYPE,
+    QueueWaitTimeout::TYPE,
+    RealtimeEvent::TYPE,
+    RecordEnd::TYPE,
+    RecordPaused::TYPE,
+    RecordResumed::TYPE,
+    RecordStarted::TYPE,
+    RecordStopped::TYPE,
+    RecordingMetadataAvailable::TYPE,
+    SipMessageReceived::TYPE,
+    SipNotifyReceived::TYPE,
+    SupervisorBargeStarted::TYPE,
+    SupervisorListenStarted::TYPE,
+    SupervisorModeStopped::TYPE,
+    SupervisorTakeoverStarted::TYPE,
+    SupervisorWhisperStarted::TYPE,
+    TranscriptEnded::TYPE,
+    TranscriptError::TYPE,
+    TranscriptFinal::TYPE,
+    TranscriptSegmentEvent::TYPE,
+    TranscriptStarted::TYPE,
+];
 
 // ═══════════════════════════════════════════════════════════════════════
 // Core event structs — Bucket A uses the rwi_event! macro.
@@ -91,11 +461,28 @@ macro_rules! rwi_event {
 /// struct: it is injected via `EventCallContext.direction` enrichment.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallCreated {
+    /// The leg the call was created for: the caller leg of an inbound session
+    /// (`"caller"`), the outgoing INVITE leg of an API originate (`leg_id`
+    /// `None`, `leg_role` `"caller"` — no leg registry entry exists
+    /// pre-answer). Child-leg sessions (a cluster peer dispatched a queue
+    /// agent / consult / transfer leg to this node) emit no `call_created`
+    /// at all — the dispatching node already announced the logical call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    /// `caller` | `callee` | `agent` | `consult` | `transfer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
     pub context: String,
     pub caller: String,
     pub callee: String,
     pub trunk: Option<String>,
+    /// Every SIP header of the request that created the call, minus the
+    /// transport/dialog headers with typed representations (Via, Call-ID,
+    /// CSeq, Content-Length/Type, From, To, User-Agent, Allow, Max-Forwards).
+    /// Route-injected headers replace same-name entries (case-insensitive).
+    /// Populated on every production emission point (inbound INVITE, RWI app,
+    /// API originate — extracted from the actual outgoing INVITE).
     #[serde(default)]
     pub sip_headers: std::collections::HashMap<String, String>,
     #[serde(default)]
@@ -113,13 +500,31 @@ pub struct CallCreated {
     #[serde(default)]
     pub routing_path: Option<Vec<String>>,
 }
-rwi_event!(CallCreated, "call_created");
+rwi_event!(CallCreated, "call_created", kind: lifecycle, fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallRinging {
     /// Present for an individual leg event; absent for a session event.
+    /// Per-leg events fire for every registered leg's ring transition
+    /// (queue-dispatched agent, consult target, …) AND for the originate
+    /// A dialog: the outgoing INVITE leg (`"caller"`) emits its own ringing
+    /// on ring-state change (first provisional, then the upgrade to early
+    /// media), so an API/CTI outbound carries the same leg-level contract as
+    /// inbound flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leg_id: Option<String>,
+    /// `agent` | `consult` | `transfer` — present on leg events and on the
+    /// session events of a child-leg session (a cluster peer dispatched the
+    /// leg to this node). `agent` identifies the CC agent leg (queue
+    /// dispatch, consult to a registered agent, agent-initiated call).
+    ///
+    /// Multiple `call_ringing` per call are the per-leg contract: every
+    /// agent attempt (sequential re-dial, escalation stage, parallel fork)
+    /// rings its own leg. After a blind/REFER transfer the departing agent's
+    /// attribution is cleared — the replacement target's ringing does not
+    /// inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
     /// `true` when the ringing provisional response carried SDP (183 Session
     /// Progress or 180 with SDP — early media), `false` for a plain 180
@@ -135,34 +540,113 @@ pub struct CallRinging {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
 }
-rwi_event!(CallRinging, "call_ringing");
+rwi_event!(CallRinging, "call_ringing", kind: lifecycle, fields: leg_id | agent_id);
 
+/// A call leg ANSWERED. Emitted per leg — every leg answer (caller pickup,
+/// direct-answer callee, queue-dispatched agent, consult / transfer target)
+/// carries its own `leg_id` + `leg_role`.
+///
+/// A session-scoped duplicate (`leg_id: None`) is emitted at most once per
+/// call at the agent / remote connect moment. **Deprecated**: it will be
+/// removed in the next version — consume the leg-level events and drop the
+/// session-scoped one. Child-leg sessions (a cluster peer dispatched the leg
+/// to this node) never emit the session-scoped duplicate; their leg-level
+/// event carries the leg.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallAnswered {
-    /// Present for an individual leg event; absent for a session event.
+    /// The leg that answered — emitted for EVERY leg answer: the caller
+    /// pickup under a queue/IVR app (`"caller"`), a direct-answer callee,
+    /// a queue-dispatched agent leg (`"agent"`), consult / transfer targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leg_id: Option<String>,
+    /// `agent` | `consult` | `transfer` | `caller` | `callee` — the leg's own
+    /// role, same semantics as `call_ringing` / `call_hangup` leg events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
 }
-rwi_event!(CallAnswered, "call_answered");
+rwi_event!(CallAnswered, "call_answered", kind: lifecycle, fields: leg_id);
+
+/// The lifecycle owner whose termination a hangup reports.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallHangupScope {
+    /// The root session ends the logical call.
+    Call,
+    /// A leg or a cluster-dispatched child session ends.
+    Leg,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallHangup {
+    /// Explicit lifecycle scope; independent of optional leg attribution.
+    pub scope: CallHangupScope,
     /// Present for an individual leg event; absent for a session event.
+    ///
+    /// Leg-scoped events fire for:
+    /// * a mid-session leg exit the session survives (setup failure, BYE on
+    ///   a dial leg, REFER / conference detach),
+    /// * an in-setup leg CANCELLED by the app — queue ring timeout
+    ///   (`reason: "ring_timeout"`), escalation stage switch
+    ///   (`"stage_switch"`), superseded parallel dial (`"superseded"`),
+    ///   other explicit removals (`"cancelled"`).
+    /// * CC-role legs (agent / consult / transfer) still CONNECTED when the
+    ///   session tears down — emitted right before the session-scoped event
+    ///   with identical `reason` / `hangup_by` / `duration_secs`, so
+    ///   `leg_role == "agent"` consumers see the agent leg's teardown even
+    ///   when the OTHER side hung up first (e.g. a CTI click-to-dial where
+    ///   the customer ends the call). Plain caller/callee legs stay covered
+    ///   by the session-scoped event alone.
+    ///
+    /// Miss hangups are what agent workbenches clear the ringing UI and
+    /// analytics count unanswered calls against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leg_id: Option<String>,
+    /// `agent` | `consult` | `transfer` — present on leg events and on the
+    /// session events of a child-leg session (a cluster peer dispatched the
+    /// leg to this node; the role is the intent the dispatcher declared).
+    /// `agent` identifies the CC agent leg (queue dispatch, consult to a
+    /// registered agent, agent-initiated call).
+    ///
+    /// Lifecycle contract: a leg-scoped `call_hangup` IS the leg's terminal
+    /// transition — every emission site completes it by removing the leg, so
+    /// a leg is reported exactly once. The session-scoped event of a
+    /// child-leg session carries the declared role only while that leg is
+    /// still registered (its teardown has not been reported yet); once the
+    /// leg exited through its own terminal transition, the session event
+    /// carries no role. After a blind/REFER transfer the departing agent's
+    /// attribution is cleared — the call's next stage (IVR / extension /
+    /// another agent) does not inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
     pub reason: Option<String>,
     /// Normalized initiator: `"agent"` | `"caller"` | `"system"` | `"transfer"`
-    /// | `"unknown"`. Consistent with the former CC-layer `cc_hangup.hangup_by`.
+    /// | `"unknown"` (plus the `"callee"` fallback for non-CC calls).
+    /// Consistent with the former CC-layer `cc_hangup.hangup_by`.
+    ///
+    /// Leg-scoped events attribute only established-dialog terminations: a
+    /// remote BYE normalizes exactly like the session event (`"agent"` in a
+    /// CC context, `"callee"` otherwise), a locally issued BYE reports
+    /// `"system"`. Setup failures (never-connected dials) carry `None` —
+    /// `queue_agent_no_answer` / `queue_agent_rejected` already describe
+    /// those with `leg_role: "agent"`.
+    ///
+    /// Direction-aware correction: on an OUTBOUND call whose first terminal
+    /// BYE came from the caller/A dialog's remote party, the initiator is
+    /// the dialed CUSTOMER (`"callee"`), never `"agent"` — the CC-centric
+    /// callee→agent mapping only applies when the BYE came from a
+    /// callee/agent dialog or an inbound session.
     pub hangup_by: Option<String>,
     pub sip_status: Option<u16>,
     /// Talk time in seconds (answer → hangup). `None` when the call was never
-    /// answered (originate setup failures).
+    /// answered (originate setup failures). Leg-scoped events carry it only
+    /// for a BYE-terminated established dialog; session-scoped events always
+    /// carry it once the session ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<u64>,
 }
-rwi_event!(CallHangup, "call_hangup");
+rwi_event!(CallHangup, "call_hangup", kind: lifecycle, fields: leg_id);
 
 /// A call leg was put on hold (re-INVITE with `sendonly`/`inactive`, or an
 /// explicit Hold command). Agent attribution (`agent_id` / `agent_name`) is
@@ -170,19 +654,25 @@ rwi_event!(CallHangup, "call_hangup");
 /// replaces the former `cc_held` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallHeld {
+    /// `agent` | `consult` | `caller` | `callee`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
     pub leg_id: String,
 }
-rwi_event!(CallHeld, "call_held");
+rwi_event!(CallHeld, "call_held", kind: lifecycle, fields: leg_id);
 
 /// A previously held call leg was retrieved (resume). Replaces the former
 /// `cc_unheld` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallUnheld {
+    /// `agent` | `consult` | `caller` | `callee`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
     pub leg_id: String,
 }
-rwi_event!(CallUnheld, "call_unheld");
+rwi_event!(CallUnheld, "call_unheld", kind: lifecycle, fields: leg_id);
 
 /// The full user data object of a call session was replaced (REST
 /// `PUT /calls/active/{session_id}/userdata` or RWI `call.set_userdata`).
@@ -197,17 +687,31 @@ pub struct CallUserDataUpdated {
 }
 rwi_event!(CallUserDataUpdated, "call_userdata_updated");
 
+/// The originate target leg did not answer (ring timeout / 408 / 480 / 487)
+/// or reported busy (486 / 600). The unanswered leg is the outgoing INVITE
+/// leg — the session's `caller` leg: `leg_role` is `"caller"`, `leg_id` is
+/// `None` (no leg registry entry exists pre-answer).
 #[derive(Debug, Clone, Serialize)]
 pub struct CallNoAnswer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
 }
-rwi_event!(CallNoAnswer, "call_no_answer");
+rwi_event!(CallNoAnswer, "call_no_answer", fields: leg_id);
 
+/// The originate target leg reported busy (486 / 600). Same leg semantics as
+/// [`CallNoAnswer`].
 #[derive(Debug, Clone, Serialize)]
 pub struct CallBusy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub call_id: String,
 }
-rwi_event!(CallBusy, "call_busy");
+rwi_event!(CallBusy, "call_busy", fields: leg_id);
 
 /// Unified call-affecting error event. One event type for every subsystem that
 /// can degrade, reject, or fail a call (routing, REST calls on the call path,
@@ -283,17 +787,12 @@ pub struct DbWriteFailed {
     pub suppressed: Option<u64>,
 }
 
-impl RwiEventSpec for DbWriteFailed {
-    const TYPE: &'static str = "db_write_failed";
-    fn call_id(&self) -> Option<&str> {
-        self.call_id.as_deref()
-    }
-}
+rwi_event!(DbWriteFailed, "db_write_failed", option: call_id);
 
 /// Where a transfer originated from — the flow position of the call at the
 /// moment it was transferred (IVR / queue / agent / SIP REFER), so consumers
 /// can reconstruct the call path from RWI events alone.
-#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TransferSource {
     /// `ivr` | `queue` | `agent` | `refer` | `external`
     pub source_type: String,
@@ -323,7 +822,7 @@ pub struct CallTransferred {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_source: Option<TransferSource>,
 }
-rwi_event!(CallTransferred, "call_transferred");
+rwi_event!(CallTransferred, "call_transferred", kind: lifecycle | transfer, fields: transfer_target | transfer_source);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallTransferAccepted {
@@ -427,6 +926,48 @@ pub struct RecordResumed {
 }
 rwi_event!(RecordResumed, "record_resumed");
 
+/// AMD (answering machine / AI assistant) detection verdict for the outbound
+/// callee leg. Emitted once per armed attempt when the engine reaches a
+/// decision (early verdict or detection-window flush). Only fired on calls
+/// where the resolved `amd` config enabled detection.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallAmdDetected {
+    pub call_id: String,
+    /// `"human" | "answering_machine" | "ai_assistant" | "silence" | "unknown"`.
+    pub result: String,
+    /// 0.0..1.0 engine confidence.
+    pub confidence: f32,
+    /// ms after answer when the decision was reached.
+    pub decision_time_ms: u64,
+    /// Detected greeting/opener duration (first speech run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_duration_ms: Option<u64>,
+    /// Sustained ~1 kHz beep seen (voicemail hallmark).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beep_detected: Option<bool>,
+    /// Engine identifier (e.g. `"heuristic"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+}
+rwi_event!(CallAmdDetected, "call_amd_detected");
+
+impl CallAmdDetected {
+    pub fn from_verdict(
+        call_id: impl Into<String>,
+        verdict: &crate::media::amd::AmdVerdict,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            result: verdict.result.to_string(),
+            confidence: verdict.confidence,
+            decision_time_ms: verdict.decision_time_ms,
+            speech_duration_ms: Some(verdict.speech_duration_ms),
+            beep_detected: Some(verdict.beep_detected),
+            engine: Some(verdict.engine.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptStarted {
     pub call_id: String,
@@ -504,61 +1045,57 @@ pub struct MediaRingbackPassthroughStarted {
     pub source: String,
     pub target: String,
 }
-impl RwiEventSpec for MediaRingbackPassthroughStarted {
-    const TYPE: &'static str = "media_ringback_passthrough_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.source)
-    }
-}
+rwi_event!(MediaRingbackPassthroughStarted, "media_ringback_passthrough_started", field: source);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaPlayStarted {
     pub call_id: String,
     pub leg_id: Option<String>,
+    /// Role of the target leg (`caller`/`callee`/`agent`/…) — resolved via
+    /// the session's leg table when the target leg is tracked there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub track_id: String,
 }
-rwi_event!(MediaPlayStarted, "media_play_started");
+rwi_event!(MediaPlayStarted, "media_play_started", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaPlayFinished {
     pub call_id: String,
     pub leg_id: Option<String>,
+    /// Role of the target leg — resolved via the session's leg table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub track_id: String,
     pub interrupted: bool,
 }
-rwi_event!(MediaPlayFinished, "media_play_finished");
+rwi_event!(MediaPlayFinished, "media_play_finished", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Dtmf {
     pub call_id: String,
     pub digit: String,
     pub leg_id: Option<String>,
+    /// `agent` | `consult` | `caller` | `callee` — present when the source leg
+    /// is tracked by the session (always, for session-originated DTMF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub extra: Option<serde_json::Value>,
 }
-rwi_event!(Dtmf, "dtmf");
+rwi_event!(Dtmf, "dtmf", kind: dtmf, fields: leg_id | digit);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallBridged {
     pub leg_a: String,
     pub leg_b: String,
 }
-impl RwiEventSpec for CallBridged {
-    const TYPE: &'static str = "call_bridged";
-    fn call_id(&self) -> Option<&str> {
-        None
-    }
-}
+rwi_event!(CallBridged, "call_bridged", none);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceCreated {
     pub conf_id: String,
 }
-impl RwiEventSpec for ConferenceCreated {
-    const TYPE: &'static str = "conference_created";
-    fn call_id(&self) -> Option<&str> {
-        None
-    }
-}
+rwi_event!(ConferenceCreated, "conference_created", none);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueJoined {
@@ -568,6 +1105,28 @@ pub struct QueueJoined {
     /// not skill-group routed (mirrors `QueueLeft::skill_groups`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_groups: Option<Vec<String>>,
+    /// Per-call ACD queue priority (higher preempts earlier waiters). `None`
+    /// for the default priority 0 — absent and 0 are equivalent, so
+    /// default-priority flows keep the exact pre-field wire payload. Consumed
+    /// by the shared-queue event tap to persist `cc_acd_queue.priority`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
+    /// Re-entry counter: absent on the call's FIRST join (wire-compatible
+    /// with the pre-field payload), `2`, `3`, … on every re-entry after an
+    /// agent attempt failed (no-answer / cancel / reject) and the call keeps
+    /// queuing in the SAME queue — next candidate or another wait-retention
+    /// round. A skill-GROUP switch is a different contract: it emits
+    /// `queue_left{overflow}` + `queue_overflow_joined`, never a re-entry
+    /// `queue_joined`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// Explicit `null` on the wire: join events describe the CALL's entry,
+    /// not an agent. Without this key the gateway's context enrichment would
+    /// merge the session's current `agent_id` into RE-ENTRY joins — after a
+    /// reject / no-answer round that attributes the rejoin to the FAILED
+    /// agent (and races the failed leg's own teardown events the other way).
+    /// `null` blocks the merge and keeps every join unattributed.
+    pub agent_id: Option<String>,
 }
 rwi_event!(QueueJoined, "queue_joined");
 
@@ -576,16 +1135,29 @@ pub struct QueueAgentOffered {
     pub call_id: String,
     pub queue_id: String,
     pub agent_id: String,
+    /// Session leg id of the dial toward this agent — joins `queue_agent_*`
+    /// with the leg-scoped `call_*` events (`call_ringing` / `call_hangup`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    /// Always `"agent"` — these events describe the CC agent leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(QueueAgentOffered, "queue_agent_offered");
+rwi_event!(QueueAgentOffered, "queue_agent_offered", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueAgentConnected {
     pub call_id: String,
     pub queue_id: String,
     pub agent_id: String,
+    /// Session leg id that connected (see [`QueueAgentOffered::leg_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    /// Always `"agent"` — these events describe the CC agent leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(QueueAgentConnected, "queue_agent_connected");
+rwi_event!(QueueAgentConnected, "queue_agent_connected", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueAgentNoAnswer {
@@ -593,8 +1165,14 @@ pub struct QueueAgentNoAnswer {
     pub queue_id: String,
     pub agent_id: String,
     pub attempt: u32,
+    /// Session leg id of the failed dial (see [`QueueAgentOffered::leg_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    /// Always `"agent"` — these events describe the CC agent leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(QueueAgentNoAnswer, "queue_agent_no_answer");
+rwi_event!(QueueAgentNoAnswer, "queue_agent_no_answer", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueAgentRejected {
@@ -602,8 +1180,14 @@ pub struct QueueAgentRejected {
     pub queue_id: String,
     pub agent_id: String,
     pub attempt: u32,
+    /// Session leg id of the rejected dial (see [`QueueAgentOffered::leg_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_id: Option<String>,
+    /// Always `"agent"` — these events describe the CC agent leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(QueueAgentRejected, "queue_agent_rejected");
+rwi_event!(QueueAgentRejected, "queue_agent_rejected", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueuePositionChanged {
@@ -624,6 +1208,12 @@ pub struct QueueOverflowJoined {
     pub queue_id: String,
     /// Overflow / escalation skill group just joined.
     pub skill_group: String,
+    /// Per-call ACD queue priority carried through the move — the shared-
+    /// queue tap re-registers the row on this event (delete + insert), so
+    /// dropping it would reset the caller to the default tier. `None` ==
+    /// default priority 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
 }
 rwi_event!(QueueOverflowJoined, "queue_overflow_joined");
 
@@ -694,16 +1284,23 @@ rwi_event!(CallUnbridged, "call_unbridged");
 pub struct DtmfCollected {
     pub call_id: String,
     pub leg_id: String,
+    /// Role of the leg that delivered the digits ("caller" for IVR
+    /// interactions). `None` when the role cannot be determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
     pub digits: String,
 }
-rwi_event!(DtmfCollected, "dtmf_collected");
+rwi_event!(DtmfCollected, "dtmf_collected", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DtmfCollectionTimeout {
     pub call_id: String,
     pub leg_id: String,
+    /// Role of the leg that was collecting (see [`DtmfCollected::leg_role`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(DtmfCollectionTimeout, "dtmf_collection_timeout");
+rwi_event!(DtmfCollectionTimeout, "dtmf_collection_timeout", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SipMessageReceived {
@@ -727,72 +1324,42 @@ pub struct SupervisorListenStarted {
     pub supervisor_call_id: String,
     pub target_call_id: String,
 }
-impl RwiEventSpec for SupervisorListenStarted {
-    const TYPE: &'static str = "supervisor_listen_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.target_call_id)
-    }
-}
+rwi_event!(SupervisorListenStarted, "supervisor_listen_started", field: target_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorWhisperStarted {
     pub supervisor_call_id: String,
     pub target_call_id: String,
 }
-impl RwiEventSpec for SupervisorWhisperStarted {
-    const TYPE: &'static str = "supervisor_whisper_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.target_call_id)
-    }
-}
+rwi_event!(SupervisorWhisperStarted, "supervisor_whisper_started", field: target_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorBargeStarted {
     pub supervisor_call_id: String,
     pub target_call_id: String,
 }
-impl RwiEventSpec for SupervisorBargeStarted {
-    const TYPE: &'static str = "supervisor_barge_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.target_call_id)
-    }
-}
+rwi_event!(SupervisorBargeStarted, "supervisor_barge_started", field: target_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorTakeoverStarted {
     pub supervisor_call_id: String,
     pub target_call_id: String,
 }
-impl RwiEventSpec for SupervisorTakeoverStarted {
-    const TYPE: &'static str = "supervisor_takeover_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.target_call_id)
-    }
-}
+rwi_event!(SupervisorTakeoverStarted, "supervisor_takeover_started", field: target_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SupervisorModeStopped {
     pub supervisor_call_id: String,
     pub target_call_id: String,
 }
-impl RwiEventSpec for SupervisorModeStopped {
-    const TYPE: &'static str = "supervisor_mode_stopped";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.target_call_id)
-    }
-}
+rwi_event!(SupervisorModeStopped, "supervisor_mode_stopped", field: target_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceError {
     pub conf_id: String,
     pub error: String,
 }
-impl RwiEventSpec for ConferenceError {
-    const TYPE: &'static str = "conference_error";
-    fn call_id(&self) -> Option<&str> {
-        None
-    }
-}
+rwi_event!(ConferenceError, "conference_error", none);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceMemberJoined {
@@ -826,12 +1393,7 @@ rwi_event!(ConferenceMemberUnmuted, "conference_member_unmuted");
 pub struct ConferenceDestroyed {
     pub conf_id: String,
 }
-impl RwiEventSpec for ConferenceDestroyed {
-    const TYPE: &'static str = "conference_destroyed";
-    fn call_id(&self) -> Option<&str> {
-        None
-    }
-}
+rwi_event!(ConferenceDestroyed, "conference_destroyed", none);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceEndedByHost {
@@ -839,12 +1401,7 @@ pub struct ConferenceEndedByHost {
     pub host_call_id: String,
     pub removed_call_ids: Vec<String>,
 }
-impl RwiEventSpec for ConferenceEndedByHost {
-    const TYPE: &'static str = "conference_ended_by_host";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.host_call_id)
-    }
-}
+rwi_event!(ConferenceEndedByHost, "conference_ended_by_host", field: host_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceMergeRequested {
@@ -874,8 +1431,12 @@ pub struct ConferenceJoined {
     pub conf_id: String,
     pub call_id: String,
     pub leg_id: String,
+    /// Role of the joining leg ("caller" for room dial-in, "agent" /
+    /// "consult" for bridged participants). `None` when undeterminable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(ConferenceJoined, "conference_joined");
+rwi_event!(ConferenceJoined, "conference_joined", fields: leg_id);
 
 /// A call leg left a conference room (hangup or room teardown).
 #[derive(Debug, Clone, Serialize)]
@@ -883,8 +1444,11 @@ pub struct ConferenceLeft {
     pub conf_id: String,
     pub call_id: String,
     pub leg_id: String,
+    /// Role of the leaving leg (see [`ConferenceJoined::leg_role`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_role: Option<String>,
 }
-rwi_event!(ConferenceLeft, "conference_left");
+rwi_event!(ConferenceLeft, "conference_left", fields: leg_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceSeatReplaceStarted {
@@ -892,12 +1456,7 @@ pub struct ConferenceSeatReplaceStarted {
     pub old_call_id: String,
     pub new_call_id: String,
 }
-impl RwiEventSpec for ConferenceSeatReplaceStarted {
-    const TYPE: &'static str = "conference_seat_replace_started";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.new_call_id)
-    }
-}
+rwi_event!(ConferenceSeatReplaceStarted, "conference_seat_replace_started", field: new_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceSeatReplaceSucceeded {
@@ -905,12 +1464,7 @@ pub struct ConferenceSeatReplaceSucceeded {
     pub old_call_id: String,
     pub new_call_id: String,
 }
-impl RwiEventSpec for ConferenceSeatReplaceSucceeded {
-    const TYPE: &'static str = "conference_seat_replace_succeeded";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.new_call_id)
-    }
-}
+rwi_event!(ConferenceSeatReplaceSucceeded, "conference_seat_replace_succeeded", field: new_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConferenceSeatReplaceFailed {
@@ -919,12 +1473,7 @@ pub struct ConferenceSeatReplaceFailed {
     pub new_call_id: String,
     pub reason: String,
 }
-impl RwiEventSpec for ConferenceSeatReplaceFailed {
-    const TYPE: &'static str = "conference_seat_replace_failed";
-    fn call_id(&self) -> Option<&str> {
-        Some(&self.new_call_id)
-    }
-}
+rwi_event!(ConferenceSeatReplaceFailed, "conference_seat_replace_failed", field: new_call_id);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IvrNodeEntered {
@@ -980,32 +1529,116 @@ rwi_event!(IvrFlowCompleted, "ivr_flow_completed");
 
 /// Structured trigger info describing what caused an IVR step to execute.
 ///
-/// Serialized as a nested object: `{"type": "dtmf", "detail": {"digit": "2"}}`.
-#[derive(Debug, Clone, Serialize)]
-pub struct TriggerInfo {
-    /// Trigger source type, e.g. `dtmf`, `dtmf_menu`, `audio_complete`,
-    /// `session_start`, `action_execute`, `chained`, `dtmf_menu_timeout`, ...
-    #[serde(rename = "type")]
-    pub r#type: String,
-    /// Structured detail for the trigger. For DTMF this is `{"digit": "2"}`,
-    /// for an API response `{"status": 200}`, for phone collection
-    /// `{"number": "..."}`. `None` when the trigger carries no detail.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<serde_json::Value>,
+/// Wire shape (adjacent tagging) — identical to the historical hand-built
+/// payloads: `{"type": "dtmf", "detail": {"digit": "2"}}` for
+/// detail-bearing triggers, `{"type": "chained"}` for detail-less ones.
+/// The variant set is the closed trigger vocabulary: a new trigger kind is
+/// a new variant, compile-checked at every emission site and in
+/// [`TriggerInfo::type_name`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", content = "detail", rename_all = "snake_case")]
+pub enum TriggerInfo {
+    Dtmf {
+        digit: String,
+        /// Digits buffered before a resumed flow re-reports them (bridge
+        /// hand-off); absent on a single keypress.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        digits: Option<Vec<String>>,
+    },
+    DtmfCollected { digit: String },
+    DtmfMenuInvalid { digit: String },
+    DtmfTimeout,
+    DtmfMenuTimeout,
+    PhoneCollected { number: String },
+    ApiResponse { status: u16 },
+    RecordingComplete { url: String, duration_secs: u64 },
+    RecordingStarted { segment_type: String, segment_id: String },
+    RecordingStopped { reason: Option<String> },
+    InputVoice { text: String, confidence: f32 },
+    Error { reason: String },
+    Fail {
+        reason: String,
+        failed_step_id: Option<String>,
+        failed_step_name: Option<String>,
+        failed_action: Option<String>,
+    },
+    TransferResult { outcome: crate::call::domain::TransferOutcome },
+    IvrFallback { reason: String, target: Option<String> },
+    /// Flow resumed onto the suspended step (session resume with a step
+    /// pointer). Shares the `resume` tag with [`TriggerInfo::Resume`].
+    #[serde(rename = "resume")]
+    ResumeFromStep { resume_from_step_id: Option<String> },
+    /// Flow resumed without a step pointer.
+    #[serde(rename = "resume")]
+    Resume,
+    SessionStart,
+    SessionEnd,
+    AudioComplete,
+    Chained,
+    ActionExecute,
+    RecordControl,
+    /// Session terminated the node's wait — which terminal reason.
+    UserHangup,
+    Cancelled,
+    Hangup,
+    /// Provider event that maps to no known trigger.
+    Unknown,
 }
 
 impl TriggerInfo {
-    pub fn new(r#type: impl Into<String>) -> Self {
-        Self {
-            r#type: r#type.into(),
-            detail: None,
+    /// Diagnostic view of the trigger kind (the wire `type` value).
+    pub fn type_name(&self) -> &'static str {        match self {
+            Self::Dtmf { .. } => "dtmf",
+            Self::DtmfCollected { .. } => "dtmf_collected",
+            Self::DtmfMenuInvalid { .. } => "dtmf_menu_invalid",
+            Self::DtmfTimeout => "dtmf_timeout",
+            Self::DtmfMenuTimeout => "dtmf_menu_timeout",
+            Self::PhoneCollected { .. } => "phone_collected",
+            Self::ApiResponse { .. } => "api_response",
+            Self::RecordingComplete { .. } => "recording_complete",
+            Self::RecordingStarted { .. } => "recording_started",
+            Self::RecordingStopped { .. } => "recording_stopped",
+            Self::InputVoice { .. } => "input_voice",
+            Self::Error { .. } => "error",
+            Self::Fail { .. } => "fail",
+            Self::TransferResult { .. } => "transfer_result",
+            Self::IvrFallback { .. } => "ivr_fallback",
+            Self::ResumeFromStep { .. } | Self::Resume => "resume",
+            Self::SessionStart => "session_start",
+            Self::SessionEnd => "session_end",
+            Self::AudioComplete => "audio_complete",
+            Self::Chained => "chained",
+            Self::ActionExecute => "action_execute",
+            Self::RecordControl => "record_control",
+            Self::UserHangup => "user_hangup",
+            Self::Cancelled => "cancelled",
+            Self::Hangup => "hangup",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Assertion accessors for the wire-contract tests — production code reads
+/// triggers through `matches!`/destructure instead.
+#[cfg(test)]
+impl TriggerInfo {
+    /// The DTMF digit across the dtmf-family triggers.
+    pub fn digit(&self) -> Option<&str> {
+        match self {
+            Self::Dtmf { digit, .. }
+            | Self::DtmfCollected { digit }
+            | Self::DtmfMenuInvalid { digit } => Some(digit),
+            _ => None,
         }
     }
 
-    pub fn with_detail(r#type: impl Into<String>, detail: serde_json::Value) -> Self {
-        Self {
-            r#type: r#type.into(),
-            detail: Some(detail),
+    /// The resume step pointer.
+    pub fn resume_step_id(&self) -> Option<&str> {
+        match self {
+            Self::ResumeFromStep {
+                resume_from_step_id,
+            } => resume_from_step_id.as_deref(),
+            _ => None,
         }
     }
 }
@@ -1014,6 +1647,19 @@ impl TriggerInfo {
 pub struct IvrStepTrace {
     pub call_id: String,
     pub session_id: String,
+    /// Runtime execution generation owning this trace (the invocation's
+    /// `app_execution_id`). Omitted when unknown — NEVER derived from
+    /// `extra`, and never replaced by a successor execution's identity.
+    ///
+    /// Composite action-instance identity is
+    /// `(session_id, app_execution_id, step_index)`: `step_index` is unique
+    /// within one execution but resets when the flow re-enters or resumes in
+    /// the same session, so consumers must pair the two fields. A
+    /// compensating trace for a flow that died while suspended (bridge /
+    /// queue / jump hand-off) carries the SUSPENDED execution's identity,
+    /// even if a successor has since started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_execution_id: Option<u64>,
     pub caller: String,
     pub callee: String,
     pub step_index: u32,
@@ -1026,6 +1672,9 @@ pub struct IvrStepTrace {
     pub step_name: Option<String>,
     pub step_start_time: Option<String>,
     pub step_end_time: Option<String>,
+    /// Opaque per-node JSON from the provider, passed through verbatim.
+    /// Never inherited from a previous node, never interpreted or completed
+    /// by the PBX.
     pub extra: Option<serde_json::Value>,
     pub sip_headers: Option<std::collections::HashMap<String, String>>,
     /// Filled only on the session-end trace entry that records how the whole
@@ -1045,15 +1694,125 @@ pub struct IvrStepTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_step_id: Option<String>,
     /// Terminal marker: `true` on the flow's final observable step
-    /// (terminal node, session end, or caller hangup mid-flow).
+    /// (terminal node, session end, or caller hangup mid-flow). A terminal
+    /// step trace carries `end=true` WITHOUT `end_reason` — the `session_end`
+    /// entry is the sole end-reason carrier (segmented-record contract).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<bool>,
 }
 rwi_event!(IvrStepTrace, "ivr_step_trace");
 
+impl IvrStepTrace {
+    /// Completion contract: every emitted entry carries BOTH stamps, so
+    /// consumers can rely on them unconditionally — `step_end_time` is the
+    /// completion marker, and `step_start_time` falls back to it (never
+    /// later than the end). `duration_ms` is already non-optional by type.
+    /// Idempotent: entries that already carry stamps pass through untouched.
+    pub fn with_completion_stamps(mut self) -> Self {
+        if self.step_end_time.is_none() {
+            self.step_end_time = Some(chrono::Utc::now().to_rfc3339());
+        }
+        if self.step_start_time.is_none() {
+            self.step_start_time = self.step_end_time.clone();
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal fixture shared by the `IvrStepTrace` contract tests.
+    fn mk_trace(start: Option<String>, end: Option<String>) -> IvrStepTrace {
+        IvrStepTrace {
+            call_id: "call-1".into(),
+            session_id: "sess-1".into(),
+            app_execution_id: None,
+            caller: "1001".into(),
+            callee: "2000".into(),
+            step_index: 1,
+            trigger: TriggerInfo::ActionExecute,
+            action_type: "ivr_fallback".into(),
+            action_json: None,
+            duration_ms: 0,
+            error: None,
+            step_id: None,
+            step_name: None,
+            step_start_time: start,
+            step_end_time: end,
+            extra: None,
+            sip_headers: None,
+            end_reason: None,
+            end_detail: None,
+            next_node_id: None,
+            next_step_id: None,
+            end: None,
+        }
+    }
+
+    /// Execution-identity contract on the wire: `app_execution_id` is omitted
+    /// when unknown (old consumers never see the key) and carried verbatim
+    /// when known. It lives OUTSIDE `extra` and is never derived from it.
+    #[test]
+    fn ivr_step_trace_app_execution_id_omitted_when_absent() {
+        let mut ev = mk_trace(None, None);
+        let none_payload = serde_json::to_value(&ev).unwrap();
+        assert!(
+            none_payload.get("app_execution_id").is_none(),
+            "absent identity must be omitted from the payload entirely, got: {none_payload}"
+        );
+
+        ev.app_execution_id = Some(7);
+        let some_payload = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            some_payload["app_execution_id"], 7,
+            "known identity must round-trip as an outer integer field"
+        );
+    }
+
+    /// Completion contract on the RWI event type itself: an entry built
+    /// without stamps is repaired (end = now, start = end) and an entry that
+    /// already carries stamps passes through untouched (idempotent).
+    #[test]
+    fn ivr_step_trace_completion_stamps_backfilled_and_idempotent() {
+        // Both missing → both backfilled, end >= start.
+        let repaired = mk_trace(None, None).with_completion_stamps();
+        let start = repaired
+            .step_start_time
+            .as_deref()
+            .expect("start backfilled");
+        let end = repaired.step_end_time.as_deref().expect("end backfilled");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(end).unwrap()
+                >= chrono::DateTime::parse_from_rfc3339(start).unwrap(),
+            "backfilled end must not precede start"
+        );
+
+        // Start missing with an explicit end → start falls back to end.
+        let end_only =
+            mk_trace(None, Some("2026-01-01T00:00:05+00:00".into())).with_completion_stamps();
+        assert_eq!(
+            end_only.step_start_time.as_deref(),
+            Some("2026-01-01T00:00:05+00:00"),
+            "start falls back to the explicit end"
+        );
+
+        // Already complete → untouched.
+        let untouched = mk_trace(
+            Some("2026-01-01T00:00:00+00:00".into()),
+            Some("2026-01-01T00:00:01+00:00".into()),
+        )
+        .with_completion_stamps();
+        assert_eq!(
+            untouched.step_start_time.as_deref(),
+            Some("2026-01-01T00:00:00+00:00")
+        );
+        assert_eq!(
+            untouched.step_end_time.as_deref(),
+            Some("2026-01-01T00:00:01+00:00")
+        );
+    }
 
     #[test]
     fn ivr_events_serialize_extra_field() {
@@ -1116,6 +1875,7 @@ mod tests {
                 call_id: "call-1".into(),
                 digit: "5".into(),
                 leg_id: None,
+                leg_role: None,
                 extra: None,
             },
             None,
@@ -1125,6 +1885,7 @@ mod tests {
                 call_id: "call-2".into(),
                 digit: "9".into(),
                 leg_id: Some("caller".into()),
+                leg_role: None,
                 extra: Some(serde_json::json!({"foo": "bar"})),
             },
             None,
@@ -1219,6 +1980,248 @@ mod tests {
     /// byte-identical to the legacy shape (no `skill_groups` key); with them
     /// the array rides along. `queue_overflow_joined` carries the newly
     /// joined overflow group.
+    // ═══════ Static contract tests — construction mechanism ═══════
+
+    /// Every registered event type is unique and snake_case-typed: the wire
+    /// `event_type` is the routing discriminator, so a collision or typo'd
+    /// name would silently merge two event streams.
+    #[test]
+    fn event_type_registry_unique_and_snake_case() {
+        let mut sorted = EVENT_TYPES.to_vec();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), len, "event TYPE collision in registry");
+        assert!(len >= 70, "registry drifted: only {len} types registered");
+        for ty in EVENT_TYPES {
+            assert!(!ty.is_empty());
+            assert!(
+                ty.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "event TYPE {ty:?} must be snake_case"
+            );
+        }
+    }
+
+    /// Typed lifts compile against the declaring struct (a wrong field name
+    /// is a compile error at the `fields:` site) and extract correctly.
+    #[test]
+    fn event_meta_lifts_extract_typed_fields() {
+        // String leg_id holder → Option via Into.
+        let held = RwiEvent::from_spec(
+            &CallHeld {
+                leg_role: None,
+                call_id: "c1".into(),
+                leg_id: "agent".into(),
+            },
+            None,
+        );
+        assert_eq!(held.meta.leg_id.as_deref(), Some("agent"));
+
+        // Transfer target + source agent extraction.
+        let transferred = RwiEvent::from_spec(
+            &CallTransferred {
+                call_id: "c1".into(),
+                transfer_target: Some("1003".into()),
+                transfer_target_type: Some("sip".into()),
+                transfer_source: Some(TransferSource {
+                    source_type: "agent".into(),
+                    name: None,
+                    ivr_node_id: None,
+                    agent_id: Some("1001".into()),
+                    agent_name: None,
+                }),
+            },
+            None,
+        );
+        assert_eq!(transferred.meta.transfer_target.as_deref(), Some("1003"));
+        assert_eq!(
+            transferred.meta.transfer_source_agent.as_deref(),
+            Some("1001")
+        );
+        assert!(transferred.meta.has_transfer_source);
+
+        // DTMF digit + no own transfer source.
+        let dtmf = RwiEvent::from_spec(
+            &Dtmf {
+                call_id: "c1".into(),
+                digit: "5".into(),
+                leg_id: Some("caller".into()),
+                leg_role: None,
+                extra: None,
+            },
+            None,
+        );
+        assert_eq!(dtmf.meta.dtmf_digit, Some('5'));
+        assert_eq!(dtmf.meta.leg_id.as_deref(), Some("caller"));
+        assert!(!dtmf.meta.has_transfer_source);
+
+        // Events without lifts carry the default meta.
+        let plain = RwiEvent::from_spec(
+            &RecordPaused { call_id: "c1".into() },
+            None,
+        );
+        assert_eq!(plain.meta, EventMeta::default());
+    }
+
+    /// `TriggerInfo` wire shape is pinned: adjacent tagging reproduces the
+    /// historical hand-built payloads byte-for-byte (`type` + optional
+    /// `detail`; `Option` fields render `null` like `json!` did).
+    #[test]
+    fn trigger_info_wire_shape_unchanged() {
+        let dtmf = serde_json::to_value(&TriggerInfo::Dtmf {
+            digit: "2".into(),
+            digits: None,
+        })
+        .unwrap();
+        assert_eq!(
+            dtmf,
+            serde_json::json!({"type": "dtmf", "detail": {"digit": "2"}})
+        );
+
+        let chained = serde_json::to_value(&TriggerInfo::Chained).unwrap();
+        assert_eq!(chained, serde_json::json!({"type": "chained"}));
+
+        let fail = serde_json::to_value(&TriggerInfo::Fail {
+            reason: "x".into(),
+            failed_step_id: None,
+            failed_step_name: None,
+            failed_action: None,
+        })
+        .unwrap();
+        assert_eq!(fail["type"], "fail");
+        assert_eq!(fail["detail"]["reason"], "x");
+        assert_eq!(fail["detail"]["failed_step_id"], serde_json::Value::Null);
+
+        // Buffered-digits variant only carries `digits` when present.
+        let resumed = serde_json::to_value(&TriggerInfo::Dtmf {
+            digit: "1".into(),
+            digits: Some(vec!["2".into(), "3".into()]),
+        })
+        .unwrap();
+        assert_eq!(
+            resumed["detail"],
+            serde_json::json!({"digit": "1", "digits": ["2", "3"]})
+        );
+    }
+
+    /// KIND anchors: the static categories the gateway dispatches on must
+    /// match the event families (never re-derived from strings).
+    #[test]
+    fn event_kind_anchors() {
+        assert!(CallCreated::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallRinging::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallAnswered::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallHangup::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallHeld::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallUnheld::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallTransferred::KIND.contains(EventKind::LIFECYCLE));
+        assert!(CallTransferred::KIND.contains(EventKind::TRANSFER));
+        assert!(Dtmf::KIND.contains(EventKind::DTMF));
+        // Non-dispatched families stay untagged.
+        assert!(QueueJoined::KIND.is_empty());
+        assert!(IvrStepTrace::KIND.is_empty());
+        assert!(RecordEnd::KIND.is_empty());
+
+        // Operator composition + vocabulary + Debug rendering.
+        let composed = EventKind::LIFECYCLE | EventKind::TRANSFER;
+        assert_eq!(composed, CallTransferred::KIND);
+        assert!(composed.intersects(EventKind::TRANSFER));
+        assert!(!EventKind::EMPTY.intersects(EventKind::ALL));
+        assert!(EventKind::ALL.contains(EventKind::LIFECYCLE | EventKind::DTMF | EventKind::TRANSFER));
+        assert_eq!(
+            format!("{:?}", CallTransferred::KIND),
+            "EventKind(LIFECYCLE | TRANSFER)"
+        );
+        assert_eq!(format!("{:?}", EventKind::EMPTY), "EventKind(EMPTY)");
+    }
+
+    /// The envelope is the single serialization pass: `event_type` rides the
+    /// payload (wire contract), context merges with existing-key-wins, and
+    /// the erased event carries TYPE/KIND statically.
+    #[test]
+    fn from_spec_envelope_and_static_identity() {
+        let ev = RwiEvent::from_spec(
+            &CallRinging {
+                leg_id: None,
+                leg_role: None,
+                call_id: "call-1".into(),
+                early_media: false,
+                agent_id: None,
+                agent_name: None,
+            },
+            None,
+        );
+        assert_eq!(ev.event_type, "call_ringing");
+        assert!(ev.kind.contains(EventKind::LIFECYCLE));
+        assert_eq!(ev.call_id.as_deref(), Some("call-1"));
+        assert_eq!(ev.payload["event_type"], "call_ringing");
+        assert_eq!(ev.payload["call_id"], "call-1");
+    }
+
+    /// Context merge contract: existing keys win, nulls skipped, sections
+    /// merge under their reserved key without shadowing event fields.
+    #[test]
+    fn merge_context_and_sections_existing_keys_win() {
+        let mut sections = std::collections::BTreeMap::new();
+        sections.insert("cc".to_string(), serde_json::json!({"skill": "l2"}));
+        sections.insert("call_id".to_string(), serde_json::json!("MUST-NOT-WIN"));
+        let ctx = EventCallContext {
+            direction: Some("inbound".into()),
+            caller: Some("1001".into()),
+            sections,
+            ..Default::default()
+        };
+        let payload = to_flat_payload(
+            &CallAnswered {
+                leg_id: None,
+                leg_role: None,
+                call_id: "call-1".into(),
+            },
+            Some(&ctx),
+        );
+        // Event's own field beats context.
+        assert_eq!(payload["call_id"], "call-1");
+        // Flat context merged.
+        assert_eq!(payload["direction"], "inbound");
+        assert_eq!(payload["caller"], "1001");
+        // Section merged under its reserved key.
+        assert_eq!(payload["cc"]["skill"], "l2");
+    }
+
+    /// field:/option:/none call_id shapes resolve through the erased event.
+    #[test]
+    fn call_id_shapes_resolve() {
+        let opt = RwiEvent::from_spec(
+            &DbWriteFailed {
+                call_id: Some("call-9".into()),
+                entity: "t".into(),
+                operation: "insert".into(),
+                error: "e".into(),
+                suppressed: None,
+            },
+            None,
+        );
+        assert_eq!(opt.call_id.as_deref(), Some("call-9"));
+        assert_eq!(opt.payload["event_type"], "db_write_failed");
+        assert_eq!(opt.payload["entity"], "t");
+
+        let field = RwiEvent::from_spec(
+            &SupervisorListenStarted {
+                supervisor_call_id: "sup-1".into(),
+                target_call_id: "target-1".into(),
+            },
+            None,
+        );
+        assert_eq!(field.call_id.as_deref(), Some("target-1"));
+        // The custom field serializes under its own name, not `call_id`.
+        assert!(field.payload.get("call_id").is_none());
+        assert_eq!(field.payload["target_call_id"], "target-1");
+
+        let none = RwiEvent::from_spec(&CallBridged { leg_a: "a".into(), leg_b: "b".into() }, None);
+        assert_eq!(none.call_id, None);
+        assert_eq!(none.payload["event_type"], "call_bridged");
+    }
+
     #[test]
     fn queue_left_skill_groups_wire_compat() {
         let plain = to_flat_payload(
@@ -1256,11 +2259,29 @@ mod tests {
                 call_id: "call-1".into(),
                 queue_id: "support".into(),
                 skill_group: "support_l2".into(),
+                priority: None,
             },
             None,
         );
         assert_eq!(joined["queue_id"], "support");
         assert_eq!(joined["skill_group"], "support_l2");
+        assert!(
+            joined.get("priority").is_none(),
+            "default priority must stay absent from the wire payload"
+        );
+        let joined_prio = to_flat_payload(
+            &QueueOverflowJoined {
+                call_id: "call-1".into(),
+                queue_id: "support".into(),
+                skill_group: "support_l2".into(),
+                priority: Some(7),
+            },
+            None,
+        );
+        assert_eq!(
+            joined_prio["priority"], 7,
+            "non-default priority rides along"
+        );
     }
 
     #[test]

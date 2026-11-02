@@ -6,7 +6,20 @@ pub(super) fn normalize_call_hangup_by(
     hangup_by: &str,
     queue_name: Option<&str>,
     has_resolved_agent: bool,
+    hangup_by_side: Option<&str>,
 ) -> String {
+    // Outbound correction: on a CTI click-to-dial / originate call the
+    // caller/A dialog's UAS is the dialed CUSTOMER. A UAS BYE there is the
+    // customer hanging up (stamped `caller_remote`), so the CC-centric
+    // `ByCallee → "agent"` mapping must not fire — the initiator is the
+    // customer ("callee"). A remote BYE on a callee/agent dialog
+    // (`callee_remote`) IS the agent hanging up and keeps "agent"; inbound
+    // sessions never stamp `caller_remote` (their caller-dialog UAS is the
+    // proxy, so a UasBye there is the callee-side cascade, correctly
+    // attributed through the existing mapping below).
+    if hangup_by == "agent" && hangup_by_side == Some("caller_remote") {
+        return "callee".to_string();
+    }
     if hangup_by == "agent" && queue_name.is_none() && !has_resolved_agent {
         "callee".to_string()
     } else {
@@ -14,7 +27,68 @@ pub(super) fn normalize_call_hangup_by(
     }
 }
 
-pub(super) fn sip_status_to_hangup_reason(status_code: u16) -> CallRecordHangupReason {
+#[cfg(test)]
+mod tests {
+    use super::normalize_call_hangup_by;
+
+    #[test]
+    fn inbound_agent_hangup_stays_agent_with_cc_context() {
+        // Inbound CC call, agent (callee side) hangs up: ByCallee → "agent".
+        assert_eq!(
+            normalize_call_hangup_by("agent", Some("support"), true, Some("callee_remote")),
+            "agent"
+        );
+        // First-BYE side not stamped (legacy paths): CC context keeps "agent".
+        assert_eq!(
+            normalize_call_hangup_by("agent", Some("support"), true, None),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn outbound_customer_hangup_normalizes_to_callee() {
+        // Outbound click-to-dial, CUSTOMER hangs up first: the caller/A
+        // dialog's remote BYE was stamped `caller_remote` — the CC-centric
+        // "agent" attribution must be corrected to "callee".
+        assert_eq!(
+            normalize_call_hangup_by("agent", None, true, Some("caller_remote")),
+            "callee"
+        );
+        // Even with a queue name present (customer hung while queued).
+        assert_eq!(
+            normalize_call_hangup_by("agent", Some("support"), true, Some("caller_remote")),
+            "callee"
+        );
+    }
+
+    #[test]
+    fn outbound_agent_hangup_stays_agent() {
+        // Outbound call, the AGENT bridge leg hangs up: remote BYE on the
+        // callee dialog (`callee_remote`) — attribution stays "agent".
+        assert_eq!(
+            normalize_call_hangup_by("agent", None, true, Some("callee_remote")),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn local_bye_and_non_agent_initiators_untouched() {
+        // We tore the call down ourselves: never rewritten.
+        assert_eq!(
+            normalize_call_hangup_by("system", None, false, Some("local")),
+            "system"
+        );
+        // Plain customer/caller initiator: untouched.
+        assert_eq!(
+            normalize_call_hangup_by("caller", None, false, Some("caller_remote")),
+            "caller"
+        );
+        // No CC context at all: existing "callee" fallback keeps working.
+        assert_eq!(normalize_call_hangup_by("agent", None, false, None), "callee");
+    }
+}
+
+pub(crate) fn sip_status_to_hangup_reason(status_code: u16) -> CallRecordHangupReason {
     match status_code {
         486 | 600 => CallRecordHangupReason::Rejected,
         487 => CallRecordHangupReason::Canceled,
@@ -34,7 +108,7 @@ pub(super) fn sip_status_to_hangup_reason(status_code: u16) -> CallRecordHangupR
     }
 }
 
-pub(super) fn format_duration_ms(ms: i64) -> String {
+pub(crate) fn format_duration_ms(ms: i64) -> String {
     if ms >= 1000 {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
@@ -156,7 +230,7 @@ pub(crate) async fn route_leg(
     }
 }
 
-pub(super) fn parse_dtmf_digit(body_text: &str) -> Option<char> {
+pub(crate) fn parse_dtmf_digit(body_text: &str) -> Option<char> {
     for line in body_text.lines() {
         let line = line.trim();
         if line.to_lowercase().starts_with("signal=") {
@@ -177,12 +251,20 @@ pub(super) fn parse_dtmf_digit(body_text: &str) -> Option<char> {
 /// the injection succeeds). Returns `true` only when a running app consumed
 /// the event — `false` means no app is running (starting up / between apps /
 /// none scheduled) and the caller may want to buffer the digit.
+///
+/// `source` describes how the digit entered the system (RFC 2833 / SIP INFO
+/// vs in-band audio detection); on the RWI `dtmf` event it is exposed as
+/// `extra.source` only for in-band digits, so legacy consumers of
+/// signaling-sourced events see byte-identical payloads.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn inject_dtmf_into_app(
     digit: char,
     leg_id: &str,
     session_id: &str,
     app_runtime: &Arc<dyn AppRuntime>,
     rwi_gateway: &Option<crate::rwi::RwiGatewayRef>,
+    leg_role: Option<String>,
+    source: crate::media::ingress_tap::DtmfSource,
 ) -> bool {
     if !app_runtime.is_running() {
         return false;
@@ -200,14 +282,18 @@ pub(super) fn inject_dtmf_into_app(
             false
         }
         Ok(()) => {
-            debug!(session_id = %session_id, leg_id, digit = %digit_str, "DTMF injected into app");
+            debug!(session_id = %session_id, leg_id, digit = %digit_str, source = source.as_str(), "DTMF injected into app");
             if let Some(gw) = rwi_gateway.as_ref() {
                 let g = gw.read();
                 g.send_to_owner(&crate::rwi::Dtmf {
                     call_id: session_id.to_string(),
                     digit: digit_str.clone(),
                     leg_id: Some(leg_id.to_string()),
-                    extra: None,
+                    leg_role,
+                    // Only in-band digits carry the marker; RFC 2833 / SIP
+                    // INFO events keep `extra: None` for payload stability.
+                    extra: (source == crate::media::ingress_tap::DtmfSource::Inband)
+                        .then(|| serde_json::json!({ "source": source.as_str() })),
                 });
             }
             true
@@ -246,9 +332,10 @@ pub(super) async fn trace_sip_headers(
 ///    trace is suppressed (the resumed executor reports the bridge step with
 ///    `next_node_id`); the buffered digit still reaches the provider.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn forward_dtmf_event(
+pub(crate) fn forward_dtmf_event(
     digit: char,
     leg_id: &str,
+    application_leg: &str,
     session_id: &str,
     app_runtime: &Arc<dyn AppRuntime>,
     rwi_gateway: &Option<crate::rwi::RwiGatewayRef>,
@@ -258,11 +345,12 @@ pub(super) fn forward_dtmf_event(
     caller: &str,
     callee: &str,
     sip_headers: Option<std::collections::HashMap<String, String>>,
+    leg_role: Option<String>,
+    source: crate::media::ingress_tap::DtmfSource,
 ) -> bool {
-    // Call applications are attached to the caller leg. Agent-side INFO must
-    // still be forwarded to its SIP peer, but it is never authoritative input
-    // for an IVR/menu application (the RTP path already listens to caller only).
-    if leg_id != "caller" {
+    // A transferred application serves its bound participant, which can be
+    // the callee. Input from the other leg must not drive the customer menu.
+    if leg_id != application_leg {
         return false;
     }
     let digit_str = digit.to_string();
@@ -294,16 +382,20 @@ pub(super) fn forward_dtmf_event(
             let ev = crate::rwi::IvrStepTrace {
                 call_id: session_id.to_string(),
                 session_id: session_id.to_string(),
+                // Originating execution's identity (stashed at hand-off via
+                // `_rst_app_execution_id`) — digits pressed during the bridge
+                // key to the suspended execution, not a successor.
+                app_execution_id: ctx.app_execution_id,
                 caller: caller.to_string(),
                 callee: callee.to_string(),
                 // Real index of the originating node (stashed by the executor
                 // via `_rst_step_index`, matching its hand-off trace); 0 only
                 // when the bridge has no node context at all.
                 step_index: ctx.step_index.unwrap_or(0),
-                trigger: crate::rwi::TriggerInfo::with_detail(
-                    "dtmf",
-                    serde_json::json!({ "digit": digit_str }),
-                ),
+                trigger: crate::rwi::TriggerInfo::Dtmf {
+                    digit: digit_str,
+                    digits: None,
+                },
                 action_type: "Bridge".to_string(),
                 action_json: None,
                 duration_ms,
@@ -319,14 +411,24 @@ pub(super) fn forward_dtmf_event(
                 next_node_id: None,
                 next_step_id: None,
                 end: None,
-            };
+            }
+            // Completion contract: both stamps present on every emitted entry.
+            .with_completion_stamps();
             gw.read().fan_out(session_id, &ev);
         }
         // The bridge owns media while active. Injecting the same digit into
         // the suspended app would replay one physical key as a second input.
         return true;
     }
-    inject_dtmf_into_app(digit, leg_id, session_id, app_runtime, rwi_gateway)
+    inject_dtmf_into_app(
+        digit,
+        leg_id,
+        session_id,
+        app_runtime,
+        rwi_gateway,
+        leg_role,
+        source,
+    )
 }
 
 /// Map the session teardown cause to the compensating `session_end` reason
@@ -368,7 +470,9 @@ pub(super) fn map_suspended_flow_end(
 /// guarantees consumers still see exactly one session_end per logical flow —
 /// carrying the REAL end reason instead of a premature `transfer`. Node
 /// context comes from the bridge trace context when the suspension was a
-/// voip_bridge.
+/// voip_bridge. `app_execution_id` is the SUSPENDED execution's identity
+/// (resolved by the caller from the executor's stash); `None` omits the
+/// field — never guessed, never taken from `extra`.
 pub(super) fn emit_suspended_flow_session_end(
     session_id: &str,
     caller: &str,
@@ -377,8 +481,17 @@ pub(super) fn emit_suspended_flow_session_end(
     bridge_trace_context: &parking_lot::Mutex<Option<super::transfer::BridgeTraceContext>>,
     sip_headers: Option<std::collections::HashMap<String, String>>,
     end_reason: crate::call::app::ivr::provider::SessionEndReason,
+    app_execution_id: Option<u64>,
 ) {
     let Some(gw) = rwi_gateway.as_ref() else {
+        // The end fact itself is not lost (the CDR still records the hangup),
+        // but the trace consumer never sees the compensating session_end.
+        // Make the drop visible instead of failing silently.
+        tracing::warn!(
+            session_id = %session_id,
+            end_reason = ?end_reason.reason,
+            "suspended flow session_end dropped: no RWI gateway attached"
+        );
         return;
     };
     let ctx = bridge_trace_context.lock().clone();
@@ -394,13 +507,20 @@ pub(super) fn emit_suspended_flow_session_end(
     let ev = crate::rwi::IvrStepTrace {
         call_id: session_id.to_string(),
         session_id: session_id.to_string(),
+        // Bridge-suspended flows take the identity stashed in the bridge
+        // context (same source as the DTMF traces for this node); other
+        // suspensions fall back to the executor's session-var stash.
+        app_execution_id: ctx
+            .as_ref()
+            .and_then(|c| c.app_execution_id)
+            .or(app_execution_id),
         caller: caller.to_string(),
         callee: callee.to_string(),
         // Bridge-suspended flows carry the executor-stashed step index;
         // non-bridge suspensions (queue / jump without node context) keep 0,
         // consistent with the other absent context fields.
         step_index: ctx.as_ref().and_then(|c| c.step_index).unwrap_or(0),
-        trigger: crate::rwi::TriggerInfo::new("session_end"),
+        trigger: crate::rwi::TriggerInfo::SessionEnd,
         action_type: if ctx.is_some() { "Bridge" } else { "Transfer" }.to_string(),
         action_json: None,
         duration_ms,
@@ -416,11 +536,13 @@ pub(super) fn emit_suspended_flow_session_end(
         next_node_id: None,
         next_step_id: None,
         end: Some(true),
-    };
+    }
+    // Completion contract: both stamps present on every emitted entry.
+    .with_completion_stamps();
     gw.read().fan_out(session_id, &ev);
 }
 
-pub(super) fn trunk_host_port(dest: &str) -> Option<(String, u16)> {
+pub(crate) fn trunk_host_port(dest: &str) -> Option<(String, u16)> {
     if dest.trim().is_empty() {
         return None;
     }
@@ -451,7 +573,7 @@ pub(super) fn parse_dial_target(target: &str) -> Result<rsipstack::sip::Uri> {
         .map_err(|e| anyhow!("invalid SIP target '{}': {}", target, e))
 }
 
-pub(super) fn other_header_ci(
+pub(crate) fn other_header_ci(
     headers: &[rsipstack::sip::Header],
     names: &[&str],
 ) -> Option<String> {
@@ -465,7 +587,7 @@ pub(super) fn other_header_ci(
     None
 }
 
-pub(super) fn parse_sipfrag_status(body: &str) -> Option<u16> {
+pub(crate) fn parse_sipfrag_status(body: &str) -> Option<u16> {
     let line = body.lines().next()?;
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() >= 2 && parts[0] == "SIP/2.0" {

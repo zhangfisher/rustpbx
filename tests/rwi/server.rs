@@ -400,7 +400,8 @@ async fn test_event_pushed_from_gateway_arrives_at_client() {
                 digit: "7".to_string(),
                 leg_id: None,
                 extra: None,
-            },
+                leg_role: None,
+},
         );
     }
 
@@ -664,21 +665,23 @@ async fn test_session_resume_returns_events() {
     // Cache some events in the gateway
     {
         let gw = gateway.read();
-        let event1 = rustpbx::rwi::event::to_legacy_event(
+        let event1 = rustpbx::rwi::event::RwiEvent::from_spec(
             &rustpbx::rwi::CallRinging {
                 leg_id: None,
                 call_id: "test-call-1".to_string(),
                 early_media: false,
                 agent_id: None,
                 agent_name: None,
-            },
+                leg_role: None,
+},
             None,
         );
-        let event2 = rustpbx::rwi::event::to_legacy_event(
+        let event2 = rustpbx::rwi::event::RwiEvent::from_spec(
             &rustpbx::rwi::CallAnswered {
                 leg_id: None,
                 call_id: "test-call-1".to_string(),
-            },
+                leg_role: None,
+},
             None,
         );
         gw.cache_event(&"test-call-1".to_string(), &event1);
@@ -716,24 +719,26 @@ async fn test_call_resume_returns_call_specific_events() {
     // Cache events for different calls
     {
         let gw = gateway.read();
-        let event1 = rustpbx::rwi::event::to_legacy_event(
+        let event1 = rustpbx::rwi::event::RwiEvent::from_spec(
             &rustpbx::rwi::CallRinging {
                 leg_id: None,
                 call_id: "call-a".to_string(),
                 early_media: false,
                 agent_id: None,
                 agent_name: None,
-            },
+                leg_role: None,
+},
             None,
         );
-        let event2 = rustpbx::rwi::event::to_legacy_event(
+        let event2 = rustpbx::rwi::event::RwiEvent::from_spec(
             &rustpbx::rwi::CallRinging {
                 leg_id: None,
                 call_id: "call-b".to_string(),
                 early_media: false,
                 agent_id: None,
                 agent_name: None,
-            },
+                leg_role: None,
+},
             None,
         );
         gw.cache_event(&"call-a".to_string(), &event1);

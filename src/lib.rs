@@ -21,7 +21,9 @@ pub mod db_report;
 pub mod handler;
 pub mod license;
 pub mod log_reload;
+mod log_search;
 pub mod log_viewer;
+pub mod master_link;
 pub mod mail;
 
 pub use rustpbx_http_util as http_util;

@@ -172,6 +172,9 @@ pub enum TestUaEvent {
     CallTerminated(DialogId),
     CallFailed(String),
     CallUpdated(DialogId, rsipstack::sip::Method, Option<String>),
+    /// restend consult_state marker relayed on an in-dialog UPDATE
+    /// (`User-to-User: consult-state=<phase>`)
+    ConsultStateUpdated(DialogId, String),
     /// Refer received with target URI
     Referred(DialogId, String),
     /// REFER progress: dialog, sipfrag body, Subscription-State.
@@ -423,7 +426,36 @@ impl TestUa {
         callee: &str,
         sdp_offer: Option<String>,
     ) -> Result<DialogId> {
-        self.make_call_inner(callee, sdp_offer, None, Vec::new()).await
+        let callee_uri = format!(
+            "sip:{}@{}:{}",
+            callee,
+            self.config.proxy_addr.ip(),
+            self.config.proxy_addr.port()
+        )
+        .try_into()
+        .map_err(|e| anyhow!("Invalid callee URI: {:?}", e))?;
+        self.make_call_uri_inner(callee_uri, sdp_offer, None, Vec::new())
+            .await
+    }
+
+    /// Dial an arbitrary callee URI — e.g. a canonical cluster address
+    /// (`sip:user@realm`) instead of this UA's proxy socket. Cluster fork
+    /// tests need this to exercise the home-hop vs canonical-realm
+    /// distinction.
+    pub async fn make_call_to_uri(
+        &self,
+        callee_uri: &str,
+        sdp_offer: Option<String>,
+    ) -> Result<DialogId> {
+        let callee_uri: rsipstack::sip::Uri = callee_uri
+            .parse()
+            .map_err(|e| anyhow!("Invalid callee URI '{callee_uri}': {e}"))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.make_call_uri_inner(callee_uri.clone(), sdp_offer, None, Vec::new()),
+        )
+        .await
+        .map_err(|_| anyhow!("make_call_to_uri timed out after 30s for callee '{callee_uri}'"))?
     }
 
     /// Make a call whose initial INVITE carries extra application headers
@@ -434,9 +466,17 @@ impl TestUa {
         sdp_offer: Option<String>,
         extra_headers: Vec<(String, String)>,
     ) -> Result<DialogId> {
+        let callee_uri = format!(
+            "sip:{}@{}:{}",
+            callee,
+            self.config.proxy_addr.ip(),
+            self.config.proxy_addr.port()
+        )
+        .try_into()
+        .map_err(|e| anyhow!("Invalid callee URI: {:?}", e))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.make_call_inner(callee, sdp_offer, None, extra_headers),
+            self.make_call_uri_inner(callee_uri, sdp_offer, None, extra_headers),
         )
         .await
         .map_err(|_| anyhow!("make_call_with_headers timed out after 30s for callee '{}'", callee))?
@@ -452,17 +492,25 @@ impl TestUa {
         callee: &str,
         fake_ip: &str,
     ) -> Result<DialogId> {
+        let callee_uri = format!(
+            "sip:{}@{}:{}",
+            callee,
+            self.config.proxy_addr.ip(),
+            self.config.proxy_addr.port()
+        )
+        .try_into()
+        .map_err(|e| anyhow!("Invalid callee URI: {:?}", e))?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.make_call_inner(callee, None, Some(fake_ip.to_string()), Vec::new()),
+            self.make_call_uri_inner(callee_uri, None, Some(fake_ip.to_string()), Vec::new()),
         )
         .await
         .map_err(|_| anyhow!("make_call_spoofed_cline timed out after 30s for callee '{callee}'"))?
     }
 
-    async fn make_call_inner(
+    async fn make_call_uri_inner(
         &self,
-        callee: &str,
+        callee_uri: rsipstack::sip::Uri,
         sdp_offer: Option<String>,
         spoof_cline_ip: Option<String>,
         extra_headers: Vec<(String, String)>,
@@ -483,15 +531,6 @@ impl TestUa {
             password: self.config.password.clone(),
             realm: Some(self.config.realm.clone()),
         };
-
-        let callee_uri = format!(
-            "sip:{}@{}:{}",
-            callee,
-            self.config.proxy_addr.ip(),
-            self.config.proxy_addr.port()
-        )
-        .try_into()
-        .map_err(|e| anyhow!("Invalid callee URI: {:?}", e))?;
 
         let proxy_uri: rsipstack::sip::Uri = format!(
             "sip:{}:{};lr",
@@ -718,6 +757,11 @@ impl TestUa {
 
     /// Send a plaintext RTP packet on the WebRTC leg; rustrtc SRTP-protects
     /// it before it hits the wire.
+    ///
+    /// In SDES mode the SRTP session is armed asynchronously after the SDP
+    /// answer is applied (rustrtc 0.4.x `wait_for_rtp_transport_ready` only
+    /// waits for the transport to EXIST), so an immediate send can race the
+    /// `start_srtp` arm. Retry briefly on that specific not-ready error.
     #[allow(dead_code)]
     pub async fn send_webrtc_rtp(
         &self,
@@ -989,6 +1033,29 @@ impl TestUa {
     ) -> Result<Option<String>> {
         self.send_mid_dialog_request(dialog_id, rsipstack::sip::Method::Update, sdp)
             .await
+    }
+
+    /// Send a header-only UPDATE (no SDP) — e.g. the restend consult_state
+    /// marker (`User-to-User: consult-state=…`). Replies OK when the relay
+    /// path handles it.
+    pub async fn send_update_with_headers(
+        &self,
+        dialog_id: &DialogId,
+        headers: Vec<rsipstack::sip::Header>,
+    ) -> Result<()> {
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .ok_or_else(|| anyhow!("TestUa not started"))?;
+        if let Some(mut dialog) = dialog_layer.get_dialog(dialog_id) {
+            if let Dialog::Invite(d) = &mut dialog {
+                d.update(Some(headers), None)
+                    .await
+                    .map_err(|e| e.into_anyhow())?;
+                return Ok(());
+            }
+        }
+        Err(anyhow!("dialog not found"))
     }
 
     /// Send re-INVITE request within a dialog and return the answer SDP if any
@@ -1263,6 +1330,35 @@ impl TestUa {
                         } else {
                             None
                         };
+                        // restend consult_state marker (User-to-User:
+                        // consult-state=…) — for the relay end-to-end assertion.
+                        let mut consult_phase = None;
+                        for header in request.headers.iter() {
+                            let raw = match header {
+                                // A typed header's to_string() renders the full
+                                // header line (name included) — take the bare
+                                // value via value(), otherwise the marker parse
+                                // never matches.
+                                rsipstack::sip::Header::UserToUser(v) => v.value().to_string(),
+                                rsipstack::sip::Header::Other(name, v)
+                                    if name.eq_ignore_ascii_case("User-to-User") =>
+                                {
+                                    v.clone()
+                                }
+                                _ => continue,
+                            };
+                            for part in raw.split(';') {
+                                if let Some(p) = part.trim().strip_prefix("consult-state=") {
+                                    consult_phase = Some(p.trim().to_string());
+                                }
+                            }
+                        }
+                        if let Some(phase) = consult_phase {
+                            events.push(TestUaEvent::ConsultStateUpdated(
+                                id.clone(),
+                                phase,
+                            ));
+                        }
                         events.push(TestUaEvent::CallUpdated(id.clone(), request.method, sdp));
                         // Reply with saved answer SDP if available (for re-INVITE responses)
                         let sdps = self.answer_sdps.lock().await;

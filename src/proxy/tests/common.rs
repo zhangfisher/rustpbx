@@ -129,6 +129,10 @@ async fn create_test_server_with_dependencies(
         conf_mgr.clone(),
     ));
 
+    let presence_manager = Arc::new(
+        crate::proxy::presence::PresenceManager::new(None)
+            .with_registration_guard(locator.clone(), locator_event_lock.clone()),
+    );
     let server_inner = Arc::new(SipServerInner {
         http_client: reqwest::Client::new(),
         rtp_config: ArcSwap::new(Arc::new(RtpConfig::default())),
@@ -148,6 +152,7 @@ async fn create_test_server_with_dependencies(
         database: None,
         user_backend,
         auth_backend: Vec::new(),
+        registration_response_hook: None,
         call_router: None,
         locator,
         callrecord_sender: None,
@@ -170,7 +175,7 @@ async fn create_test_server_with_dependencies(
         call_record_hooks: Arc::new(Vec::new()),
         runnings_tx: Arc::new(AtomicUsize::new(0)),
         storage: None,
-        presence_manager: Arc::new(crate::proxy::presence::PresenceManager::new(None)),
+        presence_manager,
         addon_registry: None,
         bans: None,
         rwi_gateway,

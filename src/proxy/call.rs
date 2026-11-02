@@ -118,7 +118,7 @@ fn escape_reason_text(text: &str) -> String {
 /// callee are treated: when `true` (default) all bindings ring simultaneously
 /// (first to answer wins); when `false` only the most recently registered
 /// device is dialed.
-fn resolve_unhandled_targets(
+pub(crate) fn resolve_unhandled_targets(
     callee_is_same_realm: bool,
     internal_lookup_empty: bool,
     locs: Vec<Location>,
@@ -418,7 +418,7 @@ impl DefaultRouteInvite {
     }
 }
 
-fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<rsipstack::sip::Uri> {
+pub(crate) fn resolve_callee_uri(origin: &rsipstack::sip::Request) -> Result<rsipstack::sip::Uri> {
     if origin
         .uri
         .user()
@@ -548,7 +548,86 @@ impl CallModule {
         Self { inner }
     }
 
-    async fn default_resolve(
+    /// Session id for an inbound INVITE — the single seam `default_resolve`
+    /// resolves every inbound call through.
+    ///
+    /// Cluster child legs of an existing logical call (queue dispatch,
+    /// consult, transfer — including RE-DIAL rounds whose wire Call-ID carries
+    /// the `-r{n}` suffix) adopt the root session id their peer declares on
+    /// the wire, so the agent-answered session keeps the caller's `call_id`
+    /// and every event / CDR of the logical call stays on one id. Everything
+    /// else keeps the legacy derivation: reuse the Call-ID when it is
+    /// id-shaped (unless `session_id_inherit_callid` is disabled), else a
+    /// fresh id; plain P2P internal calls keep the raw Call-ID verbatim.
+    pub(crate) fn resolve_inbound_session_id(
+        server: &SipServerRef,
+        cookie: &TransactionCookie,
+        original: &rsipstack::sip::Request,
+        dialog_id: &str,
+        session_id_enabled: bool,
+    ) -> String {
+        if let Some(root) = Self::inherited_child_session_id(server, cookie, original) {
+            return root;
+        }
+        if session_id_enabled {
+            crate::call::session_id::derive_from_call_id(dialog_id)
+        } else {
+            dialog_id.to_string()
+        }
+    }
+
+    /// Root id a CLUSTER PEER declares for a child leg of an existing logical
+    /// call: a CC UUI `leg=` intent (`agent` / `consult` / `transfer`) plus
+    /// the root id on the `Session-ID` header (UUI data fallback).
+    ///
+    /// Why: the FIRST agent-facing leg dials with the root id as its wire
+    /// Call-ID, so Call-ID derivation lands on it. Every later leg of the
+    /// same logical call must NOT reuse a Call-ID the phone may have already
+    /// declined — it dials `{root}-r{n}`, which `derive_from_call_id` cannot
+    /// normalize, and the child session used to fall back to a fresh id (the
+    /// "sessionid changed when the agent picked up" divergence). The
+    /// Session-ID header / UUI are explicit correlation channels that survive
+    /// the re-dial, so adoption restores one id across the whole logical
+    /// call.
+    ///
+    /// `None` → legacy derivation: non-peer sources (an external PBX planting
+    /// the headers must not merge calls), INVITEs without a CC leg intent,
+    /// and the parallel-leg case where a live local session already holds the
+    /// root id (parallel agent legs on one node must not collapse into one
+    /// id; they still correlate through the enriched `session_id`).
+    fn inherited_child_session_id(
+        server: &SipServerRef,
+        cookie: &TransactionCookie,
+        original: &rsipstack::sip::Request,
+    ) -> Option<String> {
+        if !crate::proxy::proxy_call::sip_session::SipSession::from_cluster_peer(server, cookie) {
+            return None;
+        }
+        let cc_uui = crate::call::uui::extract_cc_uui(&original.headers)?;
+        // A declared dial intent marks this INVITE as a child leg of an
+        // existing logical call — the same trust seam `SipSession::new_inner`
+        // uses for `child_leg_role`.
+        cc_uui
+            .leg
+            .as_deref()
+            .filter(|leg| crate::call::uui::is_known_leg_role(leg))?;
+        let root = crate::call::session_id::extract_inherited(original)
+            .or_else(|| crate::call::session_id::normalize_inherited(&cc_uui.session_id))?;
+        if server.active_call_registry.get(&root).is_some() {
+            debug!(
+                root = %root,
+                "child-leg root id already live on this node; keeping a unique session id"
+            );
+            return None;
+        }
+        info!(
+            root = %root,
+            "inbound cluster child leg adopts the root session id"
+        );
+        Some(root)
+    }
+
+    pub(crate) async fn default_resolve(
         &self,
         original: &rsipstack::sip::Request,
         route_invite: Box<dyn RouteInvite>,
@@ -567,7 +646,6 @@ impl CallModule {
                     .with_code(&crate::proxy::error_catalog::MISSING_CALL_ID)
             })?
             .value();
-        let session_id = dialog_id.to_string();
 
         let media_config = {
             let rtp = self.inner.server.rtp_config.load();
@@ -594,6 +672,9 @@ impl CallModule {
                 .with_relay_ready_timeout_secs(rtp.relay_ready_timeout_secs)
                 .with_stall_detect_secs(rtp.stall_detect_secs)
                 .with_media_trace_interval_secs(rtp.media_trace_interval_secs)
+                .with_quality_stats(rtp.quality_stats.clone())
+                .with_volume_stats(rtp.volume_stats.clone())
+                .with_inband_dtmf(rtp.inband_dtmf)
         };
 
         let caller_is_same_realm = self
@@ -831,11 +912,28 @@ impl CallModule {
                 Ok(mut results) => {
                     // A hop addressed to a registration's home node is terminal:
                     // do not fork shared contacts back to another cluster node.
+                    //
+                    // But an empty local set must NOT be treated as offline: the
+                    // callee may be homed on a peer node (client dials its own
+                    // registrar while the callee registered on a sibling). In
+                    // that case keep the peer-owned locations so the hop can be
+                    // forwarded cross-node instead of 480 "target user offline".
                     if let Some(home) = self.inner.server.cluster_self_addr.as_ref()
                         && callee_uri.host_with_port == home.addr
                     {
-                        results.retain(|location| location.home_proxy.as_ref()
-                            .is_none_or(|owner| owner.addr == home.addr));
+                        let local: Vec<_> = results
+                            .iter()
+                            .filter(|location| {
+                                location
+                                    .home_proxy
+                                    .as_ref()
+                                    .is_none_or(|owner| owner.addr == home.addr)
+                            })
+                            .cloned()
+                            .collect();
+                        if !local.is_empty() {
+                            results = local;
+                        }
                     }
                     internal_lookup_empty = results.is_empty();
                     if internal_lookup_empty {
@@ -1088,28 +1186,31 @@ impl CallModule {
             .map(|r| r.new_recording_config())
             .unwrap_or_default();
 
-        // Global session id (RFC 7989): use the Call-ID when UUID-shaped,
-        // else a fresh UUID. Plain P2P extension dialling keeps the raw
-        // Call-ID — no Session-ID is generated or injected for those calls.
-        // Cross-node/cross-entity root inheritance happens later in the
-        // session constructor via the Session-ID header (UUI fallback), so
-        // this leg id stays unique per node (cluster session registry keys
-        // on it).
+        // Global session id: use the Call-ID when id-shaped (unless
+        // `session_id_inherit_callid` is disabled), else a fresh id. Plain
+        // P2P extension dialling keeps the raw Call-ID — no Session-ID is
+        // generated or injected for those calls. Cross-node/cross-entity
+        // root inheritance happens later in the session constructor via the
+        // Session-ID header (UUI fallback), so this leg id stays unique per
+        // node (cluster session registry keys on it).
         let session_id_enabled = !(direction == DialDirection::Internal
             && pending_app.is_none()
             && pending_queue.is_none()
             && !routed);
-        let session_id = if session_id_enabled {
-            crate::call::session_id::normalize_or_generate(&dialog_id)
-        } else {
-            session_id
-        };
+        let session_id = Self::resolve_inbound_session_id(
+            &self.inner.server,
+            cookie,
+            original,
+            &dialog_id,
+            session_id_enabled,
+        );
         let mut dialplan = Dialplan::new(session_id.clone(), original.clone(), direction)
             .with_session_id_enabled(session_id_enabled)
             .with_caller(routed_caller.unwrap_or(caller_uri))
             .with_media(media_config)
             .with_recording(recording)
             .with_route_invite(route_invite)
+            .with_diversion_chain_from_request(original)
             .with_passthrough_failure(self.inner.server.proxy_config.load().passthrough_failure);
 
         // Resolve the original-header passthrough rule for the (direct) callee
@@ -1262,6 +1363,8 @@ impl CallModule {
             if let Some(busy_wait) = hints.busy_wait.take() {
                 dialplan.busy_wait = Some(busy_wait.to_plan());
             }
+            dialplan.diversion_policy = hints.diversion_policy;
+            dialplan.amd = hints.amd.take();
             dialplan.extensions = std::mem::take(&mut hints.extensions);
             *dialplan.concurrency_holds.lock() = std::mem::take(&mut hints.concurrency_holds);
             dialplan.concurrent_call_lease = hints.concurrent_call_lease;
@@ -1278,7 +1381,7 @@ impl CallModule {
         Ok(dialplan)
     }
 
-    fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
+    pub(crate) fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
         let policy = match dialplan.recording_policy.as_ref() {
             Some(overrides) => {
                 let mut merged = self
@@ -1332,6 +1435,9 @@ impl CallModule {
                 }
                 if overrides.stereo_swap.is_some() {
                     merged.stereo_swap = overrides.stereo_swap;
+                }
+                if overrides.stereo_mode.is_some() {
+                    merged.stereo_mode = overrides.stereo_mode;
                 }
                 if overrides.path.is_some() {
                     merged.path = overrides.path.clone();
@@ -1453,6 +1559,7 @@ impl CallModule {
                 existing.samplerate = existing.samplerate.or(recorder_option.samplerate);
                 existing.ptime = existing.ptime.or(recorder_option.ptime);
                 existing.stereo_swap = existing.stereo_swap.or(recorder_option.stereo_swap);
+                existing.stereo_mode = existing.stereo_mode.or(recorder_option.stereo_mode);
             } else {
                 dialplan.recording.option = Some(recorder_option);
             }
@@ -1581,6 +1688,7 @@ impl CallModule {
             samplerate: policy.samplerate,
             ptime: policy.ptime,
             stereo_swap: policy.stereo_swap,
+            stereo_mode: policy.stereo_mode,
         };
         Some(option)
     }
@@ -1712,7 +1820,7 @@ impl CallModule {
         builder.build_and_serve(self.inner.server.clone(), tx).await
     }
 
-    async fn build_dialplan(
+    pub(crate) async fn build_dialplan(
         &self,
         tx: &mut Transaction,
         cookie: TransactionCookie,
@@ -1823,6 +1931,24 @@ impl CallModule {
             && let Some(config) = callee.forwarding_config()
         {
             dialplan = dialplan.with_call_forwarding(Some(config));
+        }
+        // An unconditional (always) forward is a diversion hop: record it so
+        // the outgoing legs carry the Diversion / History-Info chain (RFC
+        // 5806 / RFC 7044) when enabled. The diverting party is the originally
+        // dialed target.
+        if dialplan
+            .call_forwarding
+            .as_ref()
+            .is_some_and(|config| matches!(config.mode, crate::call::CallForwardingMode::Always))
+            && !dialplan
+                .diversion_chain
+                .iter()
+                .any(|e| e.reason == Some(crate::call::diversion::DiversionReason::Unconditional))
+        {
+            dialplan.push_diversion(
+                dialplan.original.uri.to_string(),
+                Some(crate::call::diversion::DiversionReason::Unconditional),
+            );
         }
         dialplan.voicemail_enabled = callee.as_ref().is_some_and(|callee| !callee.voicemail_disabled);
 
@@ -2255,12 +2381,155 @@ impl CallModule {
         }
     }
 
+    /// A peer that owns an old dialog may reach the phone through its new
+    /// registration home. This is terminal delivery, not a request from the
+    /// phone to be forwarded back to the dialog owner.
+    async fn try_deliver_peer_bye_to_local_ws(
+        &self,
+        tx: &mut Transaction,
+        dialog_id: &DialogId,
+    ) -> Result<bool> {
+        use rsipstack::sip::{Header, Method, SipMessage, StatusCode, Transport};
+        use rsipstack::transaction::key::TransactionKey;
+
+        let server = &self.inner.server;
+        if tx.original.method != Method::Bye
+            || dialog_id.local_tag.is_empty()
+            || dialog_id.remote_tag.is_empty()
+        {
+            return Ok(false);
+        }
+        let Some(source) = tx
+            .connection
+            .as_ref()
+            .and_then(|conn| conn.get_remote_addr())
+        else {
+            return Ok(false);
+        };
+        if matches!(source.r#type, Some(Transport::Ws | Transport::Wss))
+            || !source
+                .addr
+                .host
+                .clone()
+                .try_into()
+                .ok()
+                .is_some_and(|ip: std::net::IpAddr| server.cluster_peer_ips.contains(&ip))
+        {
+            return Ok(false);
+        }
+        let Some(home) = server.cluster_self_addr.as_ref() else {
+            return Ok(false);
+        };
+        let location = server
+            .locator
+            .lookup(&tx.original.uri)
+            .await?
+            .into_iter()
+            .find(|loc| {
+                loc.aor == tx.original.uri
+                    && loc
+                        .home_proxy
+                        .as_ref()
+                        .is_some_and(|owner| owner.addr == home.addr)
+                    && loc.destination.as_ref().is_some_and(|dest| {
+                        matches!(dest.r#type, Some(Transport::Ws | Transport::Wss))
+                    })
+            });
+        let Some(destination) = location.and_then(|loc| loc.destination) else {
+            return Ok(false);
+        };
+        // Avoid dialing a client's NAT address when no registered flow is
+        // cached. Resolution and sending remain bounded if a close races this check.
+        if !server
+            .endpoint
+            .inner
+            .transport_layer
+            .get_addrs()
+            .contains(&destination)
+        {
+            tx.reply(StatusCode::TemporarilyUnavailable).await?;
+            return Ok(true);
+        }
+        let original = tx.original.clone();
+        let original_vias: Vec<_> = original
+            .headers
+            .iter()
+            .filter(|header| matches!(header, Header::Via(_)))
+            .cloned()
+            .collect();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (connection, _) = server
+                .endpoint
+                .inner
+                .transport_layer
+                .lookup(&destination, None)
+                .await?;
+            if connection
+                .cancel_token()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(anyhow!("registered WebSocket flow is closed"));
+            }
+            let mut via_addr = home.clone();
+            via_addr.r#type = destination.r#type;
+            let via = server.endpoint.inner.get_via(Some(via_addr), None)?;
+            let mut request = original;
+            request.headers = std::iter::once(Header::from(via))
+                .chain(request.headers.iter().cloned())
+                .collect::<Vec<_>>()
+                .into();
+            let key = TransactionKey::from_request(&request, TransactionRole::Client)?;
+            let mut relay = Transaction::new_client(
+                key,
+                request,
+                server.endpoint.inner.clone(),
+                Some(connection),
+            );
+            relay.destination = Some(destination);
+            relay.send().await?;
+            while let Some(message) = relay.receive().await {
+                if let SipMessage::Response(mut response) = message
+                    && response.status_code.code() >= 200
+                {
+                    // Remove this hop's Via while retaining the source peer's
+                    // transaction routing, including received/rport parameters.
+                    response.headers = original_vias
+                        .iter()
+                        .cloned()
+                        .chain(
+                            response
+                                .headers
+                                .iter()
+                                .filter(|h| !matches!(h, Header::Via(_)))
+                                .cloned(),
+                        )
+                        .collect::<Vec<_>>()
+                        .into();
+                    return Ok(response);
+                }
+            }
+            Err(anyhow!(
+                "registered WebSocket BYE transaction ended without a response"
+            ))
+        })
+        .await;
+        match response {
+            Ok(Ok(response)) => tx.respond(response).await?,
+            Ok(Err(_)) => tx.reply(StatusCode::ServiceUnavailable).await?,
+            Err(_) => tx.reply(StatusCode::from(504_u16)).await?,
+        }
+        Ok(true)
+    }
+
     async fn process_message(&self, tx: &mut Transaction) -> Result<()> {
         let dialog_id =
             DialogId::try_from((&tx.original, TransactionRole::Server)).map_err(|e| anyhow!(e))?;
         let mut dialog = match self.inner.dialog_layer.get_dialog(&dialog_id) {
             Some(dialog) => dialog,
             None => {
+                if self.try_deliver_peer_bye_to_local_ws(tx, &dialog_id).await? {
+                    return Ok(());
+                }
                 // Cluster: if this node has no dialog, try forwarding in-dialog
                 // BYE/INFO to the session owner (agent may have re-registered
                 // here after a mid-call WS reconnect).
@@ -2297,7 +2566,7 @@ impl CallModule {
 
     /// Parse Replaces header from incoming request headers.
     /// Returns (call_id, to_tag, from_tag) if present and well-formed.
-    fn parse_replaces_header(
+    pub(crate) fn parse_replaces_header(
         request: &rsipstack::sip::Request,
     ) -> Option<(String, String, String)> {
         let replaces_value = request.headers.iter().find_map(|h| match h {
@@ -2328,7 +2597,7 @@ impl CallModule {
 
     /// Handle incoming SIP MESSAGE request from CC Phone.
     /// Supports consult transfer commands via JSON body.
-    async fn handle_message(
+    pub(crate) async fn handle_message(
         &self,
         tx: &mut Transaction,
         _cookie: &TransactionCookie,
@@ -2344,7 +2613,112 @@ impl CallModule {
             _ => None,
         });
 
-        info!(content_type = ?content_type, body = %body, "Received SIP MESSAGE");
+        // Admin relays carry client credentials; never include their envelope in logs.
+        let logged_body = if content_type.as_deref() == Some(crate::call::sip::ADMIN_CMD_RELAY_CT) {
+            "[redacted admin command]"
+        } else {
+            body.as_ref()
+        };
+        info!(content_type = ?content_type, body = %logged_body, "Received SIP MESSAGE");
+        if content_type.as_deref() == Some(crate::call::sip::ADMIN_CMD_RELAY_CT) {
+            // 节点间管理指令中继：peer 节点把 console 指令转给本坐席的
+            // home 节点。信任边界与 CALL_LEG_EVENT_CT 相同（cluster peer）。
+            let server = &self.inner.server;
+            let trusted = tx.connection.as_ref()
+                .and_then(|connection| connection.get_remote_addr())
+                .and_then(|source| source.addr.host.clone().try_into().ok())
+                .is_some_and(|ip: std::net::IpAddr| server.cluster_peer_ips.contains(&ip));
+            if !trusted {
+                tx.reply(rsipstack::sip::StatusCode::Forbidden).await?;
+                return Ok(());
+            }
+            // 中继信封自带 `agent`（创建节点注入），按它在本节点终端投递。
+            // 只做终端（home==self）：locator 中途漂移 → 404（创建侧长轮询
+            // 超时收场），中继消息不再二次转发。
+            //
+            // 应答以**本 RELAY MESSAGE 事务的 200 body** 带回创建节点（坐席
+            // 跳同一机制）：home 在 [`ADMIN_CMD_AGENT_WAIT`] 内等坐席 answer，
+            // 拿到即 200+body；无本地注册 404；坐席无应答 200+空 body（创建
+            // 侧按 timeout 收场）。
+            let relay_agent = serde_json::from_slice::<serde_json::Value>(tx.original.body())
+                .ok()
+                .and_then(|v| v.get("agent").and_then(|a| a.as_str()).map(str::to_string));
+            match match relay_agent {
+                Some(agent) => {
+                    crate::call::sip::deliver_admin_cmd_relayed(server, &agent, tx.original.body())
+                        .await
+                }
+                None => Err(anyhow::anyhow!("admin relay body missing agent")),
+            } {
+                Ok(crate::call::sip::AdminCmdOutcome::Answered(answer)) => {
+                    info!(
+                        bytes = answer.body.len(),
+                        "admin cmd relay: agent answer relayed via 200 body"
+                    );
+                    let headers = vec![rsipstack::sip::Header::ContentType(
+                        answer
+                            .content_type
+                            .unwrap_or_else(|| crate::call::sip::ADMIN_CMD_ANSWER_CT.into())
+                            .into(),
+                    )];
+                    tx.reply_with(rsipstack::sip::StatusCode::OK, headers, Some(answer.body))
+                        .await?;
+                }
+                Ok(crate::call::sip::AdminCmdOutcome::NoAnswer) => {
+                    // 坐席无应答（离线/崩溃/老版本）：200 + 空 body，创建侧
+                    // 按 timeout 收场——不让创建侧空等到自己的超时。
+                    info!("admin cmd relay: agent did not answer in time");
+                    tx.reply(rsipstack::sip::StatusCode::OK).await?;
+                }
+                Ok(crate::call::sip::AdminCmdOutcome::NotRegistered) => {
+                    // 目标坐席在本节点无本地注册（stale locator / 已注销）。
+                    tx.reply(rsipstack::sip::StatusCode::NotFound).await?;
+                }
+                Err(error) => {
+                    warn!(%error, "admin cmd relay terminal delivery failed");
+                    tx.reply(rsipstack::sip::StatusCode::ServerInternalError).await?;
+                }
+            }
+            return Ok(());
+        }
+        if content_type.as_deref() == Some(crate::call::sip::CALL_LEG_EVENT_CT) {
+            use rsipstack::sip::ToTypedHeader;
+            let server = &self.inner.server;
+            let trusted = tx.connection.as_ref()
+                .and_then(|connection| connection.get_remote_addr())
+                .and_then(|source| source.addr.host.clone().try_into().ok())
+                .is_some_and(|ip: std::net::IpAddr| server.cluster_peer_ips.contains(&ip));
+            if !trusted {
+                tx.reply(rsipstack::sip::StatusCode::Forbidden).await?;
+                return Ok(());
+            }
+            // This is a terminal home hop: a live local registration is required.
+            // Never route an expiry back to another home or fall back to URI resolution.
+            let locations = server.locator.lookup(&tx.original.uri).await?;
+            let location = locations.into_iter().find(|location| {
+                location.registered_aor.is_some() && location.destination.is_some()
+                    && location.home_proxy.as_ref().is_none_or(|owner| {
+                        server.cluster_self_addr.as_ref().is_some_and(|home| home.addr == owner.addr)
+                    })
+            });
+            let Some(location) = location else {
+                tx.reply(rsipstack::sip::StatusCode::NotFound).await?;
+                return Ok(());
+            };
+            let offer = Box::new(InviteOption {
+                callee: location.aor.clone(),
+                caller: tx.original.from_header()?.typed()?.uri,
+                contact: server.contact_uri_for_location(&location)
+                    .ok_or_else(|| anyhow!("No SIP Contact for ring timeout relay"))?,
+                destination: location.destination,
+                ..Default::default()
+            });
+            crate::call::sip::send_call_leg_event(
+                &server.dialog_layer, server.endpoint.inner.clone(), offer, tx.original.body.clone(),
+            )?;
+            tx.reply(rsipstack::sip::StatusCode::OK).await?;
+            return Ok(());
+        }
         // Default: accept but do nothing
         tx.reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
             .await?;
@@ -2484,2037 +2858,5 @@ impl ProxyModule for CallModule {
 
     async fn on_transaction_end(&self, _tx: &mut Transaction) -> Result<()> {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::call::Location;
-    use crate::call::{DialDirection, RouteInvite, SipUser, TransactionCookie};
-    use crate::config::RouteResult;
-    use crate::proxy::tests::common::{create_test_server, create_test_server_with_config};
-    use async_trait::async_trait;
-    use rsipstack::dialog::invitation::InviteOption;
-
-    fn make_loc() -> Vec<Location> {
-        vec![Location {
-            aor: rsipstack::sip::Uri {
-                scheme: Some(rsipstack::sip::Scheme::Sip),
-                auth: Some(rsipstack::sip::Auth {
-                    user: "test".to_string(),
-                    password: None,
-                }),
-                host_with_port: rsipstack::sip::HostWithPort {
-                    host: rsipstack::sip::Host::Domain("example.com".to_string().into()),
-                    port: None,
-                },
-                params: vec![],
-                headers: vec![],
-            },
-            ..Default::default()
-        }]
-    }
-
-    struct NotHandledRouteInvite;
-
-    #[async_trait]
-    impl RouteInvite for NotHandledRouteInvite {
-        async fn route_invite(
-            &self,
-            option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            Ok(RouteResult::NotHandled(option, None))
-        }
-    }
-
-    #[tokio::test]
-    async fn chained_route_invite_falls_back_on_not_handled() {
-        let chained = ChainedRouteInvite::new(
-            Box::new(NotHandledRouteInvite),
-            Box::new(ApplicationRouteInvite { headers: None }),
-        );
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: rsipstack::sip::Uri::try_from("sip:bob@example.com").unwrap(),
-            version: rsipstack::sip::Version::V2,
-            headers: vec![
-                rsipstack::sip::Header::From("<sip:alice@example.com>".try_into().unwrap()),
-                rsipstack::sip::Header::To("<sip:bob@example.com>".into()),
-                rsipstack::sip::Header::CallId("chained-test".into()),
-                rsipstack::sip::Header::CSeq("1 INVITE".try_into().unwrap()),
-            ]
-            .into(),
-            body: Vec::new(),
-        };
-        let cookie = TransactionCookie::default();
-        let result = chained
-            .route_invite(
-                InviteOption::default(),
-                &request,
-                &DialDirection::Outbound,
-                &cookie,
-            )
-            .await
-            .expect("chained fallback");
-        match result {
-            RouteResult::Application { app_name, .. } => assert_eq!(app_name, "ivr"),
-            _ => panic!("expected fallback application route"),
-        }
-    }
-
-    struct ApplicationRouteInvite {
-        headers: Option<Vec<rsipstack::sip::Header>>,
-    }
-
-    #[async_trait]
-    impl RouteInvite for ApplicationRouteInvite {
-        async fn route_invite(
-            &self,
-            option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            let mut opt = option;
-            opt.headers = self.headers.clone();
-            Ok(RouteResult::Application {
-                option: opt,
-                app_name: "ivr".to_string(),
-                app_params: None,
-                auto_answer: true,
-                hints: None,
-            })
-        }
-    }
-
-    struct RoutePointApplicationRouteInvite;
-
-    #[async_trait]
-    impl RouteInvite for RoutePointApplicationRouteInvite {
-        async fn route_invite(
-            &self,
-            mut option: InviteOption,
-            origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            assert_eq!(option.callee.user(), Some("39230"));
-            assert_eq!(origin.uri.user(), Some("39230"));
-            assert_eq!(
-                origin
-                    .to_header()
-                    .expect("route-point To header")
-                    .uri()
-                    .expect("route-point To URI")
-                    .user(),
-                Some("39230")
-            );
-            option.headers = Some(vec![rsipstack::sip::Header::Other(
-                "X-Business-Key".into(),
-                "driver-spring-festival".into(),
-            )]);
-            Ok(RouteResult::Application {
-                option,
-                app_name: "step_ivr".to_string(),
-                app_params: Some(serde_json::json!({
-                    "businessKey": "driver-spring-festival"
-                })),
-                auto_answer: true,
-                hints: None,
-            })
-        }
-    }
-
-    struct RoutePointNotHandledRouteInvite;
-
-    #[async_trait]
-    impl RouteInvite for RoutePointNotHandledRouteInvite {
-        async fn route_invite(
-            &self,
-            option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            let mut hints = crate::config::DialplanHints::default();
-            hints
-                .concurrency_holds
-                .push(crate::call::policy::ConcurrencyHold {
-                    policy_id: "route-point-policy".to_string(),
-                    scope: "caller".to_string(),
-                    scope_value: "bp".to_string(),
-                });
-            Ok(RouteResult::NotHandled(option, Some(hints)))
-        }
-    }
-
-    struct RewrittenForwardRouteInvite;
-
-    #[async_trait]
-    impl RouteInvite for RewrittenForwardRouteInvite {
-        async fn route_invite(
-            &self,
-            mut option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            option.caller =
-                rsipstack::sip::Uri::try_from("sip:rewritten-caller@source.example.com")?;
-            option.callee = rsipstack::sip::Uri::try_from("sip:001234@carrier.example.com:5060")?;
-            Ok(RouteResult::Forward(vec![crate::config::RouteTarget::new(option, Some(Default::default()))]))
-        }
-    }
-
-    #[tokio::test]
-    async fn default_resolve_preserves_retry_invites_hints_and_policies() {
-        struct RetryRouter(u64);
-        #[async_trait]
-        impl RouteInvite for RetryRouter {
-            async fn route_invite(
-                &self, _option: InviteOption, _origin: &rsipstack::sip::Request,
-                _direction: &DialDirection, _cookie: &TransactionCookie,
-            ) -> Result<RouteResult> {
-                Ok(RouteResult::Forward((0..self.0).map(|index| crate::config::RouteTarget {
-                    option: InviteOption {
-                        caller: format!("sip:caller{index}@source.example.com").try_into().unwrap(),
-                        callee: format!("sip:target{index}@carrier.example.com").try_into().unwrap(),
-                        ..Default::default()
-                    },
-                    hints: Some(crate::config::DialplanHints {
-                        max_ring_time: Some(std::time::Duration::from_secs(12 + index)),
-                        ..Default::default()
-                    }),
-                    // The last target has no policy, which never advances.
-                    retry_policy: (index == 0).then(|| crate::proxy::routing::RetryPolicy {
-                        status_codes: vec![503, 408],
-                    }),
-                }).collect()))
-            }
-        }
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-        let request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite, "original-caller", None, "rustpbx.com", None,
-        );
-        let caller = SipUser { username: "original-caller".into(), realm: Some("rustpbx.com".into()), ..Default::default() };
-        let plan = module.default_resolve(&request, Box::new(RetryRouter(2)), &caller, &TransactionCookie::default()).await.unwrap();
-        let crate::call::DialplanFlow::Targets(DialStrategy::Sequential(targets)) = &plan.flow else { panic!("expected sequential plan"); };
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].location.aor.user(), Some("target0"));
-        assert_eq!(targets[1].location.aor.user(), Some("target1"));
-        let attempts = targets;
-        assert_eq!(attempts[0].caller.as_ref().unwrap().user(), Some("caller0"));
-        assert_eq!(attempts[1].caller.as_ref().unwrap().user(), Some("caller1"));
-        for (index, attempt) in attempts.iter().enumerate() {
-            assert_eq!(attempt.hints.as_ref().unwrap().max_ring_time, Some(std::time::Duration::from_secs(12 + index as u64)));
-        }
-        let policy = attempts[0].retry_policy.as_ref().unwrap();
-        assert_eq!(policy.status_codes, vec![503, 408]);
-        assert!(attempts[1].retry_policy.as_ref().unwrap().status_codes.is_empty());
-
-        let empty = module.default_resolve(
-            &request, Box::new(RetryRouter(0)), &caller, &TransactionCookie::default(),
-        ).await.unwrap();
-        assert!(empty.is_empty(), "an empty Forward must not fall back to direct dialing");
-    }
-
-    #[tokio::test]
-    async fn default_resolve_fixes_call_settings_from_the_first_of_several_targets() {
-        struct TwoTrunks;
-        #[async_trait]
-        impl RouteInvite for TwoTrunks {
-            async fn route_invite(
-                &self, option: InviteOption, _origin: &rsipstack::sip::Request,
-                _direction: &DialDirection, _cookie: &TransactionCookie,
-            ) -> Result<RouteResult> {
-                let target = |user: &str, hints: crate::config::DialplanHints| {
-                    let mut option = option.clone();
-                    option.callee = format!("sip:{user}@carrier.example.com").try_into().unwrap();
-                    crate::config::RouteTarget::new(option, Some(hints))
-                };
-                Ok(RouteResult::Forward(vec![
-                    target("a", crate::config::DialplanHints {
-                        recording: Some(RecordingPolicy {
-                            enabled: Some(true),
-                            path: Some("/tmp/rustpbx-first-target".into()),
-                            ..Default::default()
-                        }),
-                        max_ring_time: Some(std::time::Duration::from_secs(40)),
-                        ..Default::default()
-                    }),
-                    target("b", crate::config::DialplanHints {
-                        enable_recording: Some(false),
-                        ..Default::default()
-                    }),
-                ]))
-            }
-        }
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-        let request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite, "alice", None, "rustpbx.com", None,
-        );
-        let caller = SipUser { username: "alice".into(), realm: Some("rustpbx.com".into()), ..Default::default() };
-        let plan = module
-            .default_resolve(&request, Box::new(TwoTrunks), &caller, &TransactionCookie::default())
-            .await
-            .unwrap();
-        assert!(plan.recording.enabled, "the first target's recording applies to the call");
-        assert_eq!(
-            plan.recording_policy.as_ref().and_then(|policy| policy.path.as_deref()),
-            Some("/tmp/rustpbx-first-target")
-        );
-        assert_eq!(plan.max_ring_time, None, "a trunk's ring time limits its own attempt, not the call");
-        assert!(plan.extensions.get::<crate::call::OutboundTrunkContext>().is_none(), "other hints stay per attempt");
-    }
-
-    struct RecordingHintsRouteInvite {
-        recording: Option<RecordingPolicy>,
-        enable_recording: Option<bool>,
-    }
-
-    #[async_trait]
-    impl RouteInvite for RecordingHintsRouteInvite {
-        async fn route_invite(
-            &self,
-            option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            let mut hints = crate::config::DialplanHints::default();
-            hints.recording = self.recording.clone();
-            hints.enable_recording = self.enable_recording;
-            Ok(RouteResult::Forward(vec![crate::config::RouteTarget::new(option, Some(hints))]))
-        }
-    }
-
-    /// Emits a per-trunk ICE-lite override, as `merge_trunk_media_hints`
-    /// would for `[trunk.<name>] ice_lite`.
-    struct IceLiteHintsRouteInvite {
-        ice_lite: Option<bool>,
-    }
-
-    #[async_trait]
-    impl RouteInvite for IceLiteHintsRouteInvite {
-        async fn route_invite(
-            &self,
-            option: InviteOption,
-            _origin: &rsipstack::sip::Request,
-            _direction: &DialDirection,
-            _cookie: &TransactionCookie,
-        ) -> Result<RouteResult> {
-            let mut hints = crate::config::DialplanHints::default();
-            hints.ice_lite = self.ice_lite;
-            Ok(RouteResult::Forward(vec![crate::config::RouteTarget::new(option, Some(hints))]))
-        }
-    }
-
-    fn replace_to_header(request: &mut rsipstack::sip::Request, to_uri: rsipstack::sip::Uri) {
-        request
-            .headers
-            .retain(|header| !matches!(header, rsipstack::sip::Header::To(_)));
-        request.headers.push(
-            rsipstack::sip::typed::To {
-                display_name: None,
-                uri: to_uri,
-                params: vec![],
-            }
-            .into(),
-        );
-    }
-
-    #[test]
-    fn loop_guard_same_realm_online_user_passes() {
-        let result = resolve_unhandled_targets(true, false, make_loc(), true);
-        assert!(
-            result.is_ok(),
-            "same-realm online user should not be rejected"
-        );
-    }
-
-    #[test]
-    fn loop_guard_same_realm_offline_returns_empty_targets() {
-        let result = resolve_unhandled_targets(true, true, make_loc(), true);
-        assert!(result.is_ok(), "offline same-realm should not error");
-        match result.unwrap() {
-            DialStrategy::Sequential(locs) => {
-                assert!(
-                    locs.is_empty(),
-                    "offline same-realm should return empty targets"
-                );
-            }
-            _ => panic!("expected Sequential strategy"),
-        }
-    }
-
-    #[test]
-    fn loop_guard_external_callee_falls_through_to_locs() {
-        // external callee with NotHandled should fall through to locs so that
-        // dialplan inspectors (e.g. zhongan inviter) can rewrite the target.
-        // A single location uses the sequential dialer (upstream change
-        // "sequential for 1 location").
-        let result = resolve_unhandled_targets(false, false, make_loc(), true);
-        assert!(
-            result.is_ok(),
-            "external callee should fall through to Sequential(locs)"
-        );
-        let strategy = result.unwrap();
-        match strategy {
-            DialStrategy::Sequential(locs) => {
-                assert!(!locs.is_empty(), "locs should contain the callee URI");
-            }
-            _ => panic!("expected Sequential strategy for a single target"),
-        }
-    }
-
-    #[test]
-    fn loop_guard_external_callee_falls_through_offline_flag_ignored() {
-        // external callee — internal_lookup_empty is set but irrelevant;
-        // should still fall through because the offline check only applies to same-realm.
-        let result = resolve_unhandled_targets(false, true, make_loc(), true);
-        assert!(
-            result.is_ok(),
-            "external callee should fall through, offline flag is ignored"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_preserves_rewritten_route_uris_in_dialplan() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-        let request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "original-caller",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        let caller = SipUser {
-            username: "original-caller".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RewrittenForwardRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("rewritten route should produce a dialplan");
-
-        assert_eq!(
-            dialplan.caller.as_ref().map(ToString::to_string).as_deref(),
-            Some("sip:rewritten-caller@source.example.com")
-        );
-        assert_eq!(
-            dialplan
-                .first_target()
-                .map(|target| target.aor.to_string())
-                .as_deref(),
-            Some("sip:001234@carrier.example.com:5060")
-        );
-    }
-
-    /// Per-extension ICE-lite detection: a caller whose registration declared
-    /// `;+sip.ice` flips `dialplan.media.ice_lite`, which the session applies
-    /// to its plain-RTP legs (a=ice-lite answers). Default stays off.
-    #[tokio::test]
-    async fn default_resolve_caller_ice_lite_sets_media_flag() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-        let request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "original-caller",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        let caller = SipUser {
-            username: "original-caller".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ice_lite: true,
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RewrittenForwardRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("dialplan");
-        assert!(
-            dialplan.media.ice_lite,
-            "caller with ;+sip.ice must enable ice_lite on the session media"
-        );
-
-        let plain_caller = SipUser {
-            username: "original-caller".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RewrittenForwardRouteInvite),
-                &plain_caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("dialplan");
-        assert!(
-            !dialplan.media.ice_lite,
-            "callers without the detection must keep ice_lite off"
-        );
-    }
-
-    /// Trunk override wins over the per-extension detection: an explicit
-    /// `ice_lite = false` on the trunk downgrades an ice-detected caller.
-    #[tokio::test]
-    async fn default_resolve_trunk_ice_lite_hint_overrides_caller_detection() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-        let request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "original-caller",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        let caller = SipUser {
-            username: "original-caller".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ice_lite: true,
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(IceLiteHintsRouteInvite {
-                    ice_lite: Some(false),
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("dialplan");
-        assert!(
-            !dialplan.media.ice_lite,
-            "explicit trunk override must beat the caller detection"
-        );
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(IceLiteHintsRouteInvite {
-                    ice_lite: Some(true),
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("dialplan");
-        assert!(dialplan.media.ice_lite);
-    }
-
-    // ---------------------------------------------------------------------------
-    // New tests: resolve_unhandled_targets + default_resolve + CalleeOfflineMarker
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn resolve_unhandled_targets_same_realm_offline_returns_empty() {
-        // same-realm + offline (internal_lookup_empty=true) should return Ok with empty targets,
-        // not 480 — the rejection is deferred to build_dialplan.
-        let result = resolve_unhandled_targets(true, true, make_loc(), true);
-        assert!(result.is_ok());
-        match result.unwrap() {
-            DialStrategy::Sequential(locs) => assert!(locs.is_empty()),
-            _ => panic!("expected Sequential"),
-        }
-    }
-
-    #[test]
-    fn resolve_unhandled_targets_external_callee_retains_locs() {
-        // A single external target is retained but uses the simple dialer.
-        let locs = make_loc();
-        let result = resolve_unhandled_targets(false, false, locs.clone(), true);
-        let strategy = result.unwrap();
-        match strategy {
-            DialStrategy::Sequential(l) => assert_eq!(l.len(), locs.len()),
-            _ => panic!("expected Sequential"),
-        }
-    }
-
-    #[test]
-    fn resolve_unhandled_targets_single_registration_does_not_fork() {
-        let locs = make_loc();
-        let result = resolve_unhandled_targets(true, false, locs.clone(), true);
-        let strategy = result.unwrap();
-        match strategy {
-            DialStrategy::Sequential(l) => assert_eq!(l.len(), 1),
-            _ => panic!("one registration must use the sequential dialer"),
-        }
-    }
-
-    #[test]
-    fn resolve_unhandled_targets_parallel_forks_all_locs() {
-        // parallel_fork=true: every registered binding is returned so the
-        // session can ring them all at once (first to answer wins).
-        let mut locs = make_loc();
-        locs.push(Location {
-            aor: rsipstack::sip::Uri {
-                scheme: Some(rsipstack::sip::Scheme::Sip),
-                auth: Some(rsipstack::sip::Auth {
-                    user: "test2".to_string(),
-                    password: None,
-                }),
-                host_with_port: rsipstack::sip::HostWithPort {
-                    host: rsipstack::sip::Host::Domain("example.com".to_string().into()),
-                    port: None,
-                },
-                params: vec![],
-                headers: vec![],
-            },
-            ..Default::default()
-        });
-        let result = resolve_unhandled_targets(false, false, locs.clone(), true);
-        let strategy = result.unwrap();
-        match strategy {
-            DialStrategy::Parallel(l) => assert_eq!(l.len(), locs.len()),
-            _ => panic!("expected Parallel strategy"),
-        }
-    }
-
-    #[test]
-    fn resolve_unhandled_targets_last_alive_dials_only_newest() {
-        // parallel_fork=false: legacy "last alive" behavior — only the most
-        // recently registered device (first in the recency-sorted list) is dialed.
-        let mut locs = make_loc();
-        locs.push(Location {
-            aor: rsipstack::sip::Uri {
-                scheme: Some(rsipstack::sip::Scheme::Sip),
-                auth: Some(rsipstack::sip::Auth {
-                    user: "test2".to_string(),
-                    password: None,
-                }),
-                host_with_port: rsipstack::sip::HostWithPort {
-                    host: rsipstack::sip::Host::Domain("example.com".to_string().into()),
-                    port: None,
-                },
-                params: vec![],
-                headers: vec![],
-            },
-            ..Default::default()
-        });
-        let result = resolve_unhandled_targets(false, false, locs, false);
-        let strategy = result.unwrap();
-        match strategy {
-            DialStrategy::Sequential(l) => {
-                assert_eq!(l.len(), 1, "last-alive mode must dial exactly one device");
-            }
-            _ => panic!("expected Sequential strategy"),
-        }
-    }
-
-    #[tokio::test]
-    async fn default_resolve_single_forward_keeps_registered_contacts_and_hints() {
-        let (server, config) = create_test_server_with_config(ProxyConfig {
-            parallel_fork: true,
-            ..Default::default()
-        }).await;
-        for port in [5071, 5072] {
-            server.locator.register("alice", Some("rustpbx.com"), Location {
-                aor: format!("sip:alice@127.0.0.1:{port}").parse().unwrap(),
-                expires: 3600,
-                ..Default::default()
-            }).await.unwrap();
-        }
-        let module = CallModule::new(config, server);
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite, "bp", None, "rustpbx.com", None,
-        );
-        request.uri = "sip:alice@rustpbx.com".parse().unwrap();
-        replace_to_header(&mut request, "sip:alice@rustpbx.com".parse().unwrap());
-        let caller = SipUser {
-            username: "bp".into(), realm: Some("rustpbx.com".into()), ..Default::default()
-        };
-        let plan = module.default_resolve(
-            &request, Box::new(IceLiteHintsRouteInvite { ice_lite: Some(true) }),
-            &caller, &TransactionCookie::default(),
-        ).await.unwrap();
-        let crate::call::DialplanFlow::Targets(DialStrategy::Parallel(contacts)) = &plan.flow else {
-            panic!("one logical route must still ring its registered contacts in parallel");
-        };
-        assert_eq!(contacts.len(), 2);
-        let mut uris = contacts.iter().map(|contact| contact.aor.to_string()).collect::<Vec<_>>();
-        uris.sort();
-        assert_eq!(uris, vec!["sip:alice@127.0.0.1:5071", "sip:alice@127.0.0.1:5072"]);
-        assert!(plan.media.ice_lite, "single-target route hints must still apply");
-    }
-
-    #[tokio::test]
-    async fn default_resolve_sets_offline_marker_for_empty_locator() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:nobody@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:nobody@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("offline user should not error at resolve time");
-
-        assert!(dialplan.is_empty(), "targets should be empty");
-        assert!(
-            dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
-            "offline marker should be set"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_home_hop_does_not_fork_back_to_peer() {
-        let (mut server, config) = create_test_server_with_config(ProxyConfig {
-            realms: Some(vec!["10.0.0.1".into()]),
-            ..Default::default()
-        }).await;
-        let local = rsipstack::transport::SipAddr::try_from(
-            rsipstack::sip::Uri::try_from("sip:10.0.0.1:5060").unwrap()).unwrap();
-        Arc::get_mut(&mut server).unwrap().cluster_self_addr = Some(local.clone());
-        for (contact, home) in [("local", "10.0.0.1"), ("peer", "10.0.0.2")] {
-            server.locator.register("alice", Some("10.0.0.1"), Location {
-                aor: format!("sip:{contact}@device.invalid;transport=ws").parse().unwrap(),
-                registered_aor: Some("sip:alice@10.0.0.1:5060".parse().unwrap()),
-                home_proxy: Some(rsipstack::transport::SipAddr::try_from(
-                    rsipstack::sip::Uri::try_from(format!("sip:{home}:5060")).unwrap()).unwrap()),
-                destination: Some(rsipstack::transport::SipAddr::try_from(rsipstack::sip::Uri::try_from(
-                    format!("sip:192.0.2.1:{}", if contact == "local" { 7001 } else { 7002 })).unwrap()).unwrap()),
-                expires: 3600,
-                ..Default::default()
-            }).await.unwrap();
-        }
-        let module = CallModule::new(config, server);
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite, "bp", None, "rustpbx.com", None,
-        );
-        request.uri = "sip:alice@10.0.0.1:5060".parse().unwrap();
-        let caller = SipUser {
-            username: "bp".into(), realm: Some("rustpbx.com".into()), ..Default::default()
-        };
-        let dialplan = module.default_resolve(&request, Box::new(NotHandledRouteInvite), &caller,
-            &TransactionCookie::default()).await.unwrap();
-        let targets = dialplan.get_all_targets().unwrap();
-        assert_eq!(targets.len(), 1, "a home hop must not start another cluster fork");
-        assert_eq!(targets[0].home_proxy.as_ref(), Some(&local));
-        // A canonical address still rings contacts across the cluster.
-        request.uri = "sip:alice@rustpbx.com".parse().unwrap();
-        let dialplan = module.default_resolve(&request, Box::new(NotHandledRouteInvite), &caller,
-            &TransactionCookie::default()).await.unwrap();
-        assert_eq!(dialplan.get_all_targets().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn default_resolve_does_not_set_marker_for_online_user() {
-        let (server, config) = create_test_server().await;
-
-        // Register alice in the locator so she's online (BEFORE creating module)
-        let _ = server
-            .locator
-            .register(
-                "alice",
-                Some("rustpbx.com"),
-                Location {
-                    aor: rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap(),
-                    expires: 3600,
-                    destination: Some(rsipstack::transport::SipAddr {
-                        r#type: Some(rsipstack::sip::Transport::Udp),
-                        addr: rsipstack::sip::HostWithPort {
-                            host: "10.0.0.1".parse().unwrap(),
-                            port: Some(5060.into()),
-                        },
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("online user should succeed");
-
-        assert!(!dialplan.is_empty(), "online user should have targets");
-        assert!(
-            dialplan.extensions.get::<CalleeOfflineMarker>().is_none(),
-            "online user should not have offline marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_does_not_set_marker_for_external_callee() {
-        // external callee — even if locator returns empty, marker should not be set
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri =
-            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("external destination should succeed");
-
-        assert!(!dialplan.is_empty(), "external callee should have targets");
-        assert!(
-            dialplan.extensions.get::<CalleeOfflineMarker>().is_none(),
-            "external callee should not have offline marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_wholesale_trunk_gets_marker_and_empty_targets() {
-        // Wholesale trunks: same-realm, locator empty, with TrunkContext.
-        // resolve_unhandled_targets returns empty targets (not 480), and offline marker is set.
-        // This is correct — build_dialplan will let inspectors fill targets later.
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri =
-            rsipstack::sip::Uri::try_from("sip:+862161952290@rustpbx.com;transport=UDP").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:+862161952290@rustpbx.com").unwrap(),
-        );
-
-        // Caller from trunk — realm matches server so callee_is_same_realm=true
-        let caller = SipUser {
-            username: "+8617301791502".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let cookie = TransactionCookie::default();
-        cookie.insert_extension(TrunkContext {
-            id: Some(1),
-            name: "wholesale-trunk".to_string(),
-            did_numbers: vec![],
-        });
-
-        let dialplan = module
-            .default_resolve(&request, Box::new(NotHandledRouteInvite), &caller, &cookie)
-            .await
-            .expect("wholesale trunk should not error at resolve time");
-
-        assert!(
-            dialplan.is_empty(),
-            "wholesale locator empty => empty targets"
-        );
-        assert!(
-            dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
-            "offline marker should be set for same-realm locator-empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_applies_source_trunk_codecs_from_trunk_context() {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.audio_codecs = Some(vec!["pcmu".to_string()]);
-        proxy_config.trunks.insert(
-            "inbound_192_168_3_7".to_string(),
-            TrunkConfig {
-                dest: "sip:192.168.3.7:5060".to_string(),
-                codec: vec!["pcma".to_string()],
-                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
-                inbound_hosts: vec!["192.168.3.7".to_string()],
-                ..Default::default()
-            },
-        );
-
-        let (server, config) = create_test_server_with_config(proxy_config).await;
-        let module = CallModule::new(config, server.clone());
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "charlie",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:alice@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "charlie".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let cookie = TransactionCookie::default();
-        cookie.insert_extension(TrunkContext {
-            id: None,
-            name: "inbound_192_168_3_7".to_string(),
-            did_numbers: vec![],
-        });
-
-        let dialplan = module
-            .default_resolve(&request, Box::new(NotHandledRouteInvite), &caller, &cookie)
-            .await
-            .expect("same-realm trunk-originated call should resolve");
-
-        assert_eq!(dialplan.allow_codecs, vec![CodecType::PCMA]);
-    }
-
-    #[tokio::test]
-    async fn default_resolve_partial_recording_policy_inherits_global_policy_fields() {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.recording = Some(RecordingPolicy {
-            samplerate: Some(16000),
-            ptime: Some(30),
-            stereo_swap: Some(true),
-            enabled: Some(true),
-            recording_type: Some(crate::config::RecordingType::S3),
-            bucket: Some("recordings".to_string()),
-            region: Some("us-east-1".to_string()),
-            access_key: Some("access".to_string()),
-            secret_key: Some("secret".to_string()),
-            path: Some("/tmp/rustpbx-main-recordings".to_string()),
-            auto_start: Some(true),
-            auto_start_at: Some(crate::config::RecordingAutoStartAt::Answer),
-            force_file: Some(true),
-            ..Default::default()
-        });
-
-        let (server, config) = create_test_server_with_config(proxy_config).await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "alice",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "alice".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RecordingHintsRouteInvite {
-                    recording: Some(RecordingPolicy {
-                        enabled: Some(true),
-                        auto_start: Some(false),
-                        stereo_swap: Some(false),
-                        ..Default::default()
-                    }),
-                    enable_recording: None,
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("route should resolve");
-        assert_eq!(
-            dialplan
-                .recording_policy
-                .as_ref()
-                .and_then(|p| p.auto_start),
-            Some(false)
-        );
-        let dialplan = module.apply_recording_policy(dialplan, &caller);
-
-        assert!(dialplan.recording.enabled);
-        assert!(!dialplan.recording.auto_start);
-        assert_eq!(
-            dialplan.recording.auto_start_at,
-            crate::config::RecordingAutoStartAt::Answer
-        );
-        assert_eq!(
-            dialplan.recording.recording_type,
-            crate::config::RecordingType::S3
-        );
-        let option = dialplan
-            .recording
-            .option
-            .expect("merged policy should build recorder option");
-        assert_eq!(option.samplerate, Some(16000));
-        assert_eq!(option.ptime, Some(30));
-        assert_eq!(option.stereo_swap, Some(false));
-        assert!(
-            option
-                .recorder_file
-                .starts_with("/tmp/rustpbx-main-recordings"),
-            "partial override must inherit the global recorder path"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_recording_type_sipflow_skips_file_option() {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.recording = Some(RecordingPolicy {
-            enabled: Some(true),
-            recording_type: Some(crate::config::RecordingType::Sipflow),
-            path: Some("/tmp/rustpbx-main-recordings".to_string()),
-            ..Default::default()
-        });
-
-        let (server, config) = create_test_server_with_config(proxy_config).await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "alice",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "alice".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RecordingHintsRouteInvite {
-                    recording: None,
-                    enable_recording: None,
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("route should resolve");
-        let dialplan = module.apply_recording_policy(dialplan, &caller);
-
-        assert!(dialplan.recording.enabled);
-        assert_eq!(
-            dialplan.recording.recording_type,
-            crate::config::RecordingType::Sipflow
-        );
-        assert!(
-            dialplan.recording.option.is_none(),
-            "type=sipflow must not install a WAV file option"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_recording_enable_hint_false_disables_global_policy() {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.recording = Some(RecordingPolicy {
-            enabled: Some(true),
-            path: Some("/tmp/rustpbx-main-recordings".to_string()),
-            auto_start: Some(true),
-            ..Default::default()
-        });
-
-        let (server, config) = create_test_server_with_config(proxy_config).await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "alice",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:+12025550100@example.net").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "alice".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RecordingHintsRouteInvite {
-                    recording: None,
-                    enable_recording: Some(false),
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("route should resolve");
-        assert_eq!(
-            dialplan.recording_policy.as_ref().and_then(|p| p.enabled),
-            Some(false)
-        );
-        let dialplan = module.apply_recording_policy(dialplan, &caller);
-
-        assert!(!dialplan.recording.enabled);
-        assert!(dialplan.recording.option.is_none());
-    }
-
-    #[tokio::test]
-    async fn default_route_uses_acl_context_for_source_trunk() {
-        let mut proxy_config = ProxyConfig::default();
-        proxy_config.generated_dir =
-            format!("target/test-generated/source-route-{}", std::process::id());
-        proxy_config.trunks.insert(
-            "via_source".to_string(),
-            TrunkConfig {
-                dest: "sip:5.5.5.5:5060".to_string(),
-                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
-                inbound_hosts: vec!["5.5.5.0/24".to_string()],
-                ..Default::default()
-            },
-        );
-        proxy_config.trunks.insert(
-            "real_source".to_string(),
-            TrunkConfig {
-                dest: "sip:1.2.3.4:5060".to_string(),
-                direction: Some(crate::proxy::routing::TrunkDirection::Inbound),
-                inbound_hosts: vec!["1.2.3.0/24".to_string()],
-                ..Default::default()
-            },
-        );
-        proxy_config.trunks.insert(
-            "wrong_carrier".to_string(),
-            TrunkConfig {
-                dest: "sip:10.0.0.1:5060".to_string(),
-                direction: Some(crate::proxy::routing::TrunkDirection::Outbound),
-                ..Default::default()
-            },
-        );
-        proxy_config.trunks.insert(
-            "right_carrier".to_string(),
-            TrunkConfig {
-                dest: "sip:10.0.0.2:5060".to_string(),
-                direction: Some(crate::proxy::routing::TrunkDirection::Outbound),
-                ..Default::default()
-            },
-        );
-        proxy_config.routes = Some(vec![
-            RouteRule {
-                name: "wrong-via-source".to_string(),
-                priority: 0,
-                source_trunks: vec!["via_source".to_string()],
-                match_conditions: crate::proxy::routing::MatchConditions::default(),
-                action: crate::proxy::routing::RouteAction {
-                    dest: Some(crate::proxy::routing::DestConfig::Single(
-                        "wrong_carrier".to_string(),
-                    )),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            RouteRule {
-                name: "right-real-source".to_string(),
-                priority: 10,
-                source_trunks: vec!["real_source".to_string()],
-                match_conditions: crate::proxy::routing::MatchConditions::default(),
-                action: crate::proxy::routing::RouteAction {
-                    dest: Some(crate::proxy::routing::DestConfig::Single(
-                        "right_carrier".to_string(),
-                    )),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        ]);
-
-        let (server, _config) = create_test_server_with_config(proxy_config).await;
-        let route_invite = DefaultRouteInvite {
-            routing_state: std::sync::Arc::new(RoutingState::default()),
-            data_context: server.data_context.clone(),
-        };
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "caller",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:callee@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:callee@rustpbx.com").unwrap(),
-        );
-        request
-            .headers
-            .retain(|header| !matches!(header, rsipstack::sip::Header::Via(_)));
-        request.headers.push(rsipstack::sip::Header::Via(
-            rsipstack::sip::headers::Via::new("SIP/2.0/UDP 5.5.5.5:5060;branch=z9hG4bK-wrong-via"),
-        ));
-
-        let option = InviteOption {
-            caller: rsipstack::sip::Uri::try_from("sip:caller@1.2.3.4").unwrap(),
-            callee: request.uri.clone(),
-            ..Default::default()
-        };
-        let cookie = TransactionCookie::default();
-        cookie.insert_extension(TrunkContext {
-            id: None,
-            name: "real_source".to_string(),
-            did_numbers: vec![],
-        });
-
-        let result = route_invite
-            .route_invite(option, &request, &DialDirection::Inbound, &cookie)
-            .await
-            .expect("route invite should succeed");
-
-        match result {
-            RouteResult::Forward(mut targets) => {
-                assert_eq!(targets.len(), 1);
-                let option = targets.pop().unwrap().option;
-                assert_eq!(
-                    option.destination.unwrap().addr.to_string(),
-                    "10.0.0.2:5060"
-                );
-            }
-            RouteResult::NotHandled(_, _) => {
-                panic!("expected Forward via right carrier, got NotHandled")
-            }
-            RouteResult::Abort(code, reason) => panic!(
-                "expected Forward via right carrier, got Abort {} {:?}",
-                code, reason
-            ),
-            RouteResult::Queue { .. } => panic!("expected Forward via right carrier, got Queue"),
-            RouteResult::Application { .. } => {
-                panic!("expected Forward via right carrier, got Application")
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_replaces_header_basic() {
-        let mut request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: "sip:replace@example.com".try_into().unwrap(),
-            version: rsipstack::sip::Version::V2,
-            headers: vec![].into(),
-            body: vec![],
-        };
-        request.headers.push(rsipstack::sip::Header::Other(
-            "Replaces".into(),
-            "abc123;to-tag=local456;from-tag=remote789".into(),
-        ));
-
-        let result = CallModule::parse_replaces_header(&request);
-        assert!(result.is_some());
-        let (call_id, to_tag, from_tag) = result.unwrap();
-        assert_eq!(call_id, "abc123");
-        assert_eq!(to_tag, "local456");
-        assert_eq!(from_tag, "remote789");
-    }
-
-    #[test]
-    fn test_parse_replaces_header_missing() {
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: "sip:replace@example.com".try_into().unwrap(),
-            version: rsipstack::sip::Version::V2,
-            headers: vec![].into(),
-            body: vec![],
-        };
-
-        let result = CallModule::parse_replaces_header(&request);
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn default_resolve_uses_request_uri_for_same_realm_detection() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("offline internal user should not error — 480 deferred to build_dialplan");
-
-        assert!(
-            dialplan.is_empty(),
-            "offline same-realm should have empty targets"
-        );
-        assert!(
-            dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
-            "offline same-realm should have offline marker set"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_resolve_falls_through_external_callee_to_locs() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri =
-            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("external destination should fall through to locs");
-
-        use crate::call::DialplanFlow;
-        match &dialplan.flow {
-            DialplanFlow::Targets(strategy) => {
-                assert!(!strategy.is_empty(), "external callee should be in targets");
-            }
-            _ => panic!("expected Targets flow for external callee"),
-        }
-    }
-
-    #[tokio::test]
-    async fn build_dialplan_sends_offline_callee_to_voicemail_unless_opted_out() {
-        // (user exists, voicemail_disabled)
-        for (exists, disabled) in [(true, false), (true, true), (false, false)] {
-            let (server, config) = create_test_server().await;
-            if exists {
-                server
-                    .user_backend
-                    .create_user(SipUser {
-                        id: 99,
-                        username: "vm-offline".to_string(),
-                        enabled: true,
-                        realm: Some("rustpbx.com".to_string()),
-                        voicemail_disabled: disabled,
-                        ..Default::default()
-                    })
-                    .await
-                    .expect("create callee");
-            }
-            let module = CallModule::new(config, server);
-            let mut request = crate::proxy::tests::common::create_test_request(
-                rsipstack::sip::Method::Invite,
-                "bp",
-                None,
-                "rustpbx.com",
-                None,
-            );
-            let callee_uri = rsipstack::sip::Uri::try_from("sip:vm-offline@rustpbx.com").unwrap();
-            request.uri = callee_uri.clone();
-            replace_to_header(&mut request, callee_uri);
-            let (mut tx, _endpoint) =
-                crate::proxy::tests::common::create_transaction(request).await;
-            let caller = SipUser {
-                username: "bp".to_string(),
-                realm: Some("rustpbx.com".to_string()),
-                ..Default::default()
-            };
-
-            let result = module
-                .build_dialplan(&mut tx, TransactionCookie::default(), &caller)
-                .await;
-            if exists && !disabled {
-                let plan = result.expect("offline callee should reach voicemail");
-                let DialplanFlow::Application { app_name, app_params, .. } = plan.flow else {
-                    panic!("offline callee must go straight to the voicemail app");
-                };
-                assert_eq!(app_name, "voicemail");
-                assert_eq!(
-                    app_params,
-                    Some(serde_json::json!({ "extension": "vm-offline" }))
-                );
-            } else {
-                let err = result.expect_err("unknown or opted-out callee must not reach voicemail");
-                assert_eq!(
-                    err.status,
-                    Some(rsipstack::sip::StatusCode::TemporarilyUnavailable)
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn default_resolve_always_forwarding_uri_bypasses_offline_locator() {
-        let (server, config) = create_test_server().await;
-        server
-            .user_backend
-            .create_user(SipUser {
-                id: 99,
-                username: "cfwd".to_string(),
-                enabled: true,
-                realm: Some("rustpbx.com".to_string()),
-                call_forwarding_mode: Some("always".to_string()),
-                call_forwarding_destination: Some("sip:alice@rustpbx.com".to_string()),
-                ..Default::default()
-            })
-            .await
-            .expect("create forwarding user");
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:cfwd@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:cfwd@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("always forwarding should bypass offline locator check");
-
-        let target = dialplan
-            .first_target()
-            .expect("forwarding target should be present")
-            .aor
-            .to_string();
-        assert_eq!(target, "sip:alice@rustpbx.com");
-    }
-
-    #[tokio::test]
-    async fn default_resolve_always_forwarding_route_point_uses_application_route_context() {
-        let (server, mut config) = create_test_server().await;
-        Arc::make_mut(&mut config).frequency_limiter = Some("memory".to_string());
-        server
-            .user_backend
-            .create_user(SipUser {
-                id: 101,
-                username: "cfwdrp".to_string(),
-                enabled: true,
-                realm: Some("rustpbx.com".to_string()),
-                call_forwarding_mode: Some("always".to_string()),
-                call_forwarding_destination: Some("toivr:39230".to_string()),
-                ..Default::default()
-            })
-            .await
-            .expect("create route-point forwarding user");
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        let route_point_user_uri = format!("sip:{}@{}", "cfwdrp", "rustpbx.com");
-        request.uri = rsipstack::sip::Uri::try_from(route_point_user_uri.as_str()).unwrap();
-        let request_uri = request.uri.clone();
-        replace_to_header(&mut request, request_uri);
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(RoutePointApplicationRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("route-point forwarding should resolve through call routing");
-
-        match &dialplan.flow {
-            crate::call::DialplanFlow::Application {
-                app_name,
-                app_params,
-                auto_answer,
-            } => {
-                assert_eq!(app_name, "step_ivr");
-                assert_eq!(
-                    app_params
-                        .as_ref()
-                        .and_then(|params| params.get("businessKey")),
-                    Some(&serde_json::json!("driver-spring-festival"))
-                );
-                assert!(*auto_answer);
-            }
-            other => panic!("expected application flow, got {other:?}"),
-        }
-        assert_eq!(
-            dialplan
-                .routed_headers
-                .as_ref()
-                .and_then(|headers| headers.iter().find_map(|header| match header {
-                    rsipstack::sip::Header::Other(name, value)
-                        if name.eq_ignore_ascii_case("X-Business-Key") =>
-                    {
-                        Some(value.as_str())
-                    }
-                    _ => None,
-                })),
-            Some("driver-spring-festival")
-        );
-
-        let limiter = module
-            .inner
-            .routing_state
-            .policy_guard
-            .as_ref()
-            .expect("frequency policy guard")
-            .limiter()
-            .clone();
-        assert!(
-            limiter
-                .check_concurrency("route-point-policy", "caller", "bp", 1)
-                .await
-                .expect("acquire route-point concurrency hold")
-        );
-        let error = module
-            .default_resolve(
-                &request,
-                Box::new(RoutePointNotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect_err("unresolved route point must not dial the forwarding user");
-        assert_eq!(
-            error.status,
-            Some(rsipstack::sip::StatusCode::ServerInternalError)
-        );
-        assert!(
-            limiter
-                .check_concurrency("route-point-policy", "caller", "bp", 1)
-                .await
-                .expect("reacquire released route-point concurrency hold")
-        );
-        limiter
-            .release_concurrency("route-point-policy", "caller", "bp")
-            .await
-            .expect("release test concurrency hold");
-    }
-
-    #[tokio::test]
-    async fn default_resolve_always_forwarding_queue_missing_returns_480() {
-        let (server, config) = create_test_server().await;
-        server
-            .user_backend
-            .create_user(SipUser {
-                id: 100,
-                username: "cfwdq".to_string(),
-                enabled: true,
-                realm: Some("rustpbx.com".to_string()),
-                call_forwarding_mode: Some("always".to_string()),
-                call_forwarding_destination: Some("queue:99999".to_string()),
-                ..Default::default()
-            })
-            .await
-            .expect("create queue forwarding user");
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:cfwdq@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:cfwdq@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let err = module
-            .default_resolve(
-                &request,
-                Box::new(NotHandledRouteInvite),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect_err("missing always-forwarding queue should fail");
-
-        assert_eq!(
-            err.status,
-            Some(rsipstack::sip::StatusCode::TemporarilyUnavailable)
-        );
-        assert!(err.error.to_string().contains("queue '99999' not found"));
-    }
-
-    #[test]
-    fn resolve_callee_uri_prefers_request_uri() {
-        let request_uri = rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap();
-        let to_uri =
-            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
-
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: request_uri.clone(),
-            version: rsipstack::sip::Version::V2,
-            headers: vec![
-                rsipstack::sip::typed::To {
-                    display_name: None,
-                    uri: to_uri,
-                    params: vec![],
-                }
-                .into(),
-            ]
-            .into(),
-            body: vec![],
-        };
-
-        let resolved = resolve_callee_uri(&request).expect("expected callee uri");
-        assert_eq!(resolved, request_uri);
-    }
-
-    #[test]
-    fn resolve_callee_uri_falls_back_to_to_header() {
-        let request_uri = rsipstack::sip::Uri::try_from("sip:rustpbx.com").unwrap();
-        let to_uri = rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap();
-
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: request_uri,
-            version: rsipstack::sip::Version::V2,
-            headers: vec![
-                rsipstack::sip::typed::To {
-                    display_name: None,
-                    uri: to_uri.clone(),
-                    params: vec![],
-                }
-                .into(),
-            ]
-            .into(),
-            body: vec![],
-        };
-
-        let resolved = resolve_callee_uri(&request).expect("expected callee uri");
-        assert_eq!(resolved, to_uri);
-    }
-
-    #[tokio::test]
-    async fn default_resolve_application_carries_routed_headers() {
-        let (server, config) = create_test_server().await;
-        let module = CallModule::new(config, server);
-
-        let mut request = crate::proxy::tests::common::create_test_request(
-            rsipstack::sip::Method::Invite,
-            "bp",
-            None,
-            "rustpbx.com",
-            None,
-        );
-        request.uri = rsipstack::sip::Uri::try_from("sip:ivrapp@rustpbx.com").unwrap();
-        replace_to_header(
-            &mut request,
-            rsipstack::sip::Uri::try_from("sip:ivrapp@rustpbx.com").unwrap(),
-        );
-
-        let caller = SipUser {
-            username: "bp".to_string(),
-            realm: Some("rustpbx.com".to_string()),
-            ..Default::default()
-        };
-
-        let expected_headers = Some(vec![
-            rsipstack::sip::Header::Other("X-Custom".to_string(), "custom-value".to_string()),
-            rsipstack::sip::Header::Other(
-                "P-Asserted-Identity".to_string(),
-                "<sip:routing@pbx.com>".to_string(),
-            ),
-        ]);
-
-        let dialplan = module
-            .default_resolve(
-                &request,
-                Box::new(ApplicationRouteInvite {
-                    headers: expected_headers.clone(),
-                }),
-                &caller,
-                &TransactionCookie::default(),
-            )
-            .await
-            .expect("application route should resolve");
-
-        assert!(
-            matches!(dialplan.flow, crate::call::DialplanFlow::Application { .. }),
-            "expected Application flow"
-        );
-        assert_eq!(
-            dialplan.routed_headers, expected_headers,
-            "routed headers should be preserved in Dialplan"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_build_dialplan_resolves_same_realm_target_destination() {
-        use rsipstack::sip::HostWithPort;
-        use rsipstack::transport::SipAddr;
-
-        let (server, _config) = create_test_server().await;
-
-        let aor: rsipstack::sip::Uri = "sip:alice@rustpbx.com".try_into().expect("valid URI");
-
-        let expected_destination = SipAddr {
-            r#type: Some(rsipstack::sip::Transport::Udp),
-            addr: HostWithPort::try_from("192.168.1.100:5060").expect("valid address"),
-        };
-
-        // Register alice in the memory locator
-        server
-            .locator
-            .register(
-                "alice",
-                Some("rustpbx.com"),
-                Location {
-                    aor: aor.clone(),
-                    expires: 3600,
-                    destination: Some(expected_destination.clone()),
-                    supports_webrtc: true,
-                    last_modified: Some(std::time::Instant::now()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("register should succeed");
-
-        // Build a minimal dialplan with a same-realm target (destination: None)
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: "sip:target@rustpbx.com".try_into().unwrap(),
-            headers: vec![
-                rsipstack::sip::Header::From("sip:caller@rustpbx.com".into()),
-                rsipstack::sip::Header::To("sip:target@rustpbx.com".into()),
-                rsipstack::sip::Header::CallId("test-call".into()),
-            ]
-            .into(),
-            version: rsipstack::sip::Version::V2,
-            body: vec![],
-        };
-        let mut dialplan =
-            Dialplan::new("test-session".to_string(), request, DialDirection::Internal)
-                .with_targets(DialStrategy::Parallel(vec![Location {
-                    aor: aor.clone(),
-                    destination: None,
-                    ..Default::default()
-                }]));
-
-        // Run the same resolution logic from build_dialplan
-        if let DialplanFlow::Targets(ref mut strategy) = dialplan.flow {
-            let targets = match strategy {
-                DialStrategy::Parallel(t) => t,
-                DialStrategy::Sequential(_) => panic!("expected parallel targets"),
-            };
-            for target in targets.iter_mut() {
-                if target.destination.is_none() {
-                    let realm = target.aor.host().to_string();
-                    if server.is_same_realm(&realm).await {
-                        if let Ok(locs) = server.locator.lookup(&target.aor).await {
-                            if let Some(loc) = locs.first() {
-                                if let Some(dest) = loc.destination.clone() {
-                                    target.destination = Some(dest);
-                                    target.supports_webrtc = loc.supports_webrtc;
-                                    if target.transport.is_none() {
-                                        target.transport = loc.transport;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Verify destination was resolved via locator
-        let targets = match &dialplan.flow {
-            DialplanFlow::Targets(strategy) => match strategy {
-                DialStrategy::Parallel(t) => t,
-                DialStrategy::Sequential(_) => panic!("expected parallel targets"),
-            },
-            _ => panic!("Expected Targets flow"),
-        };
-        assert_eq!(targets.len(), 1);
-        let resolved = targets[0]
-            .destination
-            .as_ref()
-            .expect("destination should be resolved via locator");
-        assert_eq!(resolved.addr.to_string(), "192.168.1.100:5060");
-        assert_eq!(resolved.r#type, Some(rsipstack::sip::Transport::Udp));
-        assert!(
-            targets[0].supports_webrtc,
-            "supports_webrtc must propagate from locator result into target"
-        );
-    }
-
-
-
-    #[tokio::test]
-    async fn test_build_dialplan_skips_external_realm_targets() {
-        use rsipstack::sip::HostWithPort;
-        use rsipstack::transport::SipAddr;
-
-        let (server, _config) = create_test_server().await;
-
-        // Register alice (same-realm) in locator
-        let alice_aor: rsipstack::sip::Uri = "sip:alice@rustpbx.com".try_into().expect("valid URI");
-        let alice_dest = SipAddr {
-            r#type: Some(rsipstack::sip::Transport::Udp),
-            addr: HostWithPort::try_from("192.168.1.100:5060").expect("valid address"),
-        };
-        server
-            .locator
-            .register(
-                "alice",
-                Some("rustpbx.com"),
-                Location {
-                    aor: alice_aor.clone(),
-                    expires: 3600,
-                    destination: Some(alice_dest.clone()),
-                    last_modified: Some(std::time::Instant::now()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("register should succeed");
-
-        // Build dialplan with two targets: one same-realm, one external
-        let external_aor: rsipstack::sip::Uri =
-            "sip:bob@external.com".try_into().expect("valid URI");
-
-        let request = rsipstack::sip::Request {
-            method: rsipstack::sip::Method::Invite,
-            uri: "sip:target@rustpbx.com".try_into().unwrap(),
-            headers: vec![
-                rsipstack::sip::Header::From("sip:caller@rustpbx.com".into()),
-                rsipstack::sip::Header::To("sip:target@rustpbx.com".into()),
-                rsipstack::sip::Header::CallId("test-call-ext".into()),
-            ]
-            .into(),
-            version: rsipstack::sip::Version::V2,
-            body: vec![],
-        };
-        let mut dialplan = Dialplan::new(
-            "test-session-ext".to_string(),
-            request,
-            DialDirection::Internal,
-        )
-        .with_targets(DialStrategy::Parallel(vec![
-            Location {
-                aor: alice_aor.clone(),
-                destination: None,
-                ..Default::default()
-            },
-            Location {
-                aor: external_aor.clone(),
-                destination: None,
-                ..Default::default()
-            },
-        ]));
-
-        // Run the same resolution logic
-        if let DialplanFlow::Targets(ref mut strategy) = dialplan.flow {
-            let targets = match strategy {
-                DialStrategy::Parallel(t) => t,
-                DialStrategy::Sequential(_) => panic!("expected parallel targets"),
-            };
-            for target in targets.iter_mut() {
-                if target.destination.is_none() {
-                    let realm = target.aor.host().to_string();
-                    if server.is_same_realm(&realm).await {
-                        if let Ok(locs) = server.locator.lookup(&target.aor).await {
-                            if let Some(loc) = locs.first() {
-                                if let Some(dest) = loc.destination.clone() {
-                                    target.destination = Some(dest);
-                                    target.supports_webrtc = loc.supports_webrtc;
-                                    if target.transport.is_none() {
-                                        target.transport = loc.transport;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Verify same-realm target got resolved, external target stays None
-        let targets = match &dialplan.flow {
-            DialplanFlow::Targets(strategy) => match strategy {
-                DialStrategy::Parallel(t) => t,
-                DialStrategy::Sequential(_) => panic!("expected parallel targets"),
-            },
-            _ => panic!("Expected Targets flow"),
-        };
-        assert_eq!(targets.len(), 2);
-
-        // alice (same-realm) should have destination resolved
-        assert!(
-            targets[0].destination.is_some(),
-            "same-realm target should have destination resolved"
-        );
-
-        // bob (external) should NOT have destination set
-        assert!(
-            targets[1].destination.is_none(),
-            "external-realm target should NOT have destination resolved"
-        );
     }
 }

@@ -400,6 +400,7 @@ mod tests {
             });
         }
         let ctx = CallSessionContext {
+            leg_generation: None,
             session_id: "test-session".into(),
             root_session_id: None,
             caller: "caller".into(),
@@ -408,6 +409,7 @@ mod tests {
             queue_name: None,
             skill_group_id: None,
             transferred: false,
+            leg_role: None,
             direction: "inbound".into(),
             started_at: None,
             extensions: ext.clone(),
@@ -420,6 +422,7 @@ mod tests {
         let hook = IvrExecHook;
         let ext = SessionExtensions::new();
         let ctx = CallSessionContext {
+            leg_generation: None,
             session_id: "test-session".into(),
             root_session_id: None,
             caller: "caller".into(),
@@ -428,6 +431,7 @@ mod tests {
             queue_name: None,
             skill_group_id: None,
             transferred: false,
+            leg_role: None,
             direction: "inbound".into(),
             started_at: None,
             extensions: ext,
