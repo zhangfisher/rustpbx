@@ -1340,6 +1340,10 @@ impl CallModule {
             if let Some(ice_lite) = hints.ice_lite.take() {
                 dialplan.media.ice_lite = ice_lite;
             }
+            // Custom SDP attribute pass-through: source and destination trunk
+            // settings were already AND'd during hint merging; `None` keeps
+            // the default (pass through).
+            dialplan.passthrough_custom_sdp_attrs = hints.passthrough_custom_sdp_attrs.unwrap_or(true);
             if let Some(max_duration) = hints.max_duration {
                 dialplan.max_call_duration = Some(max_duration);
             }
@@ -1423,6 +1427,9 @@ impl CallModule {
                 }
                 if !overrides.auto_start_except.is_empty() {
                     merged.auto_start_except = overrides.auto_start_except.clone();
+                }
+                if overrides.discard_unanswered.is_some() {
+                    merged.discard_unanswered = overrides.discard_unanswered;
                 }
                 if overrides.filename_pattern.is_some() {
                     merged.filename_pattern = overrides.filename_pattern.clone();
@@ -1582,6 +1589,7 @@ impl CallModule {
         dialplan.recording.enabled = true;
         dialplan.recording.auto_start = policy.auto_start.unwrap_or(true);
         dialplan.recording.auto_start_at = policy.auto_start_at.unwrap_or_default();
+        dialplan.recording.discard_unanswered = policy.discard_unanswered.unwrap_or(false);
         dialplan.recording.recording_type = recording_type;
         dialplan
     }
@@ -2547,11 +2555,14 @@ impl CallModule {
                     }
                 }
                 // Peers retransmit BYE if we already tore the dialog down. Answer
-                // with 200 so endpoints clear; other methods stay silent at debug.
-                // Only do this after cluster lookup failed (or single-node).
+                // 481, which ends the dialog on their side (RFC 3261 §15.1.1);
+                // other methods stay silent at debug. Only do this after cluster
+                // lookup failed (or single-node).
                 if matches!(tx.original.method, rsipstack::sip::Method::Bye) {
-                    info!(%dialog_id, "BYE with no matching dialog; replying 200 so peer clears");
-                    let _ = tx.reply(rsipstack::sip::StatusCode::OK).await;
+                    info!(%dialog_id, "BYE with no matching dialog; replying 481 so peer clears");
+                    let _ = tx
+                        .reply(rsipstack::sip::StatusCode::CallTransactionDoesNotExist)
+                        .await;
                 } else if tx.original.method == rsipstack::sip::Method::Refer {
                     tx.reply(rsipstack::sip::StatusCode::CallTransactionDoesNotExist).await?;
                 } else {
@@ -2769,6 +2780,7 @@ impl ProxyModule for CallModule {
         let dialog_id =
             DialogId::try_from((&tx.original, TransactionRole::Server)).map_err(|e| anyhow!(e))?;
         info!(
+            call_id = %dialog_id.call_id,
             %dialog_id,
             tx = %tx.key,
             uri = %tx.original.uri,

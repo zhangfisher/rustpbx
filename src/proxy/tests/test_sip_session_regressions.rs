@@ -1,11 +1,18 @@
+// Compiled both under cfg(test) (imports used by the test bodies) and as
+// part of the test-support feature surface for downstream crates (cc's
+// #[path] consumers), where some imports go unused.
+#[cfg_attr(not(test), allow(unused_imports))]
 use super::common::{
     create_test_request, create_test_server, create_test_server_with_config,
     create_test_server_with_config_and_sipflow_backend, create_test_server_with_rwi_gateway,
     create_test_server_with_session_hooks, create_transaction,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
 use crate::call::app::{AppInvocationContext, ApplicationContext, CallInfo};
+#[cfg_attr(not(test), allow(unused_imports))]
 use crate::call::domain::{CallCommand, Leg, LegId, LegState, MediaPathMode, ReturnAppSpec};
 use crate::call::runtime::{AppRuntime, AppRuntimeError, BridgeConfig};
+#[cfg_attr(not(test), allow(unused_imports))]
 use crate::call::{
     DialDirection, DialStrategy, Dialplan, FailureAction, MediaConfig, QueueFallbackAction,
     QueuePlan, TransactionCookie,
@@ -1428,64 +1435,89 @@ async fn test_media_proxy_auto_keeps_plain_targets_bypass_without_recording() {
     assert_eq!(session.media_profile.path, MediaPathMode::Bypass);
 }
 
-#[tokio::test]
-async fn recording_disabled_still_arms_capture_and_allows_on_demand_start() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let dialplan = build_dialplan_with_mode(MediaProxyMode::Auto).with_application(
-        "ivr".to_string(),
-        None,
-        true,
-    );
-    // Recording policy left disabled: the capture tap is armed unconditionally
-    // so a call can start recording on demand at any stage (IVR node, agent
-    // connect, API command) regardless of the routing-time policy.
-    let mut session = build_session(dialplan).await;
+#[test]
+fn recording_disabled_still_arms_capture_and_allows_on_demand_start() {
+    let media_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1).thread_name("recording-log-test-media")
+        .enable_all().build().unwrap();
+    let control_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all().build().unwrap();
+    control_runtime.block_on(async {
+        for filter in [
+            "trace",
+            "warn,rustpbx_media=debug",
+            "warn,rustpbx_media::recorder=debug,rustpbx::proxy::proxy_call::sip_session=warn",
+        ] {
+            let (logs, _log_guard, _interest) = crate::log_capture::LogCapture::start_filtered(filter);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let dialplan = build_dialplan_with_mode(MediaProxyMode::Auto).with_application(
+                "ivr".to_string(),
+                None,
+                true,
+            );
+            // Recording policy left disabled: the capture tap is armed unconditionally
+            // so a call can start recording on demand at any stage (IVR node, agent
+            // connect, API command) regardless of the routing-time policy.
+            let mut session = build_session(dialplan).await;
 
-    setup_recording_test_media(&mut session).await;
+            {
+                // This control runtime is current-thread, so the enter guard cannot migrate.
+                let _media_guard = media_runtime.enter();
+                setup_recording_test_media(&mut session).await;
+            }
 
-    {
-        let recording = &session.media.recording;
-        assert!(
-            recording.has_recorder_task(),
-            "capture sender/task must be armed even with recording disabled"
-        );
-        assert!(
-            !recording.has_recorder().await,
-            "no recorder backend may be installed until recording starts"
-        );
-    }
+            {
+                let recording = &session.media.recording;
+                assert!(
+                    recording.has_recorder_task(),
+                    "capture sender/task must be armed even with recording disabled"
+                );
+                assert!(
+                    !recording.has_recorder().await,
+                    "no recorder backend may be installed until recording starts"
+                );
+            }
 
-    // On-demand start succeeds without recording enabled.
-    let out_path = dir.path().join("ondemand.wav");
-    let result = session
-        .execute_command(
-            CallCommand::StartRecording {
-                config: crate::call::domain::RecordConfig {
-                    path: out_path.to_string_lossy().into_owned(),
-                    ..Default::default()
-                },
-            },
-            None,
-        )
-        .await;
-    assert!(
-        result.success,
-        "on-demand start must succeed with recording disabled: {result:?}"
-    );
-    {
-        let recording = &session.media.recording;
-        assert!(
-            recording.has_recorder().await,
-            "recorder must be installed by the on-demand start"
-        );
-    }
-    {
-        let recording = &mut session.media.recording;
-        recording
-            .stop_recording()
-            .await
-            .expect("stop on-demand recorder");
-    }
+            // On-demand start succeeds without recording enabled.
+            let out_path = dir.path().join("ondemand.wav");
+            let result = session
+                .execute_command(
+                    CallCommand::StartRecording {
+                        config: crate::call::domain::RecordConfig {
+                            path: out_path.to_string_lossy().into_owned(),
+                            ..Default::default()
+                        },
+                    },
+                    None,
+                )
+                .await;
+            assert!(
+                result.success,
+                "on-demand start must succeed with recording disabled: {result:?}"
+            );
+            {
+                let recording = &session.media.recording;
+                assert!(
+                    recording.has_recorder().await,
+                    "recorder must be installed by the on-demand start"
+                );
+            }
+            {
+                let recording = &mut session.media.recording;
+                recording
+                    .stop_recording()
+                    .await
+                    .expect("stop on-demand recorder");
+            }
+            let text = logs.text();
+            let created = text.lines().find(|line| line.contains("Creating recorder:"))
+                .expect("asynchronous recorder initialization must emit its diagnostic");
+            assert!(created.contains("recording-log-test-media"), "{created}");
+            assert!(created.contains("session_id=test-session"), "{filter}: {created}");
+            assert!(logs.search("test-session").await.iter()
+                .any(|line| line.contains("Creating recorder:")));
+        }
+    });
 }
 
 #[tokio::test]
@@ -1497,6 +1529,7 @@ async fn recording_enabled_manual_start_creates_idle_capture_task() {
         option: Some(crate::media::recorder::RecorderOption::new(path.clone())),
         auto_start: false,
         auto_start_at: crate::config::RecordingAutoStartAt::Media,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Local,
         stereo_swap: false,
         stereo_mode: None,
@@ -1534,6 +1567,7 @@ async fn file_recording_default_starts_at_media_setup() {
         option: Some(crate::media::recorder::RecorderOption::new(path.clone())),
         auto_start: true,
         auto_start_at: crate::config::RecordingAutoStartAt::Media,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Local,
         stereo_swap: false,
         stereo_mode: None,
@@ -1579,6 +1613,7 @@ async fn file_recording_answer_timing_waits_after_media_setup() {
         option: Some(crate::media::recorder::RecorderOption::new(path.clone())),
         auto_start: true,
         auto_start_at: crate::config::RecordingAutoStartAt::Answer,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Local,
         stereo_swap: false,
         stereo_mode: None,
@@ -1654,6 +1689,7 @@ async fn recording_stop_leaves_stopped_trace_event_with_segment_detail() {
         option: Some(crate::media::recorder::RecorderOption::new(path.clone())),
         auto_start: true,
         auto_start_at: crate::config::RecordingAutoStartAt::Answer,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Local,
         stereo_swap: false,
         stereo_mode: None,
@@ -1722,6 +1758,7 @@ async fn sipflow_recording_default_starts_at_media_setup() {
         option: None,
         auto_start: true,
         auto_start_at: crate::config::RecordingAutoStartAt::Media,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Sipflow,
         stereo_swap: false,
         stereo_mode: None,
@@ -1777,6 +1814,7 @@ async fn sipflow_recording_auto_start_false_keeps_backend_idle() {
         option: None,
         auto_start: false,
         auto_start_at: crate::config::RecordingAutoStartAt::Media,
+        discard_unanswered: false,
         recording_type: crate::config::RecordingType::Sipflow,
         stereo_swap: false,
         stereo_mode: None,
@@ -3632,15 +3670,18 @@ async fn hold_unhold_flips_recording_capture_routes() {
         )
         .await;
     assert!(result.success, "Hold must succeed: {:?}", result.message);
-    assert_eq!(
-        route(&session, "callee"),
-        (Some(CaptureChannel::Callee), None),
-        "hold must switch the B channel to the callee mic"
-    );
+    // Q2.A（xlsx 表(2) P13）：保持窗录音只留保持音 —— 被保持方（caller）
+    // 掉 own mic、保留其听到的 MOH egress（落在自己的 Caller 声道）；另一
+    // 方 live mic 全关。
     assert_eq!(
         route(&session, "caller"),
-        (Some(CaptureChannel::Caller), None),
-        "hold must drop the caller egress capture (comfort noise / MOH)"
+        (None, Some(CaptureChannel::Caller)),
+        "hold must drop the held party's mic and keep their MOH egress"
+    );
+    assert_eq!(
+        route(&session, "callee"),
+        (None, None),
+        "hold must turn every live mic capture off"
     );
 
     let result = session
@@ -7119,4 +7160,134 @@ async fn media_stalled_fires_when_connected_leg_receives_nothing() {
             .any(|e| e.code.as_deref() == Some("proxy.media_stalled")),
         "stall must be recorded in the call trace"
     );
+}
+
+/// The leg-level stall watcher reaches the CDR/RWI error path as
+/// `proxy.ingress_stalled` — exactly ONCE per leg — when media stops after
+/// flowing, and stays silent for resume edges. This is the mid-call
+/// counterpart of `proxy.media_stalled` (lifetime RX == 0): the watcher
+/// only arms after the leg HAS received media, so the two can never
+/// double-report. Lives on the leg itself, so it covers the pre-bridge
+/// IVR/queue phase the bridge health monitor cannot see.
+#[tokio::test]
+async fn ingress_stalled_fires_once_per_leg_when_media_stops_after_flowing() {
+    let dialplan =
+        build_dialplan_with_mode(MediaProxyMode::Auto).with_application("ivr".to_string(), None, true);
+    let (mut session, _handle, mut cmd_rx) = build_session_with_cmd_rx(dialplan).await;
+
+    // Real caller leg with a 1s stall threshold + a loopback phone feeding
+    // it RTP (quality stats on so the stall event carries packet anchors).
+    let mut leg_cfg = crate::media::leg::LegConfig::rtp_pcmu();
+    leg_cfg.ingress_stall_warn_secs = 1;
+    leg_cfg.quality_stats.enabled = true;
+    let caller = crate::media::leg::LegInner::new("caller", &leg_cfg, None).unwrap();
+    let phone = crate::media::leg::LegInner::new("phone", &leg_cfg, None).unwrap();
+    let offer = caller.create_offer().await.unwrap();
+    let answer = phone.answer(&offer).await.unwrap();
+    caller
+        .apply_sdp(&answer, rustrtc::sdp::SdpType::Answer)
+        .await
+        .unwrap();
+    caller.accept();
+    phone.accept();
+    session
+        .legs
+        .set_media_leg(&LegId::from("caller"), caller.clone());
+    phone
+        .play_media(
+            Box::new(
+                crate::media::audio_source::ToneAudioSource::new(
+                    440,
+                    std::time::Duration::from_secs(30),
+                    8000,
+                )
+                .unwrap(),
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while caller.pc().received_rtp_packets() < 20 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "caller never received media"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The forwarder must arm exactly once (a second call is a no-op — the
+    // leg owns the guard, so reconnect-time re-spawns cannot double-report).
+    assert!(session.spawn_leg_ingress_stall_forwarder(&LegId::from("caller")).is_some());
+    assert!(
+        session.spawn_leg_ingress_stall_forwarder(&LegId::from("caller")).is_none(),
+        "second forwarder arming for the same leg must be a no-op"
+    );
+
+    // Phone drops off the wire → the watcher's 1s window completes → the
+    // forwarder reports `proxy.ingress_stalled` with the leg's stall facts.
+    phone.stop();
+    let mut seen = false;
+    for _ in 0..3 {
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(10), cmd_rx.recv())
+            .await
+            .expect("ingress stall should surface within the threshold + slack")
+            .expect("session command channel must stay open");
+        match &cmd {
+            CallCommand::ReportCallError { code, detail, .. } => {
+                assert_eq!(code.as_str(), "proxy.ingress_stalled");
+                let detail = detail.as_ref().expect("stall carries the watcher facts");
+                assert_eq!(detail["leg_id"], "caller");
+                assert_eq!(detail["kind"], "stalled");
+                let accepted = detail["lifetime_accepted"].as_u64().unwrap();
+                assert!(accepted >= 20);
+                assert_eq!(
+                    detail["tap_ingress"].as_u64(),
+                    Some(accepted),
+                    "pipeline consumed every wire packet"
+                );
+                assert!(detail["last_seq"].is_u64() || detail["last_seq"].is_null());
+                seen = true;
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let result = session.execute_command(cmd, None).await;
+        assert!(result.success, "ingress stall report must execute cleanly");
+        break;
+    }
+    assert!(seen, "proxy.ingress_stalled call_error expected");
+
+    // Media returns → a resumed edge exists on the leg's channel, but the
+    // forwarder stays quiet (once per leg) and a SECOND stall never
+    // produces another ReportCallError.
+    caller
+        .pc()
+        .get_transceivers()
+        .into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Audio)
+        .and_then(|t| t.sender())
+        .and_then(|s| s.transport())
+        .expect("audio transport")
+        .feed_packet(
+            bytes::Bytes::from({
+                let mut b = vec![0x80u8, 0];
+                b.extend_from_slice(&1u16.to_be_bytes());
+                b.extend_from_slice(&160u32.to_be_bytes());
+                b.extend_from_slice(&999u32.to_be_bytes());
+                b.extend_from_slice(&[0u8; 160]);
+                b
+            }),
+            "127.0.0.1:5000".parse().unwrap(),
+        )
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let drained = tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let CallCommand::ReportCallError { code, .. } = &cmd {
+                panic!("unexpected second report: {code}");
+            }
+        }
+    })
+    .await;
+    assert!(drained.is_ok(), "no second ReportCallError may appear");
 }

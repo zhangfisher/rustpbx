@@ -840,6 +840,8 @@ pub struct CallRecordingConfig {
     pub auto_start: bool,
     /// Signaling point at which automatic recording installs its backend.
     pub auto_start_at: RecordingAutoStartAt,
+    /// Delete the recording of an unanswered call; nothing is uploaded.
+    pub discard_unanswered: bool,
     /// Where media is captured: `local`/`http`/`s3` → WAV file; `sipflow` →
     /// SipflowRecorder. SIP signalling always goes to `[sipflow]` when configured.
     pub recording_type: RecordingType,
@@ -869,6 +871,7 @@ impl CallRecordingConfig {
             option: None,
             auto_start: true,
             auto_start_at: RecordingAutoStartAt::default(),
+            discard_unanswered: false,
             recording_type: RecordingType::Local,
             stereo_swap: false,
             stereo_mode: None,
@@ -976,6 +979,15 @@ pub struct MediaConfig {
     /// Unset = 30s; 0 disables periodic snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_trace_interval_secs: Option<u64>,
+    /// Per-leg inbound-RTP stall watcher (`proxy.ingress_stalled`): when a
+    /// leg that HAS received media goes silent this many seconds — ANY
+    /// phase, including the pre-bridge IVR/queue wait the bridge health
+    /// monitor cannot see — a WARN fires and a CDR/RWI error edge is
+    /// reported once per leg. The companion `proxy.media_stalled` only
+    /// covers "bridge leg never received anything". Unset = 10s; 0 disables
+    /// the watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_stall_warn_secs: Option<u64>,
     #[serde(default)]
     pub quality_stats: crate::media::quality_stats::QualityStatsConfig,
     pub volume_stats: crate::media::volume_stats::VolumeStatsConfig,
@@ -1014,6 +1026,7 @@ impl MediaConfig {
             relay_ready_timeout_secs: None,
             stall_detect_secs: None,
             media_trace_interval_secs: None,
+            ingress_stall_warn_secs: None,
             quality_stats: Default::default(),
             volume_stats: Default::default(),
             inband_dtmf: Default::default(),
@@ -1072,6 +1085,11 @@ impl MediaConfig {
 
     pub fn with_media_trace_interval_secs(mut self, secs: Option<u64>) -> Self {
         self.media_trace_interval_secs = secs;
+        self
+    }
+
+    pub fn with_ingress_stall_warn_secs(mut self, secs: Option<u64>) -> Self {
+        self.ingress_stall_warn_secs = secs;
         self
     }
 
@@ -1201,6 +1219,11 @@ pub struct Dialplan {
     pub extensions: http::Extensions,
     pub allow_codecs: Vec<CodecType>,
     pub passthrough_failure: bool,
+    /// Custom (non-standard) SDP `a=` attribute pass-through for the active
+    /// target's trunk path — source and destination trunk settings AND'd
+    /// together during routing (`true` when no trunk gate applies, the
+    /// default). Consumed by the media offer/answer rewrite points.
+    pub passthrough_custom_sdp_attrs: bool,
 
     /// Per-session override for routing app/transfer/RWI-originated calls
     /// through the route table. `None` falls back to the global
@@ -1291,6 +1314,7 @@ impl Dialplan {
             extensions: self.extensions.clone(),
             allow_codecs: self.allow_codecs.clone(),
             passthrough_failure: self.passthrough_failure,
+            passthrough_custom_sdp_attrs: self.passthrough_custom_sdp_attrs,
             route_originated_calls: self.route_originated_calls,
             audio_profile: self.audio_profile.clone(),
             busy_wait: self.busy_wait.clone(),
@@ -1365,6 +1389,7 @@ impl Dialplan {
                 "enabled": recording.enabled,
                 "auto_start": recording.auto_start,
                 "auto_start_at": recording.auto_start_at,
+                "discard_unanswered": recording.discard_unanswered,
                 "recording_type": recording.recording_type,
                 "stereo_swap": recording.stereo_swap,
             },
@@ -1492,6 +1517,7 @@ impl Dialplan {
             extensions: http::Extensions::new(),
             allow_codecs: vec![],
             passthrough_failure: false,
+            passthrough_custom_sdp_attrs: true,
             route_originated_calls: None,
             audio_profile: None,
             busy_wait: None,
