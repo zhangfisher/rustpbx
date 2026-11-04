@@ -20,15 +20,16 @@
 use std::time::Duration;
 
 use audio_codec::CodecType;
+use rustpbx_media::TransportMode;
 use rustpbx_media::leg::LegInner;
 use rustpbx_media::media_bridge::{LegSide, MediaBridge};
 use rustpbx_media::negotiate::{CodecInfo, MediaNegotiator};
-use rustrtc::config::{BufferDropStrategy, SdpCompatibilityMode};
+use rustrtc::config::BufferDropStrategy;
 use rustrtc::media::MediaStreamTrack;
 use rustrtc::media::frame::{AudioFrame, MediaSample};
 use rustrtc::media::track::sample_track;
 use rustrtc::peer_connection::RtpObserver;
-use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription, TransportMode};
+use rustrtc::{PeerConnection, RtcConfiguration, SdpType, SessionDescription};
 
 /// A standalone peer that faces one leg of the MediaBridge. Sends audio via a
 /// track source; receives via its receiver track.
@@ -75,14 +76,9 @@ impl TestPeer {
 
     /// Add a video sender track (so the peer can relay video end-to-end). The
     /// PC is rebuilt with video capabilities so the offer carries a video m-line.
-    fn with_video(
-        mut self,
-        caps: &[rustrtc::config::VideoCapability],
-        sdp_compatibility: SdpCompatibilityMode,
-    ) -> Self {
-        let mut cfg = rtc_config(self.pc.config().transport_mode.clone(), &self.codec);
+    fn with_video(mut self, caps: &[rustrtc::config::VideoCapability]) -> Self {
+        let mut cfg = rtc_config(TransportMode::of(self.pc.config()), &self.codec);
         cfg.media_capabilities.as_mut().unwrap().video = caps.to_vec();
-        cfg.sdp_compatibility = sdp_compatibility;
         self.pc.close();
         self.pc = PeerConnection::new(cfg);
         let (tx, track, _) = sample_track(rustrtc::media::MediaKind::Audio, 500);
@@ -247,17 +243,15 @@ fn rtc_config(transport: TransportMode, codec: &CodecInfo) -> RtcConfiguration {
         media_caps.audio = vec![audio_cap];
     }
     RtcConfiguration {
-        transport_mode: transport,
-        bind_ip: Some("127.0.0.1".into()),
+        bind_ips: vec!["127.0.0.1".parse().unwrap()],
         // host-only ICE: no STUN/TURN → fast localhost gathering
         ice_servers: vec![],
         enable_latching: true,
         buffer_drop_strategy: BufferDropStrategy::DropOldest,
         rtp_buffer_capacity: 500,
-        sdp_compatibility: SdpCompatibilityMode::Standard,
         media_capabilities: Some(media_caps),
         runtime_handle: Some(tokio::runtime::Handle::current()),
-        ..Default::default()
+        ..transport.rtc_configuration(false)
     }
 }
 
@@ -270,7 +264,16 @@ async fn negotiate(test_peer: &TestPeer, leg: &LegInner) {
     test_peer.pc.wait_for_gathering_complete().await;
     let offer = test_peer.pc.create_offer().await.unwrap();
     test_peer.pc.set_local_description(offer.clone()).unwrap();
-    let offer_sdp = offer.to_sdp_string();
+    let mut offer_sdp = offer.to_sdp_string();
+    // RTP and SRTP test peers stand for SIP phones without BUNDLE: they
+    // ignore the group (RFC 8843), so the leg gives each m-line a transport.
+    if TransportMode::of(test_peer.pc.config()) != TransportMode::WebRtc {
+        offer_sdp = offer_sdp
+            .split("\r\n")
+            .filter(|line| !line.starts_with("a=group:BUNDLE"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+    }
 
     // ── Answer side (Leg) — leg.answer() does its own gathering ──
     let answer_sdp = leg.answer(&offer_sdp).await.unwrap();
@@ -279,9 +282,9 @@ async fn negotiate(test_peer: &TestPeer, leg: &LegInner) {
 
     // RTP / SRTP use a direct transport (no ICE) → wait for the RTP transport
     // to be ready. WebRTC needs ICE+DTLS → wait for Connected.
-    let transport = test_peer.pc.config().transport_mode.clone();
+    let transport = TransportMode::of(test_peer.pc.config());
     match transport {
-        rustrtc::TransportMode::WebRtc => {
+        TransportMode::WebRtc => {
             match tokio::time::timeout(Duration::from_secs(10), test_peer.pc.wait_for_connected())
                 .await
             {
@@ -380,7 +383,7 @@ impl TestMediaHarness {
                 .wait_for_rtp_transport_ready(Duration::from_secs(10))
                 .await;
             // WebRTC: also wait for the full DTLS handshake (SRTP keys ready).
-            if leg.pc().config().transport_mode == rustrtc::TransportMode::WebRtc {
+            if TransportMode::of(leg.pc().config()) == TransportMode::WebRtc {
                 let _ =
                     tokio::time::timeout(Duration::from_secs(10), leg.pc().wait_for_connected())
                         .await;
@@ -1123,36 +1126,20 @@ async fn create_video_harness(
     transport_b: TransportMode,
     caps_a: Vec<rustrtc::config::VideoCapability>,
     caps_b: Vec<rustrtc::config::VideoCapability>,
-    sdp_compatibility_a: SdpCompatibilityMode,
-    sdp_compatibility_b: SdpCompatibilityMode,
 ) -> VideoTestHarness {
     let codec = MediaNegotiator::codec_info_for_type(CodecType::PCMU);
     let mk_leg = |name: &str,
                   transport: TransportMode,
-                  caps: Vec<rustrtc::config::VideoCapability>,
-                  sdp_compatibility: SdpCompatibilityMode| {
+                  caps: Vec<rustrtc::config::VideoCapability>| {
         let mut cfg = rtc_config(transport, &codec);
         cfg.media_capabilities.as_mut().unwrap().video = caps;
-        cfg.sdp_compatibility = sdp_compatibility;
         LegInner::from_rtc_config(name, cfg, vec![codec.clone()], true, -35.0, None, None).unwrap()
     };
-    let leg_a = mk_leg(
-        "a",
-        transport_a.clone(),
-        caps_a.clone(),
-        sdp_compatibility_a.clone(),
-    );
-    let leg_b = mk_leg(
-        "b",
-        transport_b.clone(),
-        caps_b.clone(),
-        sdp_compatibility_b.clone(),
-    );
+    let leg_a = mk_leg("a", transport_a.clone(), caps_a.clone());
+    let leg_b = mk_leg("b", transport_b.clone(), caps_b.clone());
 
-    let test_a =
-        TestPeer::new(transport_a.clone(), codec.clone()).with_video(&caps_a, sdp_compatibility_a);
-    let test_b =
-        TestPeer::new(transport_b.clone(), codec.clone()).with_video(&caps_b, sdp_compatibility_b);
+    let test_a = TestPeer::new(transport_a.clone(), codec.clone()).with_video(&caps_a);
+    let test_b = TestPeer::new(transport_b.clone(), codec.clone()).with_video(&caps_b);
     negotiate(&test_a, &leg_a).await;
     negotiate(&test_b, &leg_b).await;
 
@@ -1177,7 +1164,7 @@ async fn create_video_harness(
             .pc()
             .wait_for_rtp_transport_ready(Duration::from_secs(10))
             .await;
-        if leg.pc().config().transport_mode == rustrtc::TransportMode::WebRtc {
+        if TransportMode::of(leg.pc().config()) == TransportMode::WebRtc {
             let _ =
                 tokio::time::timeout(Duration::from_secs(10), leg.pc().wait_for_connected()).await;
         }
@@ -1275,8 +1262,6 @@ async fn fast_path_rtp_h264_rtp_h264_video_relay() {
         TransportMode::Rtp,
         h264_caps(96),
         h264_caps(96),
-        SdpCompatibilityMode::LegacySip,
-        SdpCompatibilityMode::LegacySip,
     )
     .await;
     assert!(
@@ -1311,8 +1296,6 @@ async fn fast_path_rtp_vp8_rtp_vp8_video_relay() {
         TransportMode::Rtp,
         vp8_caps(96),
         vp8_caps(110),
-        SdpCompatibilityMode::LegacySip,
-        SdpCompatibilityMode::LegacySip,
     )
     .await;
     assert!(!media_transports_are_bundled(&h.test_a.pc));
@@ -1340,8 +1323,6 @@ async fn fast_path_webrtc_h264_webrtc_h264_video_relay() {
         TransportMode::WebRtc,
         h264_caps(96),
         h264_caps(96),
-        SdpCompatibilityMode::Standard,
-        SdpCompatibilityMode::Standard,
     )
     .await;
     assert!(
@@ -1375,8 +1356,6 @@ async fn fast_path_webrtc_h264_rtp_h264_video_relay() {
         TransportMode::Rtp,
         h264_caps(96),
         h264_caps(96),
-        SdpCompatibilityMode::Standard,
-        SdpCompatibilityMode::LegacySip,
     )
     .await;
     assert!(
@@ -1409,8 +1388,6 @@ async fn video_codec_mismatch_degrades_to_audio_only() {
         TransportMode::Rtp,
         h264_caps(96),
         vp8_caps(98),
-        SdpCompatibilityMode::LegacySip,
-        SdpCompatibilityMode::LegacySip,
     )
     .await;
     h.assert_video_not_relayed().await;
@@ -2918,4 +2895,129 @@ async fn transcode_recording_preserves_both_directions_g729_pcma() {
 
     h.close();
     tokio::time::sleep(Duration::from_millis(80)).await;
+}
+
+/// Relay-to-hold must anchor after the newest sampling time, even when the
+/// final arrival on the relay is an older packet from the same source.
+#[tokio::test]
+async fn relay_late_tail_does_not_rewind_paced_hold_clock() {
+    use rustpbx_media::audio_source::ToneAudioSource;
+    use rustrtc::rtp::{RtpHeader, RtpPacket};
+    use std::sync::{Arc, Mutex};
+
+    struct Capture {
+        packets: Mutex<Vec<(RtpHeader, Vec<u8>)>>,
+        changed: tokio::sync::Notify,
+    }
+    impl RtpObserver for Capture {
+        fn on_ingress(&self, packet: &RtpPacket, _: std::net::SocketAddr) {
+            self.packets
+                .lock()
+                .unwrap()
+                .push((packet.header.clone(), packet.payload.to_vec()));
+            self.changed.notify_one();
+        }
+    }
+
+    let mut h = TestMediaHarness::create(
+        TransportMode::Rtp,
+        CodecType::PCMU,
+        TransportMode::Rtp,
+        CodecType::PCMU,
+    )
+    .await;
+    h.auto_rebridge = false;
+    let capture = Arc::new(Capture {
+        packets: Mutex::new(Vec::new()),
+        changed: tokio::sync::Notify::new(),
+    });
+    h.test_b.pc.add_observer(capture.clone());
+    h.bridge_and_accept().await;
+    h.assert_relay(true);
+    let leg = h.mb.leg(LegSide::B).unwrap().clone();
+    let output_ssrc = leg.outbound_audio_ssrc();
+
+    let mut received = Vec::new();
+    for (seq, timestamp, tag) in [(1, 10000, 0x11), (96, 25200, 0x22), (2, 10160, 0x33)] {
+        h.test_a
+            .pc
+            .send_raw_rtp(RtpPacket::new(
+                RtpHeader::new(0, seq, timestamp, 0x1234),
+                vec![tag; 160],
+            ))
+            .await
+            .unwrap();
+        let header = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some((header, _)) =
+                    capture
+                        .packets
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(header, payload)| {
+                            header.ssrc == output_ssrc && payload == &vec![tag; 160]
+                        })
+                {
+                    break header.clone();
+                }
+                capture.changed.notified().await;
+            }
+        })
+        .await
+        .expect("each raw relayed payload reaches the real UDP receiver");
+        received.push(header);
+    }
+    assert_eq!(
+        received[1].timestamp.wrapping_sub(received[0].timestamp),
+        15200
+    );
+    assert_eq!(
+        received[2].timestamp.wrapping_sub(received[0].timestamp),
+        160,
+        "initial rewrite fix keeps the late packet's real sampling time"
+    );
+    let high_water = received[1].timestamp;
+    let count_before_hold = capture.packets.lock().unwrap().len();
+    h.mb.unbridge().await.unwrap();
+    leg.play_media(
+        Box::new(ToneAudioSource::new(660, Duration::from_secs(1), 8000).unwrap()),
+        true,
+    )
+    .await
+    .unwrap();
+    let resumed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some((header, _)) = capture
+                .packets
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(count_before_hold)
+                .find(|(header, _)| header.ssrc == output_ssrc)
+            {
+                break header.clone();
+            }
+            capture.changed.notified().await;
+        }
+    })
+    .await
+    .expect("paced hold output reaches the real UDP receiver");
+    eprintln!(
+        "relay currentTS={high_water} lateTS={} pacedTS={} seq={}->{}",
+        received[2].timestamp,
+        resumed.timestamp,
+        received[2].sequence_number,
+        resumed.sequence_number
+    );
+    h.close();
+    assert_eq!(
+        resumed.sequence_number,
+        received[2].sequence_number.wrapping_add(1)
+    );
+    assert_eq!(
+        resumed.timestamp.wrapping_sub(high_water),
+        160,
+        "relay-to-paced must anchor to the output high-water sampling time"
+    );
 }

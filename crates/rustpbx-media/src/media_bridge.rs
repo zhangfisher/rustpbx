@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 use crate::egress::EgressSource;
 use crate::ingress_tap::{DtmfEvent, PacketDirection};
 use crate::leg::Leg;
-use crate::negotiate::{NegotiatedLegProfile, NegotiatedVideoCodec};
+use crate::negotiate::{NegotiatedLegProfile, NegotiatedVideoCodec, TransportMode};
 
 /// Which side of the 2-party bridge a leg occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -452,10 +452,10 @@ impl MediaBridge {
         // video but share no codec, degrade to the transcoding path: audio
         // still flows (decode → re-encode) and video stops entirely.
         let video_mismatch = !pa.video.is_empty() && !pb.video.is_empty() && video_match.is_none();
-        let a_transport = la.pc().config().transport_mode.clone();
-        let b_transport = lb.pc().config().transport_mode.clone();
-        let has_webrtc_leg = a_transport == rustrtc::TransportMode::WebRtc
-            || b_transport == rustrtc::TransportMode::WebRtc;
+        let a_transport = TransportMode::of(la.pc().config());
+        let b_transport = TransportMode::of(lb.pc().config());
+        let has_webrtc_leg =
+            a_transport == TransportMode::WebRtc || b_transport == TransportMode::WebRtc;
 
         // Idempotent re-bridge: same codec pair on an already-active route is
         // a no-op (avoid rebuilding decoders / re-arming the relay).
@@ -1300,9 +1300,6 @@ struct LegSample {
     egress: u64,
     transport_rx: u64,
     transport_tx: u64,
-    sr_packet_count: u64,
-    sr_ssrc: u32,
-    has_sr: bool,
     jitter_us: u64,
     rtt_us: u64,
     fraction_lost: u8,
@@ -1311,7 +1308,7 @@ struct LegSample {
     ingress_recovery: Option<std::time::Instant>,
 }
 
-async fn sample_leg(leg: &Leg, quality: bool) -> LegSample {
+async fn sample_leg(leg: &Leg) -> LegSample {
     let tap = leg.stats();
     let rtcp = leg.rtcp_stats().snapshot();
     // Wire-level outbound RTP: sum the audio senders' counters (includes
@@ -1324,32 +1321,32 @@ async fn sample_leg(leg: &Leg, quality: bool) -> LegSample {
         .filter_map(|t| t.sender())
         .map(|s| s.packets_sent() as u64)
         .sum();
+    // Sequence-number-based inbound counters (RFC 3550 §A.3). Always sampled:
+    // the 5s health loss figure is derived from them.
     let mut ingress_quality = None;
-    if quality {
-        let receiver = leg.pc().get_transceivers().into_iter()
-            .find(|transceiver| transceiver.kind() == MediaKind::Audio)
-            .and_then(|transceiver| transceiver.receiver());
-        if let (Some(receiver), Some(codec)) = (receiver, leg.negotiated().and_then(|profile| profile.audio)) {
-            if codec.clock_rate != 0 {
-                let ssrc = receiver.ssrc();
-                match leg.pc().get_stats().await {
-                    Ok(report) => {
-                        ingress_quality = report.entries.iter().find(|entry|
-                            entry.kind == rustrtc::stats::StatsKind::InboundRtp
-                            && entry.values.get("ssrc").and_then(serde_json::Value::as_u64) == Some(ssrc as u64))
-                            .and_then(|entry| {
-                                let received = entry.values.get("packetsReceived")?.as_u64()?;
-                                Some(IngressSample {
-                                    ssrc, clock_rate: codec.clock_rate,
-                                    received,
-                                    lost: entry.values.get("packetsLost")?.as_i64()?,
-                                    jitter_ms: (received > 1).then_some(
-                                        entry.values.get("jitter")?.as_f64()? * 1000.0 / codec.clock_rate as f64),
-                                })
-                            });
-                    }
-                    Err(error) => warn!(leg_id = %leg.id(), %error, "failed to sample inbound media quality"),
+    let receiver = leg.pc().get_transceivers().into_iter()
+        .find(|transceiver| transceiver.kind() == MediaKind::Audio)
+        .and_then(|transceiver| transceiver.receiver());
+    if let (Some(receiver), Some(codec)) = (receiver, leg.negotiated().and_then(|profile| profile.audio)) {
+        if codec.clock_rate != 0 {
+            let ssrc = receiver.ssrc();
+            match leg.pc().get_stats().await {
+                Ok(report) => {
+                    ingress_quality = report.entries.iter().find(|entry|
+                        entry.kind == rustrtc::stats::StatsKind::InboundRtp
+                        && entry.values.get("ssrc").and_then(serde_json::Value::as_u64) == Some(ssrc as u64))
+                        .and_then(|entry| {
+                            let received = entry.values.get("packetsReceived")?.as_u64()?;
+                            Some(IngressSample {
+                                ssrc, clock_rate: codec.clock_rate,
+                                received,
+                                lost: entry.values.get("packetsLost")?.as_i64()?,
+                                jitter_ms: (received > 1).then_some(
+                                    entry.values.get("jitter")?.as_f64()? * 1000.0 / codec.clock_rate as f64),
+                            })
+                        });
                 }
+                Err(error) => warn!(leg_id = %leg.id(), %error, "failed to sample inbound media quality"),
             }
         }
     }
@@ -1361,9 +1358,6 @@ async fn sample_leg(leg: &Leg, quality: bool) -> LegSample {
         egress: tap.egress_packets,
         transport_rx: leg.pc().received_rtp_packets(),
         transport_tx,
-        sr_packet_count: rtcp.sr_packet_count,
-        sr_ssrc: rtcp.sr_ssrc,
-        has_sr: rtcp.has_sr,
         jitter_us: rtcp.jitter_us,
         rtt_us: rtcp.rtt_us,
         fraction_lost: rtcp.fraction_lost,
@@ -1378,36 +1372,65 @@ struct LegSampleDelta {
     egress: u64,
     transport_rx: u64,
     transport_tx: u64,
-    sr: u64,
+    /// Inbound packets the window should have carried (sequence-number span).
+    rx_expected: u64,
+    /// Inbound packets missing from that span.
+    rx_lost: u64,
     jitter_us: u64,
     rtt_us: u64,
     fraction_lost: u8,
+}
+
+/// Inbound `(expected, lost)` for the window from the receiver's
+/// sequence-number counters. Both counters cover the same span, so the ratio
+/// is exact whatever the sampling cadence — unlike the remote Sender Report
+/// packet count, whose randomized interval never lines up with our window.
+/// A missing previous sample or a new SSRC starts a fresh stream: the
+/// cumulative counters are themselves the window. Late packets can lower the
+/// cumulative loss; that window reports none.
+fn ingress_loss_delta(cur: Option<&IngressSample>, prev: Option<&IngressSample>) -> (u64, u64) {
+    let Some(cur) = cur else {
+        return (0, 0);
+    };
+    let (received, lost) = match prev {
+        Some(prev) if prev.ssrc == cur.ssrc && cur.received >= prev.received => {
+            (cur.received - prev.received, cur.lost - prev.lost)
+        }
+        _ => (cur.received, cur.lost),
+    };
+    let lost = lost.max(0) as u64;
+    (received + lost, lost)
+}
+
+/// True for the FIRST health tick of a bridge: `prev` is still `None`, so
+/// `leg_delta` falls back to a zero baseline and yields LIFETIME counters
+/// (packets since each leg was created) instead of a 5s window. Those
+/// lifetime values must never drive anomaly reporting or telemetry — the
+/// caller leg's lifetime RX against a callee born seconds ago is a
+/// guaranteed false `rx_idrop` (production incident 2026-10-29: a caller
+/// with ~3.8k lifetime packets surfaced as `rx_idrop=3787` on the first
+/// tick, masquerading as a 5s-window burst). Use the first tick purely as
+/// the baseline; true windowed deltas start on the next tick.
+fn is_baseline_health_tick(prev_a: Option<&LegSample>, prev_b: Option<&LegSample>) -> bool {
+    prev_a.is_none() || prev_b.is_none()
 }
 
 fn leg_delta(cur: Option<&LegSample>, prev: Option<&LegSample>) -> LegSampleDelta {
     let Some(cur) = cur else {
         return LegSampleDelta::default();
     };
+    let (rx_expected, rx_lost) = ingress_loss_delta(
+        cur.ingress_quality.as_ref(),
+        prev.and_then(|prev| prev.ingress_quality.as_ref()),
+    );
     let prev = prev.cloned().unwrap_or_default();
-    // SR packet count is only meaningful once a Sender Report has arrived.
-    // If the remote SSRC changed (stream restart / audio↔video SR flip) the
-    // cumulative counter resets, so treat the window as "fresh stream" instead
-    // of computing a bogus huge delta.
-    let sr = if cur.has_sr {
-        if cur.sr_ssrc != 0 && prev.sr_ssrc != 0 && cur.sr_ssrc != prev.sr_ssrc {
-            cur.sr_packet_count
-        } else {
-            cur.sr_packet_count.saturating_sub(prev.sr_packet_count)
-        }
-    } else {
-        0
-    };
     LegSampleDelta {
         ingress: cur.ingress.saturating_sub(prev.ingress),
         egress: cur.egress.saturating_sub(prev.egress),
         transport_rx: cur.transport_rx.saturating_sub(prev.transport_rx),
         transport_tx: cur.transport_tx.saturating_sub(prev.transport_tx),
-        sr,
+        rx_expected,
+        rx_lost,
         jitter_us: cur.jitter_us,
         rtt_us: cur.rtt_us,
         fraction_lost: cur.fraction_lost,
@@ -1477,8 +1500,8 @@ fn spawn_bridge_stats_task(
                 let mut g = legs_shared.lock();
                 if finishing { std::mem::take(&mut *g) } else { (g.0.clone(), g.1.clone()) }
             };
-            let mut sa = if let Some(leg) = &la { Some(sample_leg(leg, config.enabled).await) } else { None };
-            let mut sb = if let Some(leg) = &lb { Some(sample_leg(leg, config.enabled).await) } else { None };
+            let mut sa = if let Some(leg) = &la { Some(sample_leg(leg).await) } else { None };
+            let mut sb = if let Some(leg) = &lb { Some(sample_leg(leg).await) } else { None };
             // A closed leg has no inbound transport reading, not a counter
             // reset: keep the last cumulative rx (teardown stops legs before
             // the sampler's final pass). Sender-side tx survives close.
@@ -1638,11 +1661,18 @@ fn spawn_bridge_stats_task(
                 }
             }
             if finishing { break; }
-            // Preserve the existing 5s health/telemetry cadence and SR
-            // reconciliation; fast samples must not invent SR bursts.
+            // Preserve the existing 5s health/telemetry cadence.
             // Use scheduled ticks: wake-up jitter must not skip a full health period.
             if tick.duration_since(last_health) < Duration::from_secs(5) { continue; }
             last_health = tick;
+            // First health tick of a bridge: `prev` is still None, so
+            // `leg_delta` falls back to zero and yields LIFETIME counters
+            // (packets since each leg was created), not a 5s window. Those
+            // lifetime values must not drive anomaly reporting (caller
+            // lifetime vs a callee born seconds ago is a guaranteed false
+            // `rx_idrop`) or telemetry (a huge phantom burst). Use this tick
+            // purely as the baseline; true windowed deltas start next tick.
+            let baseline_tick = is_baseline_health_tick(prev_a.as_ref(), prev_b.as_ref());
             let da = leg_delta(sa.as_ref(), prev_a.as_ref());
             let db = leg_delta(sb.as_ref(), prev_b.as_ref());
 
@@ -1655,8 +1685,8 @@ fn spawn_bridge_stats_task(
 
             // ── rx bucket (system received) ──
             let rx_packets_d = da.transport_rx + db.transport_rx;
-            let rx_expected_d = da.sr + db.sr;
-            let rx_lost_d = rx_expected_d.saturating_sub(rx_packets_d);
+            let rx_expected_d = da.rx_expected + db.rx_expected;
+            let rx_lost_d = da.rx_lost + db.rx_lost;
             // Internal drops: received on one leg but not emitted on the
             // peer leg (rustrtc mpsc/SPSC saturation, relay stall, ...).
             // Relay-only (see `relay_mode`).
@@ -1684,18 +1714,23 @@ fn spawn_bridge_stats_task(
                 0.0
             };
 
-            crate::telemetry::MediaTelemetry::record_rx(rx_packets_d, rx_lost_d, rx_idrop_d);
-            crate::telemetry::MediaTelemetry::record_tx(tx_packets_d, tx_lost_d, 0);
+            if !baseline_tick {
+                crate::telemetry::MediaTelemetry::record_rx(rx_packets_d, rx_lost_d, rx_idrop_d);
+                crate::telemetry::MediaTelemetry::record_tx(tx_packets_d, tx_lost_d, 0);
+            }
 
-            let anomalous = rx_idrop_d > 0 || rx_loss_pct >= 1.0 || tx_loss_pct >= 1.0;
+            let anomalous = !baseline_tick
+                && (rx_idrop_d > 0 || rx_loss_pct >= 1.0 || tx_loss_pct >= 1.0);
             if anomalous && rx_packets_d + tx_packets_d > 0 {
                 info!(
                     bridge_id = %session_id,
                     relay = relay_mode,
                     a_ingress = da.ingress, a_egress = da.egress, a_rx = da.transport_rx,
+                    a_rx_lost = da.rx_lost,
                     a_jitter = fmt_ms(da.jitter_us), a_rtt = fmt_ms(da.rtt_us),
                     a_flost = format!("{:.1}%", da.fraction_lost as f64 / 255.0 * 100.0),
                     b_ingress = db.ingress, b_egress = db.egress, b_rx = db.transport_rx,
+                    b_rx_lost = db.rx_lost,
                     b_jitter = fmt_ms(db.jitter_us), b_rtt = fmt_ms(db.rtt_us),
                     b_flost = format!("{:.1}%", db.fraction_lost as f64 / 255.0 * 100.0),
                     rx_packets = rx_packets_d,
@@ -1727,7 +1762,7 @@ fn spawn_bridge_stats_task(
              -> Option<crate::media_health::LegMediaHealth> {
                 let leg = leg.as_ref()?;
                 let sample = sample.as_ref()?;
-                let transport_mode = format!("{:?}", leg.pc().config().transport_mode);
+                let transport_mode = format!("{:?}", TransportMode::of(leg.pc().config()));
                 let audio = leg
                     .negotiated()
                     .and_then(|p| p.audio.map(|c| (c.codec, c.payload_type)));
@@ -1844,8 +1879,8 @@ fn sdes_mid_for_kind(leg: &Leg, kind: rustrtc::MediaKind) -> Option<(u8, std::sy
 /// audio-level, transport-cc, mid) use the ids it negotiated with us, which a
 /// SIP peer never agreed to, plain RTP or SDES-SRTP alike: only a WebRTC
 /// destination keeps them (and gets its own sdes:mid stamped).
-fn strip_extensions_toward(destination: &rustrtc::TransportMode) -> bool {
-    *destination != rustrtc::TransportMode::WebRtc
+fn strip_extensions_toward(destination: &TransportMode) -> bool {
+    *destination != TransportMode::WebRtc
 }
 
 /// Rewrite rules for one direction of audio relay: the audio catch-all rule
@@ -2159,6 +2194,36 @@ mod tests {
     use crate::leg::{LegConfig, LegInner};
     use crate::negotiate::CodecInfo;
 
+    fn ingress_sample(ssrc: u32, received: u64, lost: i64) -> IngressSample {
+        IngressSample { ssrc, clock_rate: 8000, received, lost, jitter_ms: None }
+    }
+
+    /// The window loss comes from the receiver's own sequence counters, so a
+    /// loss-free stream reports zero however the remote RTCP timing falls.
+    #[test]
+    fn ingress_loss_delta_uses_sequence_counters() {
+        let prev = ingress_sample(7, 1000, 0);
+        assert_eq!(ingress_loss_delta(Some(&ingress_sample(7, 1250, 0)), Some(&prev)), (250, 0));
+        assert_eq!(ingress_loss_delta(Some(&ingress_sample(7, 1245, 5)), Some(&prev)), (250, 5));
+    }
+
+    #[test]
+    fn ingress_loss_delta_fresh_stream_uses_cumulative_counters() {
+        // First sample: the cumulative counters are the window.
+        assert_eq!(ingress_loss_delta(Some(&ingress_sample(7, 500, 2)), None), (502, 2));
+        // New SSRC: the old stream's counters do not apply.
+        let prev = ingress_sample(7, 5000, 40);
+        assert_eq!(ingress_loss_delta(Some(&ingress_sample(9, 100, 1)), Some(&prev)), (101, 1));
+        assert_eq!(ingress_loss_delta(None, Some(&prev)), (0, 0));
+    }
+
+    /// Late packets lower the cumulative loss; that window reports none.
+    #[test]
+    fn ingress_loss_delta_late_recovery_reports_no_loss() {
+        let prev = ingress_sample(7, 1000, 10);
+        assert_eq!(ingress_loss_delta(Some(&ingress_sample(7, 1250, 4)), Some(&prev)), (250, 0));
+    }
+
     /// Leak regression for the spawned monitors (they are no longer visible
     /// to the session-side TaskGuard counter): both monitor tasks must
     /// terminate once the bridge — the watch senders — is dropped, and must
@@ -2202,10 +2267,39 @@ mod tests {
     /// peers (plain RTP and SDES-SRTP) never negotiated the source's ids.
     #[test]
     fn relay_strips_extensions_toward_non_webrtc_legs() {
-        use rustrtc::TransportMode;
+        use crate::TransportMode;
         assert!(strip_extensions_toward(&TransportMode::Rtp));
         assert!(strip_extensions_toward(&TransportMode::Srtp));
         assert!(!strip_extensions_toward(&TransportMode::WebRtc));
+    }
+
+    #[test]
+    fn baseline_health_tick_gates_anomaly_and_telemetry() {
+        // First tick: prev never captured → lifetime deltas → no anomaly
+        // report, no telemetry. Second tick on: real windowed deltas flow.
+        let sample = LegSample {
+            audio_packet_samples: None,
+            ingress: 3787,
+            egress: 7607,
+            transport_rx: 3787,
+            transport_tx: 7607,
+            jitter_us: 0,
+            rtt_us: 0,
+            fraction_lost: 0,
+            recording_queue_drops: 0,
+            ingress_quality: None,
+            ingress_recovery: None,
+        };
+        assert!(is_baseline_health_tick(None, Some(&sample)));
+        assert!(is_baseline_health_tick(Some(&sample), None));
+        assert!(is_baseline_health_tick(None, None));
+        assert!(!is_baseline_health_tick(Some(&sample), Some(&sample)));
+
+        // The lifetime delta the baseline tick would produce: exactly what
+        // must NOT reach the anomaly report / telemetry.
+        let delta = leg_delta(Some(&sample), None);
+        assert_eq!(delta.ingress, 3787);
+        assert_eq!(delta.transport_rx, 3787);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2338,8 +2432,8 @@ mod tests {
                             MediaBridge::new_with_quality_stats(name, settings.clone());
                         let mut leg_config = LegConfig::rtp_pcmu();
                         leg_config.quality_stats = settings;
-                        leg_config.bind_ip = Some("127.0.0.1".to_string());
-                        leg_config.external_ip = Some("127.0.0.1".to_string());
+                        leg_config.bind_ips = vec!["127.0.0.1".parse().unwrap()];
+                        leg_config.external_ips = vec!["127.0.0.1".parse().unwrap()];
                         leg_config.enable_latching = false;
                         leg_config.comfort_noise = false;
                         if name == "enabled-b" {
@@ -2744,11 +2838,12 @@ mod tests {
             volume_stats: Default::default(),
             quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             relay_ready_timeout: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
-            transport: rustrtc::TransportMode::WebRtc,
+            transport: TransportMode::WebRtc,
             codecs: vec![CodecInfo {
                 payload_type: 111,
                 codec: audio_codec::CodecType::Opus,
@@ -2758,14 +2853,16 @@ mod tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("webrtc-test".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
             inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
         };
         let mut mb = MediaBridge::new("s7");
         let a = LegInner::new("a", &cfg, None).unwrap();
@@ -2811,11 +2908,12 @@ mod tests {
             volume_stats: Default::default(),
             quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             relay_ready_timeout: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
-            transport: rustrtc::TransportMode::WebRtc,
+            transport: TransportMode::WebRtc,
             codecs: vec![CodecInfo {
                 payload_type: 111,
                 codec: audio_codec::CodecType::Opus,
@@ -2825,14 +2923,16 @@ mod tests {
             }],
             video_codecs: crate::negotiate::tests::test_video_codecs(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("webrtc-video".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
             inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
         };
         let mut mb = MediaBridge::new("s-video-rtcp");
         let a = LegInner::new("a", &cfg, None).unwrap();
@@ -2878,11 +2978,12 @@ mod tests {
             volume_stats: Default::default(),
             quality_stats: Default::default(),
             call_id: None,
+            root_session_id: None,
             relay_ready_timeout: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
-            transport: rustrtc::TransportMode::WebRtc,
+            transport: TransportMode::WebRtc,
             codecs: vec![CodecInfo {
                 payload_type: 111,
                 codec: audio_codec::CodecType::Opus,
@@ -2892,14 +2993,16 @@ mod tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("x-transport".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
             inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
         };
 
         let a = LegInner::new("a", &webrtc_cfg, None).unwrap();
@@ -2967,11 +3070,12 @@ mod tests {
                         volume_stats: Default::default(),
                         quality_stats: Default::default(),
                         call_id: None,
+                        root_session_id: None,
                         relay_ready_timeout: None,
                         ice_servers: Vec::new(),
                         relay_only: false,
                         enable_ice_lite: false,
-                        transport: rustrtc::TransportMode::WebRtc,
+                        transport: TransportMode::WebRtc,
                         codecs: vec![CodecInfo {
                             payload_type: 111,
                             codec: audio_codec::CodecType::Opus,
@@ -2981,24 +3085,27 @@ mod tests {
                         }],
                         video_codecs: Vec::new(),
                         rtp_port_range: None,
-                        external_ip: None,
-                        bind_ip: None,
+                        external_ips: Vec::new(),
+                        bind_ips: Vec::new(),
+                        prefer_ipv6: false,
                         cname: Some("x-opus-webrtc".to_string()),
                         comfort_noise: true,
                         comfort_noise_level_db: -35.0,
                         enable_latching: true,
                         probation_max_packets: None,
                         inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
                     };
                     let rtp_opus_cfg = LegConfig {
                         volume_stats: Default::default(),
                         quality_stats: Default::default(),
                         call_id: None,
+                        root_session_id: None,
                         relay_ready_timeout: None,
                         ice_servers: Vec::new(),
                         relay_only: false,
                         enable_ice_lite: false,
-                        transport: rustrtc::TransportMode::Rtp,
+                        transport: TransportMode::Rtp,
                         codecs: vec![CodecInfo {
                             payload_type: 111,
                             codec: audio_codec::CodecType::Opus,
@@ -3008,14 +3115,16 @@ mod tests {
                         }],
                         video_codecs: Vec::new(),
                         rtp_port_range: None,
-                        external_ip: None,
-                        bind_ip: None,
+                        external_ips: Vec::new(),
+                        bind_ips: Vec::new(),
+                        prefer_ipv6: false,
                         cname: Some("x-opus-rtp".to_string()),
                         comfort_noise: true,
                         comfort_noise_level_db: -35.0,
                         enable_latching: true,
                         probation_max_packets: None,
                         inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
                     };
 
                     let a = LegInner::new("a", &webrtc_cfg, None).unwrap();
@@ -3079,11 +3188,12 @@ mod tests {
                 sample_interval_ms: 500, window_ms: 2000, log_interval_ms: 2000, ..Default::default()
             },
             call_id: None,
+            root_session_id: None,
             relay_ready_timeout: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
-            transport: rustrtc::TransportMode::WebRtc,
+            transport: TransportMode::WebRtc,
             codecs: vec![CodecInfo {
                 payload_type: 0,
                 codec: audio_codec::CodecType::PCMU,
@@ -3093,14 +3203,16 @@ mod tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("unready-webrtc".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
             inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
         };
         let rtp_pcmu_cfg = LegConfig {
             volume_stats: crate::volume_stats::VolumeStatsConfig { enabled: true },
@@ -3108,11 +3220,12 @@ mod tests {
                 sample_interval_ms: 500, window_ms: 2000, log_interval_ms: 2000, ..Default::default()
             },
             call_id: None,
+            root_session_id: None,
             relay_ready_timeout: None,
             ice_servers: Vec::new(),
             relay_only: false,
             enable_ice_lite: false,
-            transport: rustrtc::TransportMode::Rtp,
+            transport: TransportMode::Rtp,
             codecs: vec![CodecInfo {
                 payload_type: 0,
                 codec: audio_codec::CodecType::PCMU,
@@ -3122,14 +3235,16 @@ mod tests {
             }],
             video_codecs: Vec::new(),
             rtp_port_range: None,
-            external_ip: None,
-            bind_ip: None,
+            external_ips: Vec::new(),
+            bind_ips: Vec::new(),
+            prefer_ipv6: false,
             cname: Some("rtp-pcmu".to_string()),
             comfort_noise: true,
             comfort_noise_level_db: -35.0,
             enable_latching: true,
             probation_max_packets: None,
             inband_dtmf: Default::default(),
+            ingress_stall_warn_secs: 0,
         };
 
         // Leg A: WebRTC answerer whose remote (10.0.0.1) never connects, so its
@@ -3141,6 +3256,7 @@ mod tests {
             t=0 0\r\n\
             m=audio 5000 UDP/TLS/RTP/SAVPF 0\r\n\
             a=rtpmap:0 PCMU/8000\r\n\
+            a=rtcp-mux\r\n\
             a=fingerprint:sha-256 F3:04:99:7A:51:6A:C4:D7:30:46:B5:69:82:2A:38:D3:37:D9:66:5B:B6:2F:AD:D3:77:DA:F5:09:2C:9E:DF:8B\r\n\
             a=setup:actpass\r\n\
             a=ice-ufrag:uv50\r\n\

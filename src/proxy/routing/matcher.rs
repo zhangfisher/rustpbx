@@ -1554,9 +1554,11 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
         && trunk.recording.is_none()
         && trunk.ringback.is_none()
         && trunk.max_ring_time.is_none()
+        && trunk.max_call_duration.is_none()
         && trunk.external_ip.is_none()
         && trunk.bind_ip.is_none()
         && trunk.ice_lite.is_none()
+        && trunk.passthrough_custom_sdp_attrs.is_none()
         && trunk.profile.is_none()
         && trunk.diversion_headers.is_none()
         && trunk.history_info.is_none()
@@ -1595,6 +1597,11 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
     if let Some(ringback) = &trunk.ringback {
         hints.ringback = Some(ringback.clone());
     }
+    if let Some(secs) = trunk.max_call_duration.filter(|secs| *secs > 0) {
+        // Source and destination trunks both merge here: the shorter wins.
+        let limit = std::time::Duration::from_secs(secs as u64);
+        hints.max_duration = Some(hints.max_duration.map_or(limit, |cur| cur.min(limit)));
+    }
     if let Some(max_ring_time) = trunk.max_ring_time {
         hints.max_ring_time =
             (max_ring_time > 0).then(|| std::time::Duration::from_secs(max_ring_time as u64));
@@ -1607,6 +1614,13 @@ pub fn merge_trunk_media_hints(hints: &mut Option<DialplanHints>, trunk: &TrunkC
     }
     if let Some(ice_lite) = trunk.ice_lite {
         hints.ice_lite = Some(ice_lite);
+    }
+    // Custom SDP attribute pass-through: source and destination trunks both
+    // merge here, so the semantics are AND — a single disabled trunk strips
+    // custom attributes for the whole call. `None` means "default" (enabled).
+    if let Some(passthrough) = trunk.passthrough_custom_sdp_attrs {
+        hints.passthrough_custom_sdp_attrs =
+            Some(hints.passthrough_custom_sdp_attrs.unwrap_or(true) && passthrough);
     }
     // AMD: route hints outrank the trunk (per-field), the trunk fills gaps —
     // the session then overlays `app_params` and falls back to `[proxy] amd`.
@@ -1653,6 +1667,31 @@ mod ice_lite_hint_tests {
         let mut hints = None;
         merge_trunk_media_hints(&mut hints, &trunk_with(Some(false)));
         assert_eq!(hints.as_ref().and_then(|h| h.ice_lite), Some(false));
+    }
+
+    /// Source and destination trunks both merge their limit; the shorter
+    /// one is the call's, and 0 means no limit.
+    #[test]
+    fn trunk_max_call_duration_keeps_the_shorter_limit() {
+        let trunk = |secs| TrunkConfig {
+            max_call_duration: Some(secs),
+            ..trunk_with(None)
+        };
+        let max_duration =
+            |hints: &Option<DialplanHints>| hints.as_ref().and_then(|h| h.max_duration);
+        let mut hints = None;
+        merge_trunk_media_hints(&mut hints, &trunk(600));
+        assert_eq!(
+            max_duration(&hints),
+            Some(std::time::Duration::from_secs(600))
+        );
+        merge_trunk_media_hints(&mut hints, &trunk(60));
+        merge_trunk_media_hints(&mut hints, &trunk(0));
+        merge_trunk_media_hints(&mut hints, &trunk(120));
+        assert_eq!(
+            max_duration(&hints),
+            Some(std::time::Duration::from_secs(60))
+        );
     }
 
     /// Absent per-trunk flag: no hint is produced, so the global default and
