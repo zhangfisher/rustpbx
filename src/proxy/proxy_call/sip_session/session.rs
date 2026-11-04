@@ -765,11 +765,11 @@ impl SipSession {
 
     pub(crate) fn build_leg_config(
         &self,
-        transport: rustrtc::TransportMode,
+        transport: crate::media::TransportMode,
         codecs: Vec<crate::media::negotiate::CodecInfo>,
         video_codecs: Vec<rustrtc::config::VideoCapability>,
     ) -> crate::media::leg::LegConfig {
-        let is_webrtc = transport == rustrtc::TransportMode::WebRtc;
+        let is_webrtc = transport == crate::media::TransportMode::WebRtc;
         let rtp_port_range = if is_webrtc {
             self.context
                 .dialplan
@@ -800,14 +800,15 @@ impl SipSession {
             codecs,
             video_codecs,
             rtp_port_range,
-            external_ip: self.context.dialplan.media.external_ip.clone(),
+            external_ips: parse_ips(self.context.dialplan.media.external_ip.as_deref()),
             // WebRTC must gather host candidates across interfaces. A fixed
             // SIP/RTP bind address is only appropriate for RTP/SDES legs.
-            bind_ip: if is_webrtc {
-                None
+            bind_ips: if is_webrtc {
+                Vec::new()
             } else {
-                self.context.dialplan.media.bind_ip.clone()
+                parse_ips(self.context.dialplan.media.bind_ip.as_deref())
             },
+            prefer_ipv6: false,
             cname: Some(self.server.rtc_cname.clone()),
             comfort_noise: self.context.dialplan.media.comfort_noise,
             comfort_noise_level_db: self.context.dialplan.media.comfort_noise_level_db,
@@ -826,12 +827,19 @@ impl SipSession {
             // In-band audio DTMF policy (global `[rtp] inband_dtmf`, default
             // auto — detect on legs that negotiate no telephone-event).
             inband_dtmf: self.context.dialplan.media.inband_dtmf,
+            root_session_id: Some(self.root_session_id_str()),
             relay_ready_timeout: self
                 .context
                 .dialplan
                 .media
                 .relay_ready_timeout_secs
                 .map(std::time::Duration::from_secs),
+            ingress_stall_warn_secs: self
+                .context
+                .dialplan
+                .media
+                .ingress_stall_warn_secs
+                .unwrap_or(crate::media::ingress_stall::DEFAULT_INGRESS_STALL_WARN_SECS),
         }
     }
 
@@ -951,7 +959,6 @@ impl SipSession {
 
         (handle, cmd_rx)
     }
-
 
     /// Auto-start live transcription when `[proxy.transcript.remote]
     /// auto_start = true` **or** the dialplan carries a per-call
@@ -1619,6 +1626,10 @@ impl SipSession {
                 !dest_user.is_empty() && registry.get_agent(&dest_user).await.is_some();
             if !dest_is_agent {
                 session.extensions.set_agent_attribution(&cand);
+                // Keep the producing state, before downstream responses or queued events.
+                session.extensions.write().insert(
+                    crate::proxy::proxy_call::session_hooks::OriginatingAgentSnapshot(agent),
+                );
             }
             if let Some(caller) = session.legs.get_mut(&LegId::from("caller")) {
                 caller.agent_id = Some(cand.clone());
@@ -1845,7 +1856,10 @@ impl SipSession {
                         timeout = tokio::time::sleep(Self::CALLER_REJECTION_ACK_TIMEOUT).boxed();
                         continue;
                     }
-                    if !server_dialog_clone.state().is_terminated() {
+                    // Keyed on the INVITE, not the dialog: a caller BYE on the
+                    // early dialog terminates it before any final response, and
+                    // that INVITE still needs its 487 (RFC 3261 §15.1.2).
+                    if Self::invite_unanswered(tx) {
                         if let Err(e) = tx.reply(rsipstack::sip::StatusCode::RequestTerminated).await {
                             warn!(session_id = %session_id, error = %e, "Failed to reply 487 on cancel");
                         }
@@ -1855,7 +1869,7 @@ impl SipSession {
                 _ = &mut timeout => {
                     warn!(session_id = %session_id, "Call setup timed out");
                     cancel_token.cancel();
-                    if !server_dialog_clone.state().is_terminated() {
+                    if Self::invite_unanswered(tx) {
                         if let Err(e) = tx.reply(rsipstack::sip::StatusCode::RequestTerminated).await {
                             warn!(session_id = %session_id, error = %e, "Failed to reply 487 on setup timeout");
                         }
@@ -1868,6 +1882,13 @@ impl SipSession {
         Ok(())
     }
 
+
+    /// The caller's INVITE has no final response yet, so it still awaits one.
+    fn invite_unanswered(tx: &rsipstack::transaction::transaction::Transaction) -> bool {
+        tx.last_response.as_ref().is_none_or(|resp| {
+            resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Provisional
+        })
+    }
 
     /// This node's identity for home-proxy self detection — must match the
     /// address the registrar stamps as `home_proxy` (see `route_via_home_proxy`).
@@ -2075,6 +2096,10 @@ impl SipSession {
             self.server
                 .active_call_registry
                 .touch_heartbeat(&self.context.session_id);
+            // BYE to the caller: the call ends now, however long it takes.
+            if self.pending_hangup.contains(&self.caller_dialog_id()) {
+                self.mark_call_ending();
+            }
             for dialog_id in self.pending_hangup.drain() {
                 let dialog = self
                     .server
@@ -2231,14 +2256,21 @@ impl SipSession {
 
                 // RTP timeout handled via MediaBridge callback → cmd channel
 
-                _ = &mut max_duration_sleep => {
+                _ = &mut max_duration_sleep, if !self.cancel_token.is_cancelled() => {
                     warn!(session_id = %self.id,
                         session_id = %self.context.session_id,
                         max_duration = ?self.context.dialplan.max_call_duration,
                         "Max call duration exceeded, terminating session"
                     );
-                    self.meta.hangup_reason = Some(CallRecordHangupReason::Autohangup);
-                    self.cancel_token.cancel();
+                    // Hang up through the normal path so both legs get their
+                    // BYE (or CANCEL / final response) now, not after the
+                    // cancel drain.
+                    self.handle_hangup(&HangupCommand::local(
+                        "max_call_duration",
+                        Some(CallRecordHangupReason::Autohangup),
+                        None,
+                    ))
+                    .await;
                 }
 
                 // Liveness tick: keep the registry heartbeat fresh.
@@ -2561,7 +2593,7 @@ impl SipSession {
             // (DTLS-SRTP) must build its MediaBridge leg with the matching
             // transport or SRTP negotiation will fail.
             let mut transport = crate::media::negotiate::detect_transport(&sdp);
-            if transport == rustrtc::TransportMode::Srtp {
+            if transport == crate::media::TransportMode::Srtp {
                 // The outbound INVITE offer on originated legs is generated by
                 // RtpTrackBuilder without `a=crypto`, so a SAVP+crypto answer
                 // cannot be honored: the remote expects SRTP but never
@@ -2569,7 +2601,7 @@ impl SipSession {
                 // config gap instead of producing one-way-protected media.
                 warn!(session_id = %self.id,
                     "Callee answered with SDES-SRTP but the outbound offer was plain RTP; keeping plain RTP leg (enable SRTP for originated legs to fix)");
-                transport = rustrtc::TransportMode::Rtp;
+                transport = crate::media::TransportMode::Rtp;
             }
             if let Err(e) = self.ensure_media_leg(LegSide::B, &sdp, transport).await {
                 warn!(session_id = %self.id, error = %e, "Failed to create callee MediaBridge leg");
@@ -2601,6 +2633,67 @@ impl SipSession {
     /// Started once per caller peer; exits when its DTMF sender is dropped.
     pub(crate) fn spawn_dtmf_forwarder(&self) {
         self.spawn_leg_dtmf_forwarder(&LegId::from("caller"));
+        self.spawn_leg_ingress_stall_forwarder(&LegId::from("caller"));
+    }
+
+    /// Forward per-leg inbound-RTP stall edges to the CDR/RWI error path as
+    /// `proxy.ingress_stalled` (once per leg; re-arming is a no-op). The
+    /// watcher on the leg covers every phase of the leg's life — including
+    /// the pre-bridge IVR/queue wait the bridge health monitor cannot
+    /// observe — and the condition is disjoint from `proxy.media_stalled`
+    /// (which requires lifetime RX == 0): this watcher only arms after the
+    /// leg HAS received media, so a leg can never trigger both codes.
+    pub(crate) fn spawn_leg_ingress_stall_forwarder(
+        &self,
+        id: &LegId,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let peer = self.media_leg(id)?;
+        if !peer.arm_ingress_stall_forwarder() {
+            return None;
+        }
+        let mut rx = peer.subscribe_ingress_stall();
+        let leg_id = peer.id().to_string();
+        let session_id = self.context.session_id.clone();
+        let cmd_tx = self.cmd_tx.clone();
+        Some(crate::utils::spawn(async move {
+            let mut reported = false;
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        // Resume edges stay in the watcher's own log line;
+                        // only the stall edge is a CDR/RWI-worthy condition.
+                        if ev.kind != crate::media::ingress_stall::IngressStallKind::Stalled
+                            || reported
+                        {
+                            continue;
+                        }
+                        reported = true;
+                        let detail = serde_json::to_value(&ev).ok();
+                        warn!(
+                            session_id = %session_id,
+                            leg_id = %leg_id,
+                            "reporting proxy.ingress_stalled (once per leg)"
+                        );
+                        if let Some(tx) = &cmd_tx {
+                            let _ = tx.try_send(CallCommand::ReportCallError {
+                                stage: "proxy".to_string(),
+                                app: "proxy".to_string(),
+                                code: "proxy.ingress_stalled".to_string(),
+                                severity: crate::call_errors::ErrSeverity::Warn,
+                                message: format!(
+                                    "Inbound media stalled on leg {} after {} received packets",
+                                    leg_id, ev.lifetime_accepted
+                                ),
+                                sip_status: None,
+                                detail,
+                            });
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
     }
 
     fn accepts_application_input(binding: &RwLock<Option<LegId>>, leg_id: &str) -> bool {
@@ -2739,7 +2832,7 @@ impl SipSession {
             return Err(anyhow!("Originate caller MediaBridge A leg already exists"));
         }
 
-        let cfg = self.build_leg_config(rustrtc::TransportMode::Rtp, codecs, Vec::new());
+        let cfg = self.build_leg_config(crate::media::TransportMode::Rtp, codecs, Vec::new());
         let recorder_sender = self.setup_recording_capture()?;
         let leg_label = "caller";
         let leg = crate::media::create_leg(leg_label, &cfg, recorder_sender, crate::media::CaptureRoute::Classic)?;
@@ -3089,6 +3182,12 @@ impl SipSession {
             ),
             transferred: self.meta.transferred,
             leg_role: self.meta.dial_leg_role.clone(),
+            owns_statistics: crate::proxy::proxy_call::session_hooks::owns_statistics_at_birth(
+                self.meta.child_leg_role.is_some(),
+                self.meta.child_leg_role.as_deref(),
+                self.meta.root_session_id.as_deref(),
+                &self.context.session_id,
+            ),
             direction: self.context.dialplan.direction.to_string(),
             started_at: Some(self.context.created_at.clone()),
             extensions: self.extensions.clone(),
@@ -3146,6 +3245,36 @@ impl SipSession {
             hook.on_call_ringing(&ctx, early_media).await;
         }
         self.refresh_rwi_meta();
+    }
+
+    /// Attended-transfer departure: the session's agent leg is leaving
+    /// (consult → complete transfer) — freeze THE LEG'S OWN agent identity as
+    /// the session's attribution pin, so the final CDR/`call_hangup` stays
+    /// with the agent who actually served this session. Without this,
+    /// `agent_id_from_context` falls through to Priority 3
+    /// (`connected_callee`), which the cross-session transfer bridge repoints
+    /// at the OTHER party — the served agent's row vanished / was
+    /// double-counted (PRD s25 S5: A 0 rows / B duplicate rows).
+    ///
+    /// Keyed to the leg's own `agent_id` (stamped at LegConnected for every
+    /// agent call — queue and direct alike): the consult session's departing
+    /// leg freezes ITS agent (B), the customer session's departing leg freezes
+    /// ITS agent (A) — the stash-based fallback mis-attributed B's session to
+    /// the transferor. Fires only when the leg has a confirmed agent identity.
+    fn freeze_served_agent_attribution(&mut self, leg_id: &LegId) {
+        let served_agent = self
+            .legs
+            .get(leg_id)
+            .and_then(|leg| leg.agent_id.clone())
+            .filter(|agent| !agent.is_empty());
+        if let Some(agent) = served_agent {
+            Self::set_pinned_agent_id(&self.extensions, &agent);
+            info!(
+                session_id = %self.id,
+                agent = %agent,
+                "served agent attribution frozen at transfer departure"
+            );
+        }
     }
 
     pub fn transferred_agent_context(
@@ -4285,12 +4414,34 @@ impl SipSession {
                         )
                     })
             } else if self.bypasses_local_media() {
-                self.relay_signaling_only_offer(side, request.method.clone(), &offer_sdp)
+                // Custom-SDP-attribute gate: the relay is otherwise verbatim,
+                // so a disabled trunk strips custom attrs on both the relayed
+                // offer and the relayed answer. Direction alignment is
+                // unaffected (direction attrs are standard and never stripped).
+                let relay_offer = if self.custom_sdp_attrs_passthrough_enabled() {
+                    offer_sdp.clone()
+                } else {
+                    crate::media::sdp_attrs::strip_custom_attrs_sdp(
+                        &offer_sdp,
+                        rustrtc::SdpType::Offer,
+                    )
+                };
+                self.relay_signaling_only_offer(side, request.method.clone(), &relay_offer)
                     .await
                     .map(|(result_status, answer_sdp)| {
                         // Align answer direction for bypass mode
                         let aligned = answer_sdp
-                            .map(|sdp| MediaNegotiator::align_answer_direction_with_offer(&offer_sdp, &sdp));
+                            .map(|sdp| {
+                                let sdp = if self.custom_sdp_attrs_passthrough_enabled() {
+                                    sdp
+                                } else {
+                                    crate::media::sdp_attrs::strip_custom_attrs_sdp(
+                                        &sdp,
+                                        rustrtc::SdpType::Answer,
+                                    )
+                                };
+                                MediaNegotiator::align_answer_direction_with_offer(&offer_sdp, &sdp)
+                            });
                         (result_status, aligned)
                     })
                     .map_err(|e| {
@@ -4471,6 +4622,8 @@ impl SipSession {
                 // earlier root cause (for example RTP timeout or autohangup).
                 match reason {
                     TerminatedReason::UacBye => {
+                        // BYE received from the caller: the call ends now.
+                        self.mark_call_ending();
                         if self.meta.hangup_reason.is_none() {
                             self.meta.hangup_reason = Some(CallRecordHangupReason::ByCaller);
                             self.meta.hangup_by_side = Some("local".to_string());
@@ -5536,6 +5689,7 @@ impl SipSession {
         self.update_leg_state(leg, crate::call::domain::LegState::Connected);
         if let Some(peer) = self.media_leg(leg) {
             peer.resume_rtp_timeout();
+            peer.set_ingress_quiet_expected(false);
         }
         Ok(())
     }
@@ -5734,6 +5888,12 @@ impl SipSession {
                     .as_ref()
                     .and_then(|leg| self.transferred_agent_context(leg))
                 {
+                    // PRD s25 S5：转场离场坐席 = 本会话的实际服务坐席 —— 先把
+                    // 归因冻结进 live pin（CDR/call_hangup 归属不变），再发
+                    // on_agent_disconnected。
+                    self.freeze_served_agent_attribution(
+                        terminated_leg.as_ref().expect("checked above"),
+                    );
                     for hook in self.server.session_hooks.iter() {
                         hook.on_agent_disconnected(&ctx, &*self.app_runtime).await;
                     }
@@ -6224,6 +6384,7 @@ impl SipSession {
         if let Some(enabled) = hints.enable_sipflow {
             plan.enable_sipflow = enabled;
         }
+        plan.passthrough_custom_sdp_attrs = hints.passthrough_custom_sdp_attrs.unwrap_or(true);
         if let Some(busy_wait) = hints.busy_wait.as_ref() {
             plan.busy_wait = Some(busy_wait.to_plan());
         }
@@ -7742,7 +7903,7 @@ impl SipSession {
             if !has_callee_leg {
                 if let Some(ref callee_sdp_str) = callee_sdp {
                     let callee_is_webrtc =
-                        Self::sdp_transport_mode(callee_sdp_str) == rustrtc::TransportMode::WebRtc;
+                        Self::sdp_transport_mode(callee_sdp_str) == crate::media::TransportMode::WebRtc;
                     let callee_mode = self.callee_transport_mode(callee_is_webrtc);
                     let allow_codecs = self.resolve_effective_codecs();
                     let codecs = self
@@ -7888,13 +8049,13 @@ impl SipSession {
     /// Transport mode for the caller (UAS) leg, derived from the caller's offer
     /// so we answer with a matching media profile (e.g. answer an `RTP/SAVP`
     /// offer with `RTP/SAVP`, never downgrade SDES-SRTP to plain `RTP/AVP`).
-    fn caller_transport_mode(&self) -> rustrtc::TransportMode {
+    fn caller_transport_mode(&self) -> crate::media::TransportMode {
         if let Some(ref offer) = self.media.caller_offer {
             Self::sdp_transport_mode(offer)
         } else {
             self.legs
                 .get_transport(&LegId::from("caller"))
-                .unwrap_or(rustrtc::TransportMode::Rtp)
+                .unwrap_or(crate::media::TransportMode::Rtp)
         }
     }
 
@@ -7902,13 +8063,13 @@ impl SipSession {
     /// callees are unchanged; for SIP callees we mirror SDES-SRTP from the caller
     /// leg ("secure in -> secure out") so anchored SIP<->SIP media stays
     /// encrypted end to end. Plain-RTP callers keep plain `RTP/AVP`.
-    pub(crate) fn callee_transport_mode(&self, callee_is_webrtc: bool) -> rustrtc::TransportMode {
+    pub(crate) fn callee_transport_mode(&self, callee_is_webrtc: bool) -> crate::media::TransportMode {
         if callee_is_webrtc {
-            rustrtc::TransportMode::WebRtc
-        } else if self.caller_transport_mode() == rustrtc::TransportMode::Srtp {
-            rustrtc::TransportMode::Srtp
+            crate::media::TransportMode::WebRtc
+        } else if self.caller_transport_mode() == crate::media::TransportMode::Srtp {
+            crate::media::TransportMode::Srtp
         } else {
-            rustrtc::TransportMode::Rtp
+            crate::media::TransportMode::Rtp
         }
     }
 
@@ -8007,6 +8168,25 @@ impl SipSession {
         // leg-scoped RWI event for it carries `leg_role: "agent"`. Idempotent.
         self.stamp_caller_agent_identity().await;
         self.meta.connected_callee = callee.clone();
+        // PRD s25 S5（C2）：入呼应答腿盖章服务坐席身份 —— 直拨入呼不经
+        // queue 派发的 LegConnected 盖章点，离场冻结
+        //（`freeze_served_agent_attribution`）按腿自身身份定归属，缺章则
+        // 完成转接后归因漂到转接目标（A 0 行 / B 双行）。
+        if let Some(ref callee_uri) = callee
+            && let Some(dialog_id) = self.meta.connected_callee_dialog_id.as_ref()
+            && let Some(leg_id) = self.leg_id_for_dialog(&dialog_id.to_string())
+            && let Some(agent) = self.leg_agent_id(&leg_id, Some(callee_uri)).await
+            && let Some(leg) = self.legs.get_mut(&leg_id)
+            && leg.agent_id.is_none()
+        {
+            info!(
+                session_id = %self.id,
+                leg_id = %leg_id,
+                agent = %agent,
+                "inbound answer: served agent stamped on the connected leg"
+            );
+            leg.agent_id = Some(agent);
+        }
         // A real callee/agent leg answered. Record this permanently so the
         // queue-abandon detector can tell "served then hung up" apart from
         // "hung up while still waiting" even after this leg terminates.
@@ -8432,7 +8612,6 @@ impl SipSession {
 
 
 
-
     /// RFC 3264 direction translation across the media anchor:
     /// the relaying leg's offer expresses its send/receive intent; the target
     /// leg's offer must express the complementary intent.
@@ -8599,6 +8778,13 @@ impl SipSession {
         self.callee_event_tx = None;
 
         // Collect ALL active dialog IDs to hang up: pending set + caller dialog + callee dialogs.
+        if self
+            .caller_dialog
+            .as_ref()
+            .is_some_and(|d| !d.state().is_terminated())
+        {
+            self.mark_call_ending();
+        }
         let mut dialogs_to_hangup = self.pending_hangup.clone();
         dialogs_to_hangup.insert(self.caller_dialog_id());
         for dialog_id in self.callee_dialogs.iter().map(|e| e.key().clone()) {
@@ -11178,6 +11364,7 @@ impl SipSession {
                         }
                         if let Some(peer) = self.media_leg(&caller) {
                             peer.resume_rtp_timeout();
+                            peer.set_ingress_quiet_expected(false);
                         }
                         self.meta.connected_callee_dialog_id =
                             self.legs.get_dialog(&leg_id).map(|d| d.id());
@@ -11205,10 +11392,13 @@ impl SipSession {
                     // primary one. Gated to queue context so direct (non-
                     // queue) calls keep deriving the agent from parties.
                     let leg_agent_id = self.leg_agent_id(&leg_id, Some(agent_uri)).await;
-                    if self.in_queue_context() {
-                        if let Some(leg) = self.legs.get_mut(&leg_id) {
-                            leg.agent_id = leg_agent_id.clone();
-                        }
+                    // PRD s25 S5（C2）：盖章不再门控 queue 语境 —— 直拨 agent
+                    // 呼叫的腿同样带身份，离场冻结
+                    //（`freeze_served_agent_attribution`）按腿自身身份定归属。
+                    // 会话 pin 写入仍门控 queue 语境（直拨归因由 Priority 3
+                    // 兜底，保持既有语义）。
+                    if let Some(leg) = self.legs.get_mut(&leg_id) {
+                        leg.agent_id = leg_agent_id.clone();
                     }
                     if let Some(ref id) = leg_agent_id
                         && Some(id.as_str()) != self.pinned_agent_id().as_deref()
@@ -12045,6 +12235,14 @@ impl SipSession {
     ///
     /// Returns `false` when the leg does not exist (no phantom legs are
     /// created; callers surface the failure explicitly).
+    /// Stamp `CallMeta::hangup_time` (first call wins): the caller is hung up
+    /// now, however long the teardown takes.
+    pub(super) fn mark_call_ending(&mut self) {
+        if self.meta.hangup_time.is_none() {
+            self.meta.hangup_time = Some(Instant::now());
+        }
+    }
+
     pub fn update_leg_state(&mut self, leg_id: &LegId, new_state: LegState) -> bool {
         if let Some(leg) = self.legs.get_mut(leg_id) {
             let prev_state = leg.state;
@@ -12105,7 +12303,10 @@ impl SipSession {
             }
             if let Some(peer) = self.media_leg(leg_id) {
                 match new_state {
-                    LegState::Hold => peer.pause_rtp_timeout(),
+                    LegState::Hold => {
+                        peer.pause_rtp_timeout();
+                        peer.set_ingress_quiet_expected(true);
+                    }
                     LegState::Connected => peer.resume_rtp_timeout(),
                     _ => {}
                 }
@@ -12794,7 +12995,7 @@ impl SipSession {
     pub async fn create_leg_peer(
         &self,
         leg_id: &LegId,
-        mode: rustrtc::TransportMode,
+        mode: crate::media::TransportMode,
     ) -> Result<(crate::media::leg::Leg, String)> {
         let source_sdp = self
             .legs
@@ -12818,7 +13019,7 @@ impl SipSession {
         // deployment gets G.729 implicitly.
         let policy: Vec<CodecType> = if !allow_codecs.is_empty() {
             allow_codecs
-        } else if mode == rustrtc::TransportMode::WebRtc {
+        } else if mode == crate::media::TransportMode::WebRtc {
             MediaNegotiator::default_webrtc_codecs()
         } else {
             MediaNegotiator::default_rtp_codecs()
@@ -12829,7 +13030,7 @@ impl SipSession {
             } else {
                 MediaNegotiator::build_local_rtp_codec_offer(&policy)
             };
-        if mode == rustrtc::TransportMode::WebRtc {
+        if mode == crate::media::TransportMode::WebRtc {
             if let Some(offer) = source_sdp.as_ref().or(self.media.caller_offer.as_ref()) {
                 codecs = MediaNegotiator::filter_webrtc_offer_codecs(offer, codecs);
             }
@@ -12843,7 +13044,7 @@ impl SipSession {
         } else {
             Vec::new()
         };
-        if mode == rustrtc::TransportMode::WebRtc {
+        if mode == crate::media::TransportMode::WebRtc {
             MediaNegotiator::remap_bundle_video_payload_types(
                 &mut video,
                 codecs.iter().map(|codec| codec.payload_type),
@@ -14356,4 +14557,12 @@ mod consult_state_marker_tests {
         let phase = SipSession::consult_state_marker_from_headers(&headers);
         assert_eq!(phase.as_deref(), Some("talk"), "Other-form header also matches");
     }
+}
+
+/// The address of a media setting (`external_ip`, `bind_ip`) as a list for
+/// the media legs: empty when unset or not an IP.
+fn parse_ips(ip: Option<&str>) -> Vec<std::net::IpAddr> {
+    ip.and_then(|ip| ip.trim().parse().ok())
+        .into_iter()
+        .collect()
 }

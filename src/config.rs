@@ -233,6 +233,9 @@ pub struct RecordingPolicy {
     /// `record start` actions, giving separate IVR / agent segments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_start_except: Vec<String>,
+    /// Delete the recording of a call that was never answered (only early
+    /// media was captured) instead of keeping and uploading it. Default false.
+    pub discard_unanswered: Option<bool>,
     pub filename_pattern: Option<String>,
     /// Live file output rate in Hz; explicit values select resampled PCM WAV.
     pub samplerate: Option<u32>,
@@ -320,6 +323,13 @@ pub struct RecordingPolicy {
     /// Default 600 (10 minutes). Breaches increment a Prometheus counter.
     #[serde(default)]
     pub upload_sla_secs: Option<u64>,
+    /// Keep the local recording file for N days **after a successful upload**
+    /// before cleanup (acceptance §3.2.5 归档: 上传后本地保留 10 天). `0`
+    /// (default) = delete immediately on upload success (historical
+    /// behaviour). Files still pending upload (`.upload_failed` marker
+    /// present) are never swept. Sweep runs on the retry worker cycle.
+    #[serde(default)]
+    pub keep_local_days: Option<u32>,
     /// System-managed outbound ringback stage: when true, every originate
     /// call records its pre-answer slice (`segment_type = "ringing"`) without
     /// needing the per-request `record` option, and the slice is KEPT when the
@@ -396,6 +406,7 @@ impl RecordingPolicy {
             enabled: self.enabled.unwrap_or(false),
             auto_start: self.auto_start.unwrap_or(true),
             auto_start_at: self.auto_start_at.unwrap_or_default(),
+            discard_unanswered: self.discard_unanswered.unwrap_or(false),
             recording_type: self.effective_recording_type(),
             stereo_swap: self.stereo_swap.unwrap_or(false),
             stereo_mode: self.stereo_mode,
@@ -471,6 +482,12 @@ impl RecordingPolicy {
         self.upload_sla_secs.unwrap_or(600).max(1)
     }
 
+    /// Local retention (days) after a successful upload before cleanup.
+    /// `0` = delete immediately on upload success (historical behaviour).
+    pub fn effective_keep_local_days(&self) -> u32 {
+        self.keep_local_days.unwrap_or(0)
+    }
+
     /// Whether the system-managed outbound ringback stage should be recorded
     /// (`[recording].record_ringing`): captured for every originate call and
     /// kept even when the call is answered.
@@ -491,42 +508,6 @@ impl RecordingPolicy {
             false
         }
     }
-}
-
-/// `[release]` section: where release/version-management artifacts are stored
-/// plus the lifetime of on-demand presigned download URLs. Metadata itself
-/// lives in a single `release.toml` managed through the generated-config
-/// store (file or `config_entry` table), not in a dedicated DB table.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct ReleaseConfig {
-    /// Artifact storage backend. Defaults to the local `storage/releases`
-    /// directory; configure `type = "s3"` to upload packages to an
-    /// S3-compatible bucket.
-    #[serde(default)]
-    pub storage: Option<StorageConfig>,
-    /// Lifetime in seconds of presigned download URLs generated on demand for
-    /// S3-uploaded artifacts. Defaults to 86400 (24h); the SigV4 signature
-    /// caps validity at 7 days, so larger values are clamped.
-    #[serde(default)]
-    pub signed_url_expiry_secs: Option<u64>,
-    /// Local directory for client telemetry bodies (`POST {api_prefix}/report`).
-    /// Defaults to `storage/telemetry`. Bodies are deliberately kept on local
-    /// disk (not the artifact storage engine): ingestion must succeed even
-    /// while S3 / other subsystems are down.
-    #[serde(default)]
-    pub telemetry_dir: Option<String>,
-}
-
-impl ReleaseConfig {
-    /// Lifetime of presigned release download URLs, clamped to the SigV4
-    /// 7-day maximum.
-    pub fn effective_signed_url_expiry_secs(&self) -> u64 {
-        const DEFAULT_SIGNED_URL_EXPIRY_SECS: u64 = 86_400;
-        self.signed_url_expiry_secs
-            .unwrap_or(DEFAULT_SIGNED_URL_EXPIRY_SECS)
-            .clamp(1, crate::storage::MAX_PRESIGN_EXPIRY_SECS)
-    }
-
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -624,10 +605,6 @@ pub struct Config {
     pub storage: Option<StorageConfig>,
     #[serde(default)]
     pub sipflow: Option<SipFlowConfig>,
-    /// Release/version management: artifact storage + presign expiry. See
-    /// [`ReleaseConfig`].
-    #[serde(default)]
-    pub release: Option<ReleaseConfig>,
     #[serde(default)]
     pub licenses: Option<LicenseConfig>,
     /// SSO login broker (commerce builds only). Handlers are mounted only
@@ -2099,6 +2076,14 @@ pub struct DialplanHints {
     /// console `metadata.sbc.ice_lite`). `Some(true)` forces `a=ice-lite` on
     /// this session's plain-RTP legs; `Some(false)` explicitly disables it.
     pub ice_lite: Option<bool>,
+    /// Custom SDP attribute pass-through gate (from
+    /// `[proxy.trunks.<name>] passthrough_custom_sdp_attrs` or the console
+    /// `metadata.sbc.passthrough_custom_sdp_attrs`). `None`/`true` keeps
+    /// vendor-specific `a=` lines flowing across the B2BUA rewrite in both
+    /// directions; `false` strips them. Source and destination trunks merge
+    /// with AND semantics (`Some(false)` always wins), so a single disabled
+    /// trunk disables pass-through for the whole call.
+    pub passthrough_custom_sdp_attrs: Option<bool>,
     /// Resolved network profile id stamped during routing (from trunk.profile).
     pub network_profile_id: Option<String>,
     /// Per-trunk ringback/early-media audio configuration
@@ -2137,6 +2122,10 @@ impl std::fmt::Debug for DialplanHints {
             .field("external_ip", &self.external_ip)
             .field("bind_ip", &self.bind_ip)
             .field("ice_lite", &self.ice_lite)
+            .field(
+                "passthrough_custom_sdp_attrs",
+                &self.passthrough_custom_sdp_attrs,
+            )
             .field("busy_wait", &self.busy_wait)
             .field("diversion_policy", &self.diversion_policy)
             .field("amd", &self.amd)
@@ -2672,7 +2661,6 @@ impl Default for Config {
             demo_mode: false,
             storage: None,
             sipflow: None,
-            release: None,
             licenses: None,
             #[cfg(feature = "commerce")]
             sso: None,

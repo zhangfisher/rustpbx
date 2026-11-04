@@ -983,6 +983,48 @@ impl StepIvrApp {
                             return Box::pin(self.__exec_node(ctrl, ctx)).await;
                         }
 
+                        // API/webhook executed synchronously inside
+                        // execute_action: the status/body are already in hand,
+                        // and nothing downstream ever delivers ApiResponse as
+                        // a ControllerEvent — waiting for one stalls the flow
+                        // forever (acceptance §3.2.1.1 api row: "no flow
+                        // advance after api/ApiResponse"). Ask the provider
+                        // for the successor NOW; the provider owns the
+                        // branch/dynamic-tree decision for the response
+                        // (third_party getDynamicTree merges here), so
+                        // `node.next` must NOT short-circuit it.
+                        if let WaitEvent::ApiResponse { status, body } = wait_event {
+                            let next = self
+                                .request_next(Some(ProviderEvent::ApiResponse {
+                                    status: *status,
+                                    body: body.clone(),
+                                }))
+                                .await?;
+                            let next_id =
+                                next.step_id.clone().or_else(|| next.step_name.clone());
+                            self.record_trace(IvrTraceEntry {
+                                step_end_time: Some(step_end),
+                                duration_ms: elapsed_ms,
+                                next_node_id: next_id.clone(),
+                                next_step_id: next_id,
+                                ..self.trace_entry(
+                                    &session_id,
+                                    &caller,
+                                    &callee,
+                                    crate::rwi::TriggerInfo::ApiResponse { status: *status },
+                                    &node_type_str,
+                                    action_json,
+                                    None,
+                                    step_id.clone(),
+                                    step_name.clone(),
+                                )
+                            });
+                            self.current_trigger =
+                                Some(crate::rwi::TriggerInfo::ApiResponse { status: *status });
+                            self.current_node = Some(next);
+                            return Box::pin(self.__exec_node(ctrl, ctx)).await;
+                        }
+
                         let step_trigger = match wait_event {
                             WaitEvent::DtmfCollected { digit } => {
                                 crate::rwi::TriggerInfo::DtmfCollected {
@@ -2266,7 +2308,12 @@ impl CallApp for StepIvrApp {
             return self.__exec_node(ctrl, context).await;
         }
 
-        self.provider.on_session_start(&sess_ctx).await.ok();
+        if let Err(err) = self.provider.on_session_start(&sess_ctx).await {
+            self.set_runtime_status(context, "startup_error");
+            self.set_runtime_error(context, &err.to_string());
+            self.current_node = Some(self.enter_ivr_fallback_node(&format!("start:{err}")));
+            return self.__exec_node(ctrl, context).await;
+        }
 
         self.step_prev_start_time = Some(chrono::Utc::now().to_rfc3339());
 

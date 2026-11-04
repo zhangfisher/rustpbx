@@ -413,6 +413,9 @@ type = "extension"
 enabled = true
 auto_start = true
 auto_start_at = "media" # default; use "answer" to wait for 200
+# Delete the WAV recording of a call that was never answered (early media
+# only) instead of keeping and uploading it.
+# discard_unanswered = false
 # Stereo channel assignment for two-party stereo recordings:
 #   caller_left   (default) caller → left, callee → right
 #   callee_left             callee → left, caller → right
@@ -470,6 +473,14 @@ auto_start_at = "media" # default; use "answer" to wait for 200
 # retry_interval_secs = 60   # 0 disables the worker
 # retry_max_attempts = 30
 # upload_sla_secs = 600      # 10-minute completion SLA
+#
+# Keep the local WAV for N days after a successful upload before cleanup
+# (acceptance §3.2.5 归档: 上传后本地保留 10 天). 0 = delete immediately on
+# upload success (historical behaviour). The retention sweep runs on the
+# retry worker cycle and never touches files still pending retry (failure
+# marker present). Applies to http/s3 uploads only — local/sipflow
+# deployments manage disk retention themselves.
+# keep_local_days = 10
 #
 # type = "local" archival layout under path:
 # subdir = "daily"   # default — {path}/YYYYMMDD/{file}
@@ -686,6 +697,12 @@ subdirs = "daily"  # "none" | "daily" | "hourly"
 #                                       # Console: Media Options → ICE-Lite). For strict full-ICE
 #                                       # peers (Teams Direct Routing) that never fall back to
 #                                       # plain RTP. false = explicitly off; unset = inherit global.
+# passthrough_custom_sdp_attrs = true   # custom (non-standard) SDP a= attributes cross the B2BUA
+#                                       # (default). false strips them in both directions for this
+#                                       # trunk: its vendor attrs never reach the peer, and SDP
+#                                       # sent to it carries none from the other side. Source and
+#                                       # destination trunks AND together — one disabled trunk
+#                                       # disables pass-through for the whole call.
 # nat_fix = false                       # per-trunk override of [proxy] nat_fix for SIP messages
 #                                       # from this trunk's IPs (inbound_hosts/dest/backup_dest).
 # # Custom headers (X-* / P-* that are not standard SIP headers) copied between

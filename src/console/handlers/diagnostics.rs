@@ -730,11 +730,18 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
             .and_then(|meta| meta.get("sbc"))
             .and_then(|sbc| sbc.get("ice_lite"))
             .and_then(|v| v.as_bool()),
+        passthrough_custom_sdp_attrs: model
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("sbc"))
+            .and_then(|sbc| sbc.get("passthrough_custom_sdp_attrs"))
+            .and_then(|v| v.as_bool()),
         nat_fix: None,
         profile: None,
         did_numbers: vec![],
         ringback: None,
         max_ring_time: None,
+        max_call_duration: None,
         retry_policy: None,
         diversion_headers: model
             .metadata
