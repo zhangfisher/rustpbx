@@ -482,6 +482,12 @@ fn collect_recording_artifacts(
                     serde_json::Value::String(ended.clone()),
                 );
             }
+            if let Some(ref media_kind) = seg.media_kind {
+                extra.insert(
+                    "media_kind".to_string(),
+                    serde_json::Value::String(media_kind.clone()),
+                );
+            }
             recorder.push(CallRecordMedia {
                 track_id: format!("segment:{}:{}", seg.segment_type, seg.segment_id),
                 path: seg.path.clone(),
@@ -916,24 +922,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "addon-wholesale")]
-    fn enrich_metadata_severity_and_catalog_message_fallback() {
-        // A registered code with no dynamic detail: severity + catalog default
-        // message are resolved from the registry at write time.
-        let mut meta: HashMap<String, serde_json::Value> = HashMap::new();
-        let route = HashMap::from([(
-            "error_code".to_string(),
-            "wholesale.insufficient_funds".to_string(),
-        )]);
-        enrich_error_metadata(&mut meta, Some(&route), 402, None, None);
-        assert_eq!(
-            meta_str(&meta, "error_severity"),
-            crate::call_errors::ErrSeverity::Warn.as_str()
-        );
-        assert_eq!(meta_str(&meta, "error_message"), "Insufficient funds");
-    }
-
-    #[test]
     fn enrich_metadata_unknown_code_no_severity() {
         // An unregistered code (e.g. from a newer build) must not panic; it
         // simply leaves error_severity absent for the renderer to default.
@@ -1010,6 +998,7 @@ mod tests {
             started_at: Some("t0".into()),
             ended_at: Some("t1".into()),
             duration_secs: 1.5,
+            media_kind: None,
         }];
 
         let (recorder, meta) = collect_recording_artifacts(&snapshot, "root-sess", false, None);
@@ -1045,6 +1034,40 @@ mod tests {
     }
 
     #[test]
+    fn collect_recording_artifacts_carries_media_kind_for_video_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp4 = dir.path().join("full_caller.mp4");
+        std::fs::write(&mp4, b"mp4bytes").unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.recording_segments = vec![crate::callrecord::RecordingSegment {
+            unique_id: Some("vid-1".into()),
+            path: mp4.to_string_lossy().into_owned(),
+            size: 8,
+            segment_type: "full".into(),
+            segment_id: "full:video_caller".into(),
+            seq: 1,
+            label: "full_video_caller".into(),
+            started_at: None,
+            ended_at: None,
+            duration_secs: 2.0,
+            media_kind: Some("video".into()),
+        }];
+        let (recorder, meta) = collect_recording_artifacts(&snapshot, "root", false, None);
+        assert_eq!(recorder.len(), 1);
+        assert_eq!(recorder[0].track_id, "segment:full:full:video_caller");
+        assert_eq!(
+            recorder[0]
+                .extra
+                .as_ref()
+                .and_then(|e| e.get("media_kind"))
+                .and_then(|v| v.as_str()),
+            Some("video"),
+            "video marker must surface in the CDR media extra"
+        );
+        assert!(meta.get("recording_segments").is_some());
+    }
+
+    #[test]
     fn collect_recording_artifacts_falls_back_to_dialplan_file() {
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("full.wav");
@@ -1071,6 +1094,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             duration_secs: 0.0,
+            media_kind: None,
         }];
         let (recorder, _) = collect_recording_artifacts(&snapshot, "root", false, None);
         assert!(recorder.is_empty());

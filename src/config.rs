@@ -26,6 +26,18 @@ pub const DEFAULT_IVR_MODE: &str = "tree";
 /// Product brand name.
 pub const BRAND_NAME: &str = "RustPBX";
 
+/// Encoding of passwords minted for shared-secret (TURN REST) entries.
+/// - `Base64` (default): padded Base64 over HMAC-SHA1, as issued by coturn.
+/// - `Hex`: lowercase hex over the same digest, as verified by miuturn's
+///   short-term credential manager.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialEncoding {
+    #[default]
+    Base64,
+    Hex,
+}
+
 /// An ICE server with optional settings for issuing temporary browser credentials.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct IceServerConfig {
@@ -36,6 +48,10 @@ pub struct IceServerConfig {
     /// Temporary credential lifetime in seconds; defaults to one hour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifetime: Option<u64>,
+    /// Encoding of the minted TURN REST password; defaults to Base64
+    /// (coturn-compatible). Use `hex` when the TURN server is miuturn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<CredentialEncoding>,
 }
 
 impl std::fmt::Debug for IceServerConfig {
@@ -44,8 +60,68 @@ impl std::fmt::Debug for IceServerConfig {
             .field("server", &self.server)
             .field("secrete", &self.secrete.as_ref().map(|_| "[redacted]"))
             .field("lifetime", &self.lifetime)
+            .field("encoding", &self.encoding)
             .finish()
     }
+}
+
+/// Resolve browser ICE configuration from ICE server entries at the given
+/// Unix time (seconds). Static entries are preserved; shared-secret TURN
+/// credentials are minted per call and never cached server-side.
+pub fn mint_ice_servers(entries: &[IceServerConfig], now: u64) -> Result<Vec<IceServer>> {
+    let mut servers = Vec::new();
+    for entry in entries {
+        let Some(secret) = &entry.secrete else {
+            servers.push(entry.server.clone());
+            continue;
+        };
+        use hmac::{Hmac, KeyInit, Mac};
+
+        let turn = &entry.server;
+        let user = turn.username.as_deref().unwrap_or("rustpbx");
+        let lifetime = entry.lifetime.unwrap_or(3600);
+        anyhow::ensure!(!secret.is_empty(), "ice_servers.secrete must not be empty");
+        anyhow::ensure!(
+            turn.credential.is_none(),
+            "ice_servers cannot combine secrete and credential"
+        );
+        anyhow::ensure!(
+            turn.credential_type == rustrtc::IceCredentialType::Password,
+            "ice_servers.secrete requires password credentials"
+        );
+        anyhow::ensure!(
+            !turn.urls.is_empty()
+                && turn.urls.iter().all(|url| {
+                    url.strip_prefix("turn:")
+                        .or_else(|| url.strip_prefix("turns:"))
+                        .is_some_and(|host| !host.is_empty())
+                }),
+            "ice_servers with secrete must contain TURN URLs"
+        );
+        anyhow::ensure!(
+            !user.is_empty() && !user.contains(':'),
+            "ice_servers with secrete require a nonempty username suffix without a colon"
+        );
+        anyhow::ensure!(lifetime > 0, "ice_servers.lifetime must be positive");
+        let expires = now
+            .checked_add(lifetime)
+            .ok_or_else(|| anyhow::anyhow!("ice_servers.lifetime overflows expiry"))?;
+        let username = format!("{}:{}", expires, user);
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())?;
+        mac.update(username.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        // TURN REST passwords use standard padded Base64, as in coturn;
+        // miuturn's short-term credential manager instead verifies hex.
+        let credential = match entry.encoding.unwrap_or_default() {
+            CredentialEncoding::Base64 => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                STANDARD.encode(digest)
+            }
+            CredentialEncoding::Hex => hex::encode(digest),
+        };
+        servers.push(turn.clone().with_credential(username, credential));
+    }
+    Ok(servers)
 }
 
 #[derive(Parser, Debug)]
@@ -345,6 +421,41 @@ pub struct RecordingPolicy {
     /// source has no entry uploads to the main bucket fields above.
     #[serde(default)]
     pub sources: Option<HashMap<String, RecordingS3Target>>,
+    /// Video call recording (P2P per-leg MP4). Off by default; when enabled,
+    /// a call whose negotiated SDP carries an H264 video m-line additionally
+    /// records each leg's video as `{base}_caller.mp4` / `{base}_callee.mp4`
+    /// next to the WAV artifact.
+    #[serde(default)]
+    pub video: Option<VideoRecordingConfig>,
+}
+
+/// `[recording.video]` — video recording options.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+pub struct VideoRecordingConfig {
+    /// Master switch. Video recording additionally requires the call to have
+    /// negotiated H264 video (`VideoPolicy::PassThrough` keeps video on the
+    /// legs; `Strip` removes it, leaving a plain audio recording).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Video codec to record. Only `h264` is supported today (VP8 negotiated
+    /// calls degrade to the audio-only WAV).
+    #[serde(default)]
+    pub codec: Option<String>,
+}
+
+impl VideoRecordingConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn h264_enabled(&self) -> bool {
+        self.enabled
+            && self
+                .codec
+                .as_deref()
+                .map(|codec| codec.eq_ignore_ascii_case("h264"))
+                .unwrap_or(true)
+    }
 }
 
 /// One `[recording.sources.<tag>]` entry: an independent S3-compatible upload
@@ -601,6 +712,11 @@ pub struct Config {
     pub recording: Option<RecordingPolicy>,
     #[serde(default)]
     pub demo_mode: bool,
+    /// Explicit node identity (config-only; the former
+    /// `RUSTPBX_INSTANCE_ID` environment override). When unset the identity
+    /// falls back to the cluster peer self-match, then the system hostname.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     #[serde(default)]
@@ -638,6 +754,13 @@ pub struct Config {
     /// Graceful shutdown (drain) tuning — see `GracefulShutdownConfig`.
     #[serde(default)]
     pub graceful_shutdown: Option<GracefulShutdownConfig>,
+    /// Rolling process handover (container rolling release) — see
+    /// [`RollingConfig`]. **Enabled by default**: a config without a
+    /// `[rolling]` section behaves as `enabled = true`; a lone instance
+    /// self-detects and SIGTERM degrades to the plain drain. Opt out with
+    /// `[rolling] enabled = false`.
+    #[serde(default = "default_rolling_config")]
+    pub rolling: Option<RollingConfig>,
     /// Maximum size (in bytes) for audio files downloaded over HTTP from the
     /// console (queue prompts, voicemail prompts, ...). Defaults to 20 MB.
     #[serde(default = "default_max_audio_download_bytes")]
@@ -901,6 +1024,64 @@ pub struct ConsoleConfig {
     /// account whose e-mail address they know.
     #[serde(default)]
     pub expose_reset_link_dev: bool,
+    /// Source-address ACL for the console, notably who may reach the
+    /// unauthenticated bootstrap that creates the first (superuser) account.
+    #[serde(default)]
+    pub acl: ConsoleAclConfig,
+}
+
+/// Source-address ACL for the console registration endpoints
+/// (`[console.acl]`).
+///
+/// The FIRST console account is created on the unauthenticated `/register`
+/// page and automatically becomes the superuser, so by default only loopback
+/// sources may bootstrap. `[console.acl] bootstrap` replaces that default
+/// with an explicit allow-list (it does not implicitly keep loopback).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ConsoleAclConfig {
+    /// Sources allowed to create the first (superuser) account. Supports
+    /// exact IPs, CIDR ranges, and "*" (any). Unset = loopback only.
+    #[serde(default)]
+    pub bootstrap: Option<Vec<String>>,
+    /// Optional restriction for the whole `/register` endpoint (bootstrap
+    /// and later self-registration alike). Unset = no extra restriction;
+    /// the registration policy still governs whether signup is open.
+    #[serde(default)]
+    pub registration: Option<Vec<String>>,
+}
+
+impl ConsoleAclConfig {
+    /// Entry match semantics mirror `AmiConfig::is_allowed`: exact address,
+    /// CIDR range, or the "*" wildcard.
+    fn entry_allows(entry: &str, ip: IpAddr) -> bool {
+        let entry = entry.trim();
+        entry == "*"
+            || entry
+                .parse::<IpAddr>()
+                .is_ok_and(|allowed| allowed == ip)
+            || entry
+                .parse::<IpNet>()
+                .is_ok_and(|network| network.contains(&ip))
+    }
+
+    /// May requests from `ip` create the first (superuser) account? An unset
+    /// list means the conservative default: loopback only.
+    pub fn bootstrap_allows(&self, ip: IpAddr) -> bool {
+        match &self.bootstrap {
+            None => ip.is_loopback(),
+            Some(entries) => entries.iter().any(|entry| Self::entry_allows(entry, ip)),
+        }
+    }
+
+    /// May requests from `ip` reach `/register` at all? An unset list adds no
+    /// address restriction (the registration policy still governs whether
+    /// signup is open); a configured list must match.
+    pub fn registration_allows(&self, ip: IpAddr) -> bool {
+        match &self.registration {
+            None => true,
+            Some(entries) => entries.iter().any(|entry| Self::entry_allows(entry, ip)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -928,6 +1109,7 @@ impl Default for ConsoleConfig {
             static_path: None,
             api_tokens: Vec::new(),
             expose_reset_link_dev: false,
+            acl: ConsoleAclConfig::default(),
         }
     }
 }
@@ -1784,8 +1966,9 @@ pub struct ProxyConfig {
     pub addons: Option<Vec<String>>,
     #[serde(default = "default_passthrough_failure")]
     pub passthrough_failure: bool,
-    /// Video codecs allowed for pass-through relay. Only H264 and VP8 are
-    /// accepted; both are enabled when this setting is omitted.
+    /// Video codecs allowed for pass-through relay. H264, VP8, H265 and VP9
+    /// are accepted; H264 and VP8 are enabled when this setting is omitted.
+    /// Recording only muxes H264 — non-H264 video relays but is not recorded.
     #[serde(
         default = "default_video_codecs",
         deserialize_with = "deserialize_video_codecs"
@@ -2042,12 +2225,14 @@ where
     D: Deserializer<'de>,
 {
     let codecs = Vec::<String>::deserialize(deserializer)?;
-    if let Some(codec) = codecs
-        .iter()
-        .find(|codec| !codec.eq_ignore_ascii_case("H264") && !codec.eq_ignore_ascii_case("VP8"))
-    {
+    if let Some(codec) = codecs.iter().find(|codec| {
+        !codec.eq_ignore_ascii_case("H264")
+            && !codec.eq_ignore_ascii_case("VP8")
+            && !codec.eq_ignore_ascii_case("H265")
+            && !codec.eq_ignore_ascii_case("VP9")
+    }) {
         return Err(serde::de::Error::custom(format!(
-            "unsupported video codec `{codec}`; supported codecs are H264 and VP8"
+            "unsupported video codec `{codec}`; supported codecs are H264, VP8, H265 and VP9"
         )));
     }
     Ok(codecs)
@@ -2202,7 +2387,10 @@ impl Default for GracefulShutdownConfig {
 }
 
 fn default_graceful_shutdown_drain_timeout() -> u64 {
-    300
+    // Aligned with max_call_duration (3600s): a rolling-handover drain must
+    // never force-kill a call that would have ended naturally. Ops note:
+    // `docker stop -t` must exceed this value or SIGKILL defeats the drain.
+    3600
 }
 
 impl GracefulShutdownConfig {
@@ -2211,6 +2399,93 @@ impl GracefulShutdownConfig {
     pub fn effective_timeout(&self) -> Option<std::time::Duration> {
         (self.drain_timeout_secs > 0)
             .then(|| std::time::Duration::from_secs(self.drain_timeout_secs))
+    }
+}
+
+/// `[rolling]` — rolling process handover for container deployments.
+///
+/// The successor (new release) container starts first and waits for the
+/// public ports; `docker stop` on the predecessor triggers a handover
+/// instead of a plain drain: the predecessor keeps serving its live calls
+/// while the successor takes over every public listener, and in-dialog SIP
+/// destined to the predecessor's calls is relayed over loopback HTTP until
+/// the drain completes. Protocol lives in [`crate::rolling`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RollingConfig {
+    #[serde(default = "default_rolling_enabled")]
+    pub enabled: bool,
+    /// Loopback-only listener the PREDECESSOR serves during the handover
+    /// window (`/rolling/relay_ingress`, `/rolling/manifest`, plus the full
+    /// management router for AMI forwards). Host-network deployments must
+    /// pick a port that no other node uses. Default 18181.
+    #[serde(default = "default_rolling_predecessor_port")]
+    pub predecessor_port: u16,
+    /// How long the successor keeps retrying the final port binds after the
+    /// predecessor announces the handover. The idle wait BEFORE that
+    /// ("new container up" → "docker stop old") is unbounded — the
+    /// successor hello-pings while it waits. Default 60s.
+    #[serde(default = "default_rolling_bind_wait_secs")]
+    pub bind_wait_secs: u64,
+    /// Push the predecessor's registration table to the successor at
+    /// handover. Only meaningful for memory-locator deployments (DB-backed
+    /// locators already share registrations). Default false.
+    #[serde(default)]
+    pub handoff_registrations: bool,
+    /// Successor → predecessor hello heartbeat interval in seconds. The
+    /// predecessor only accepts a handover when a heartbeat arrived within
+    /// 3× this window. Default 2s.
+    #[serde(default = "default_rolling_hello_interval_secs")]
+    pub hello_interval_secs: u64,
+}
+
+/// Rolling handover is ENABLED by default: a lone instance self-detects (its
+/// own hello comes back with its own pid) and SIGTERM degrades to the plain
+/// drain — identical behavior to a non-rolling deployment. A rolling pair
+/// (successor started first, then `docker stop` on the predecessor) gets
+/// the zero-restart handover. Opt out with `[rolling] enabled = false`.
+fn default_rolling_enabled() -> bool {
+    true
+}
+
+/// Absent `[rolling]` section = enabled (see [`default_rolling_enabled`]).
+fn default_rolling_config() -> Option<RollingConfig> {
+    Some(RollingConfig::default())
+}
+
+fn default_rolling_predecessor_port() -> u16 {
+    18181
+}
+
+fn default_rolling_bind_wait_secs() -> u64 {
+    60
+}
+
+fn default_rolling_hello_interval_secs() -> u64 {
+    2
+}
+
+impl Default for RollingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rolling_enabled(),
+            predecessor_port: default_rolling_predecessor_port(),
+            bind_wait_secs: default_rolling_bind_wait_secs(),
+            handoff_registrations: false,
+            hello_interval_secs: default_rolling_hello_interval_secs(),
+        }
+    }
+}
+
+impl RollingConfig {
+    /// A successor heartbeat older than this is treated as absent.
+    pub fn hello_fresh_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.hello_interval_secs * 3)
+    }
+
+    /// How long the successor keeps trusting the predecessor's manifest
+    /// (call-id set) after the last refresh.
+    pub fn manifest_fresh_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(10)
     }
 }
 
@@ -2639,6 +2914,7 @@ impl Default for Config {
             media: None,
             ami: Some(AmiConfig::default()),
             graceful_shutdown: None,
+            rolling: Some(RollingConfig::default()),
             external_ip: None,
             auto_external_ip: None,
             sip_external_ip: None,
@@ -2659,6 +2935,7 @@ impl Default for Config {
             database_pool: DatabasePoolConfig::default(),
             recording: None,
             demo_mode: false,
+            instance_id: None,
             storage: None,
             sipflow: None,
             licenses: None,
@@ -2699,12 +2976,6 @@ impl Config {
         let mut config: Self = toml::from_str(
             &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
         )?;
-        if std::env::var("RUSTPBX_DEMO_MODE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-        {
-            config.demo_mode = true;
-        }
         config.ensure_recording_defaults();
         Ok(config)
     }
@@ -2714,12 +2985,6 @@ impl Config {
             .await
             .map_err(|e| anyhow::anyhow!("{}: {}", e, path))?;
         let mut config: Self = toml::from_str(&contents)?;
-        if std::env::var("RUSTPBX_DEMO_MODE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-        {
-            config.demo_mode = true;
-        }
         config.ensure_recording_defaults();
         Ok(config)
     }
@@ -2767,52 +3032,7 @@ impl Config {
     /// Static entries are preserved; shared-secret TURN credentials are minted
     /// per request and are not cached in the server-side RTP configuration.
     pub fn browser_ice_servers(&self, now: u64) -> Result<Vec<IceServer>> {
-        let mut servers = Vec::new();
-        for entry in self.ice_servers.iter().flatten() {
-            let Some(secret) = &entry.secrete else {
-                servers.push(entry.server.clone());
-                continue;
-            };
-            use base64::{Engine as _, engine::general_purpose::STANDARD};
-            use hmac::{Hmac, KeyInit, Mac};
-
-            let turn = &entry.server;
-            let user = turn.username.as_deref().unwrap_or("rustpbx");
-            let lifetime = entry.lifetime.unwrap_or(3600);
-            anyhow::ensure!(!secret.is_empty(), "ice_servers.secrete must not be empty");
-            anyhow::ensure!(
-                turn.credential.is_none(),
-                "ice_servers cannot combine secrete and credential"
-            );
-            anyhow::ensure!(
-                turn.credential_type == rustrtc::IceCredentialType::Password,
-                "ice_servers.secrete requires password credentials"
-            );
-            anyhow::ensure!(
-                !turn.urls.is_empty()
-                    && turn.urls.iter().all(|url| {
-                        url.strip_prefix("turn:")
-                            .or_else(|| url.strip_prefix("turns:"))
-                            .is_some_and(|host| !host.is_empty())
-                    }),
-                "ice_servers with secrete must contain TURN URLs"
-            );
-            anyhow::ensure!(
-                !user.is_empty() && !user.contains(':'),
-                "ice_servers with secrete require a nonempty username suffix without a colon"
-            );
-            anyhow::ensure!(lifetime > 0, "ice_servers.lifetime must be positive");
-            let expires = now
-                .checked_add(lifetime)
-                .ok_or_else(|| anyhow::anyhow!("ice_servers.lifetime overflows expiry"))?;
-            let username = format!("{}:{}", expires, user);
-            let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes())?;
-            mac.update(username.as_bytes());
-            // TURN REST passwords use standard padded Base64, as in coturn.
-            let credential = STANDARD.encode(mac.finalize().into_bytes());
-            servers.push(turn.clone().with_credential(username, credential));
-        }
-        Ok(servers)
+        mint_ice_servers(self.ice_servers.as_deref().unwrap_or(&[]), now)
     }
 
     pub fn sip_contact_config(&self) -> SipContactConfig {
@@ -2929,6 +3149,77 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_acl_bootstrap_defaults_to_loopback_only() {
+        let acl = ConsoleAclConfig::default();
+        assert!(acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(acl.bootstrap_allows("::1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        // Missing ConnectInfo leaves the 0.0.0.0 placeholder, which must not
+        // pass the loopback default (fail-closed).
+        assert!(!acl.bootstrap_allows("0.0.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_bootstrap_explicit_list_is_authoritative() {
+        let acl = ConsoleAclConfig {
+            bootstrap: Some(vec!["192.168.1.0/24".into(), "10.0.0.5".into()]),
+            registration: None,
+        };
+        assert!(acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(acl.bootstrap_allows("10.0.0.5".parse().unwrap()));
+        // An explicit list replaces the implicit loopback allowance.
+        assert!(!acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("192.168.2.10".parse().unwrap()));
+
+        let any = ConsoleAclConfig {
+            bootstrap: Some(vec!["*".into()]),
+            registration: None,
+        };
+        assert!(any.bootstrap_allows("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_registration_unset_adds_no_restriction() {
+        let acl = ConsoleAclConfig::default();
+        assert!(acl.registration_allows("203.0.113.9".parse().unwrap()));
+
+        let gated = ConsoleAclConfig {
+            bootstrap: None,
+            registration: Some(vec!["10.0.0.0/8".into()]),
+        };
+        assert!(gated.registration_allows("10.1.2.3".parse().unwrap()));
+        assert!(!gated.registration_allows("192.168.1.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn console_acl_parses_from_toml() {
+        let raw = r#"
+[console]
+base_path = "/console"
+
+[console.acl]
+bootstrap = ["192.168.1.0/24", "::1"]
+registration = ["10.0.0.0/8"]
+"#;
+        let doc: toml::Value = toml::from_str(raw).expect("parse config");
+        let console: ConsoleConfig = doc["console"].clone().try_into().expect("console section");
+        let acl = console.acl;
+        assert!(acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(acl.bootstrap_allows("::1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!acl.bootstrap_allows("10.9.9.9".parse().unwrap()));
+        assert!(acl.registration_allows("10.9.9.9".parse().unwrap()));
+        assert!(!acl.registration_allows("192.168.1.10".parse().unwrap()));
+
+        // Without an [console.acl] section the bootstrap default stays
+        // loopback-only and registration is unrestricted.
+        let bare: ConsoleConfig = toml::from_str("").expect("parse empty console");
+        assert!(bare.acl.bootstrap_allows("127.0.0.1".parse().unwrap()));
+        assert!(!bare.acl.bootstrap_allows("192.168.1.10".parse().unwrap()));
+        assert!(bare.acl.registration_allows("192.168.1.10".parse().unwrap()));
+    }
 
     #[test]
     fn recording_policy_parses_sources_and_record_ringing() {
@@ -3194,6 +3485,53 @@ bucket = "default-recordings"
     }
 
     #[test]
+    fn test_turn_rest_hex_encoding_matches_miuturn_short_term() {
+        let settings = |encoding: &str| {
+            format!(
+                r#"
+                urls = ["turn:turn.example.com:3478"]
+                secrete = "interop-secret"
+                username = "rustpbx"
+                lifetime = 3600
+                encoding = "{encoding}"
+                "#
+            )
+        };
+        // miuturn's ShortTermCredentialManager verifies lowercase-hex
+        // HMAC-SHA1 passwords over the same digest that coturn-style Base64
+        // entries carry (see test_turn_rest_ice_servers_match_miuturn).
+        let hex_entry: IceServerConfig = toml::from_str(&settings("hex")).unwrap();
+        let servers = mint_ice_servers(&[hex_entry.clone()], 4_102_441_200).unwrap();
+        assert_eq!(servers[0].username.as_deref(), Some("4102444800:rustpbx"));
+        assert_eq!(
+            servers[0].credential.as_deref(),
+            Some("f9d388a7b9fd0c7cc84fcb8d7d5cfcb4d159a0bb")
+        );
+        // Explicit Base64 stays equivalent to the no-encoding default.
+        let base64_entry: IceServerConfig = toml::from_str(&settings("base64")).unwrap();
+        let default_entry = IceServerConfig {
+            encoding: None,
+            ..hex_entry.clone()
+        };
+        assert_eq!(
+            mint_ice_servers(&[base64_entry], 4_102_441_200).unwrap(),
+            mint_ice_servers(&[default_entry], 4_102_441_200).unwrap()
+        );
+        // The encoding survives a config roundtrip.
+        let config = Config {
+            ice_servers: Some(vec![hex_entry]),
+            ..Config::default()
+        };
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("encoding = \"hex\""));
+        let restored: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            restored.browser_ice_servers(4_102_441_200).unwrap(),
+            config.browser_ice_servers(4_102_441_200).unwrap()
+        );
+    }
+
+    #[test]
     fn test_video_codecs_default_and_override() {
         let default_config: ProxyConfig = toml::from_str("addr = \"::\"").unwrap();
         assert_eq!(default_config.video_codecs, vec!["H264", "VP8"]);
@@ -3207,17 +3545,31 @@ bucket = "default-recordings"
         .unwrap();
         assert_eq!(configured.video_codecs, vec!["H264", "VP8"]);
 
+        // Pass-through codecs beyond the defaults: H265 / VP9 relay like
+        // H264 / VP8 (name-matched negotiation, no transcoding).
+        let extended: ProxyConfig = toml::from_str(
+            r#"
+            addr = "::"
+            video_codecs = ["H264", "VP8", "H265", "VP9"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            extended.video_codecs,
+            vec!["H264", "VP8", "H265", "VP9"]
+        );
+
         let unsupported = toml::from_str::<ProxyConfig>(
             r#"
             addr = "::"
-            video_codecs = ["H265"]
+            video_codecs = ["AV1"]
             "#,
         )
         .expect_err("unsupported video codec must fail configuration parsing");
         assert!(
             unsupported
                 .to_string()
-                .contains("supported codecs are H264 and VP8")
+                .contains("supported codecs are H264, VP8, H265 and VP9")
         );
     }
 
