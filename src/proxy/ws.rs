@@ -6,6 +6,7 @@ use rsipstack::{
     transaction::endpoint::EndpointInnerRef,
     transport::{SipAddr, SipConnection, TransportEvent, channel::ChannelConnection},
 };
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::{select, sync::mpsc};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,10 @@ struct WsChannelCleanupGuard {
     sip_connection: SipConnection,
     ws_token: CancellationToken,
     addr: SipAddr,
+    /// Rolling-mode extras: drop the drain-time eviction close handle.
+    rolling: Option<std::sync::Arc<crate::rolling::RollingRuntime>>,
+    conn_kind: &'static str,
+    peer: SocketAddr,
 }
 
 impl Drop for WsChannelCleanupGuard {
@@ -48,6 +53,9 @@ impl Drop for WsChannelCleanupGuard {
         self.endpoint
             .transport_layer
             .remove_connection(&self.sip_connection);
+        if let Some(r) = self.rolling.as_ref() {
+            r.unregister_real_close(self.conn_kind, self.peer);
+        }
         debug!(addr = %self.addr, "ws channel cleanup: transport entry removed");
     }
 }
@@ -57,6 +65,7 @@ pub async fn sip_ws_handler(
     client_addr: ClientAddr,
     socket: WebSocket,
     endpoint_ref: EndpointInnerRef,
+    rolling: Option<std::sync::Arc<crate::rolling::RollingRuntime>>,
 ) {
     let (mut ws_sink, mut ws_read) = socket.split();
     let (from_ws_tx, from_ws_rx) = mpsc::unbounded_channel();
@@ -67,6 +76,7 @@ pub async fn sip_ws_handler(
     } else {
         rsipstack::sip::transport::Transport::Ws
     };
+    let conn_kind: &'static str = if client_addr.is_secure { "Wss" } else { "Ws" };
     let local_addr = SipAddr {
         r#type: Some(transport_type),
         addr: client_addr.addr.into(),
@@ -93,6 +103,20 @@ pub async fn sip_ws_handler(
         "created WebSocket channel connection"
     );
 
+    // Rolling handover: register the drain-time eviction close handle so
+    // the predecessor can disconnect idle WS clients (they reconnect onto
+    // the successor). Live-dialog conns are skipped by the eviction loop.
+    if let Some(r) = rolling.as_ref() {
+        let ws_token_for_close = ws_token.clone();
+        let kind = conn_kind;
+        let peer = client_addr.addr;
+        r.register_real_close(
+            kind,
+            peer,
+            std::sync::Arc::new(move || ws_token_for_close.cancel()),
+        );
+    }
+
     endpoint_ref
         .transport_layer
         .add_connection(sip_connection.clone());
@@ -107,6 +131,9 @@ pub async fn sip_ws_handler(
         sip_connection: sip_connection.clone(),
         ws_token: ws_token.clone(),
         addr: local_addr.clone(),
+        rolling: rolling.clone(),
+        conn_kind,
+        peer: client_addr.addr,
     };
 
     const WS_PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -442,6 +469,9 @@ mod channel_cleanup_tests {
             sip_connection: sip_connection.clone(),
             ws_token: ws_token.clone(),
             addr: peer_addr,
+            rolling: None,
+            conn_kind: "Ws",
+            peer: "203.0.113.7:54323".parse().unwrap(),
         };
         drop(guard);
 
@@ -500,6 +530,9 @@ mod channel_cleanup_tests {
             sip_connection,
             ws_token: ws_token.clone(),
             addr: peer_addr,
+            rolling: None,
+            conn_kind: "Ws",
+            peer: "203.0.113.7:54323".parse().unwrap(),
         };
         drop(guard);
 

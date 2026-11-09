@@ -133,6 +133,7 @@ async fn create_test_server_with_dependencies(
         crate::proxy::presence::PresenceManager::new(None)
             .with_registration_guard(locator.clone(), locator_event_lock.clone()),
     );
+
     let server_inner = Arc::new(SipServerInner {
         http_client: reqwest::Client::new(),
         rtp_config: ArcSwap::new(Arc::new(RtpConfig::default())),
@@ -181,6 +182,7 @@ async fn create_test_server_with_dependencies(
         rwi_gateway,
         ivr_trace: None,
         tls_listener: None,
+        bound_transports: std::sync::Mutex::new(Vec::new()),
         conference_manager: conf_mgr,
         conference_server: conf_server,
         agent_registry: None,
@@ -192,7 +194,7 @@ async fn create_test_server_with_dependencies(
         cluster_peers: vec![],
         cluster_self_addr: None,
         session_registry: Arc::new(crate::call::runtime::NoopSessionRegistry),
-        session_registry_heartbeat: None,
+        session_registry_heartbeat: std::sync::Mutex::new(None),
         trunk_health: None,
         session_hooks: Arc::new(session_hooks),
         contact_username: "rustpbx".to_string(),
@@ -315,7 +317,7 @@ pub fn create_test_request(
     ));
 
     let call_id = rsipstack::sip::headers::CallId::new(random_text(16));
-    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method };
+    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method: method.clone() };
 
     // Create contact with the same user and host
     let contact_uri = rsipstack::sip::Uri {
@@ -459,7 +461,7 @@ pub fn create_proxy_auth_request_with_nonce(
     ));
 
     let call_id = rsipstack::sip::headers::CallId::new(random_text(16));
-    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method };
+    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method: method.clone() };
 
     // Create contact with the same user and host
     let contact_uri = rsipstack::sip::Uri {
