@@ -10,10 +10,6 @@ use super::prelude::*;
 use super::session::{DialogSide, SipSession};
 
 impl SipSession {
-    pub(crate) async fn get_local_reinvite_pc(&self, leg_id: &LegId) -> Option<rustrtc::PeerConnection> {
-        self.media_leg(leg_id).map(|peer| peer.pc().clone())
-    }
-
     /// Propagate hold to the selected peer: updates leg state, sends a hold re-INVITE
     /// (media bypass) or starts hold music on its peer. `override_music`,
     /// if `Some`, is used instead of the normal header/extension/config chain.
@@ -405,6 +401,17 @@ impl SipSession {
             }
         }
 
+        if let (Some(peer), Some(draft)) = (
+            self.media_leg(&LegId::from("caller")),
+            final_answer.as_deref(),
+        ) && peer.pc().signaling_state() == rustrtc::SignalingState::HaveRemoteOffer {
+            final_answer = Some(peer.commit_local_answer(draft, rustrtc::SdpType::Answer).await?);
+            self.media.answer = final_answer.clone();
+        }
+        if final_answer.is_some() {
+            self.activate_callee_media(false).await?;
+        }
+
         if let Some(ref answer_sdp) = final_answer {
             let mut headers = Self::sdp_headers();
             let caller_dialog_id = self.caller_dialog_id();
@@ -750,6 +757,26 @@ impl SipSession {
         Ok(())
     }
 
+    pub(super) async fn apply_reinvite_answer(
+        &mut self,
+        leg_id: &LegId,
+        offer: &str,
+        response: &rsipstack::sip::Response,
+    ) -> Result<()> {
+        if let Some(peer) = self.media_leg(leg_id)
+            && let Some(answer) = Self::extract_sdp(response.body())
+        {
+            // Commit only after SIP accepts the offer. A rejection keeps the previous media state.
+            let offer = Self::parse_sdp(rustrtc::SdpType::Offer, offer, "local re-INVITE")?;
+            Self::parse_sdp(rustrtc::SdpType::Answer, &answer, "re-INVITE answer")?;
+            peer.pc().set_local_description(offer)?;
+            peer.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await?;
+            peer.refresh_observer();
+            self.legs.set_answer(leg_id.clone(), answer);
+        }
+        Ok(())
+    }
+
     /// Send a re-INVITE (e.g. hold/unhold SDP) to the dialog of the target leg
     /// ("caller" → the primary caller dialog; "callee" → the callee dialog).
     pub(crate) async fn send_reinvite_to_leg(&mut self, leg_id: &LegId, sdp: String) -> Result<()> {
@@ -771,13 +798,14 @@ impl SipSession {
                 leg_id,
                 rsipstack::sip::Method::Invite,
                 headers,
-                Some(sdp.into_bytes()),
+                Some(sdp.as_bytes().to_vec()),
             )
             .await?
         {
             Some(response) => {
                 let status = response.status_code.code();
                 if StatusCode::from(status).kind() == rsipstack::sip::StatusCodeKind::Successful {
+                    self.apply_reinvite_answer(leg_id, &sdp, &response).await?;
                     info!(session_id = %self.id, status = %status, "re-INVITE accepted");
                     Ok(())
                 } else {

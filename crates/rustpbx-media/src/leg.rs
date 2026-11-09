@@ -440,7 +440,8 @@ impl LegInner {
         let pc = {
             let handle = tokio::runtime::Handle::try_current();
             let _guard = handle.as_ref().ok().map(|h| h.enter());
-            PeerConnection::new(rtc_config)
+            let span = tracing::info_span!("media_leg", session_id = rtc_config.label.as_deref(), leg_id = %label);
+            span.in_scope(|| PeerConnection::new(rtc_config))
         };
 
         // Egress audio track: create the push/source pair and add the track to
@@ -649,6 +650,7 @@ impl LegInner {
         if cfg.ingress_stall_warn_secs > 0 {
             let handle = crate::ingress_stall::spawn_ingress_watch(
                 leg.id.to_string(),
+                cfg.call_id.clone(),
                 leg.pc.clone(),
                 Arc::clone(&leg.tap),
                 Arc::clone(&leg.rtcp_stats),
@@ -704,6 +706,29 @@ impl LegInner {
     /// answer is applied.
     pub fn negotiated(&self) -> Option<NegotiatedLegProfile> {
         self.negotiated.lock().clone()
+    }
+
+    /// Build a local description for hold/resume without re-offering unused audio codecs.
+    pub fn negotiated_local_sdp(&self) -> Option<SessionDescription> {
+        let mut local = self.pc.local_description()?;
+        if let Some(profile) = self.negotiated()
+            && let Some(codec) = &profile.audio
+            && let Some(audio) = local.media_sections.iter_mut()
+                .find(|section| section.kind == rustrtc::MediaKind::Audio && section.port != 0)
+        {
+            let mut payloads = profile.dtmf_pts();
+            payloads.insert(codec.payload_type);
+            audio.formats.retain(|pt| pt.parse::<u8>().is_ok_and(|pt| payloads.contains(&pt)));
+            audio.attributes.retain(|attr| {
+                if matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb")
+                    && let Some(pt) = attr.value.as_deref().and_then(|v| v.split_whitespace().next())
+                {
+                    return pt == "*" || audio.formats.iter().any(|format| format == pt);
+                }
+                true
+            });
+        }
+        Some(local)
     }
 
     /// Audio address this leg advertised in its local SDP (`addr:port` a
@@ -797,6 +822,30 @@ impl LegInner {
     /// Create and commit an offer SDP (as UAC).
     pub async fn create_offer(&self) -> Result<String> {
         let offer = self.prepare_offer().await?;
+        let mut sdp = offer.to_sdp_string();
+        // rustrtc renders freshly added video transceivers as `m=video 0`
+        // without `a=rtcp-mux` even under `RtcpMuxPolicy::Require` — while
+        // BUNDLE groups the video m-line with a muxed audio one. Browser
+        // peers reject such an answer (`rtcp-mux must be enabled when BUNDLE
+        // is enabled`) → JsSIP replies 500. When this leg advertises video,
+        // finalize the m-line through the same renegotiation seam the rest
+        // of the session uses (port placeholder + mux posture restore).
+        if let Some(caps) = self
+            .pc
+            .config()
+            .media_capabilities
+            .as_ref()
+            .map(|caps| caps.video.as_slice())
+            .filter(|caps| !caps.is_empty())
+        {
+            sdp = negotiate::MediaNegotiator::rewrite_video_capabilities(
+                SdpType::Offer,
+                &sdp,
+                caps,
+            )?;
+        }
+        let offer = SessionDescription::parse(SdpType::Offer, &sdp)
+            .map_err(|e| anyhow!("failed to reparse rewritten offer: {e:?}"))?;
         let sdp = set_local(&self.pc, offer)?;
         if let Some(desc) = self.pc.local_description()
             && let Some(addr) = advertised_audio_addr(&desc)
@@ -813,17 +862,27 @@ impl LegInner {
         Ok(sdp)
     }
 
-    /// Apply a remote SDP (offer or answer) and return the local SDP to send
-    /// back (an answer when `sdp_type == Offer`, or empty when applying an
-    /// answer as UAC). Also extracts and stores the negotiated profile and
-    /// refreshes the egress codec + DTMF payload types.
-    pub async fn apply_sdp(&self, remote: &str, sdp_type: SdpType) -> Result<String> {
+    /// Apply the peer's SDP. Answers update the negotiated RTP profile.
+    /// Offers leave the local answer to prepare_answer and commit_local_answer.
+    pub async fn apply_remote_sdp(&self, remote: &str, sdp_type: SdpType) -> Result<()> {
+        let video_mline = SessionDescription::parse(sdp_type, remote).ok().and_then(|desc| {
+            desc.media_sections
+                .iter()
+                .find(|section| section.kind == rustrtc::MediaKind::Video)
+                .map(|section| {
+                    format!(
+                        "port={} dir={:?} fmts={:?}",
+                        section.port, section.direction, section.formats
+                    )
+                })
+        });
         debug!(
             session_id = %self.pc.config().label.as_deref().unwrap_or_default(),
             leg = %self.id,
             sdp_type = ?sdp_type,
             sdp_bytes = remote.len(),
             transport = ?TransportMode::of(self.pc.config()),
+            video_mline = ?video_mline,
             "leg SDP applied",
         );
         let desc = SessionDescription::parse(sdp_type, remote)
@@ -831,8 +890,8 @@ impl LegInner {
         if let Some(addr) = advertised_audio_addr(&desc) {
             *self.peer_advertised_addr.lock() = Some(addr);
         }
-        self.pc
-            .set_remote_description(desc)
+        // Keep rustrtc's large negotiation future off the nested SIP call stack.
+        Box::pin(self.pc.set_remote_description(desc))
             .await
             .map_err(|e| anyhow!("set_remote_description failed: {}", e))?;
         // Direct RTP has a transport now; WebRTC may still be waiting for ICE.
@@ -859,35 +918,22 @@ impl LegInner {
             }
         }
 
-        let local_sdp = if sdp_type == SdpType::Offer {
-            // rustrtc gathering pattern: the first create_answer primes ICE
-            // gathering; wait for candidates, then the second includes them.
-            // RTP mode returns instantly; WebRTC/SRTP need the wait.
-            let _ = self.pc.create_answer().await?;
-            self.pc.wait_for_gathering_complete().await;
-            let mut answer = self.pc.create_answer().await?;
-            answer.sdp_type = SdpType::Answer;
-            let local = set_local(&self.pc, answer)?;
-            if let Some(desc) = self.pc.local_description()
-                && let Some(addr) = advertised_audio_addr(&desc)
-            {
-                *self.advertised_addr.lock() = Some(addr);
-            }
-            local
-        } else {
-            // Applying a remote answer (UAC): no local SDP to emit.
-            String::new()
-        };
+        if sdp_type != SdpType::Offer {
+            self.sync_answer_profile(remote, remote).await?;
+        }
+        Ok(())
+    }
 
-        // R1 fix: sync the sender's codec/PT to the negotiated answer.
-        // Extract the profile from the answer SDP: the local answer we just
-        // produced (as UAS), or the remote answer we applied (as UAC).
-        let profile_sdp = if local_sdp.is_empty() {
-            remote
-        } else {
-            local_sdp.as_str()
-        };
-        let profile = negotiate::MediaNegotiator::extract_leg_profile(profile_sdp);
+    /// Build a draft answer to the applied remote offer, ready for editing.
+    pub async fn prepare_answer(&self) -> Result<SessionDescription> {
+        // The first create_answer starts ICE gathering. The second includes its candidates.
+        let _ = self.pc.create_answer().await?;
+        self.pc.wait_for_gathering_complete().await;
+        Ok(self.pc.create_answer().await?)
+    }
+
+    async fn sync_answer_profile(&self, answer: &str, remote: &str) -> Result<()> {
+        let profile = negotiate::MediaNegotiator::extract_leg_profile(answer);
 
         self.sync_negotiated_profile(&profile).await?;
 
@@ -903,12 +949,14 @@ impl LegInner {
             self.tap.set_dtmf_payload_types(all_pts);
         }
 
-        Ok(local_sdp)
+        Ok(())
     }
 
     /// Convenience: apply a remote offer and produce an answer.
     pub async fn answer(&self, remote_offer: &str) -> Result<String> {
-        self.apply_sdp(remote_offer, SdpType::Offer).await
+        self.apply_remote_sdp(remote_offer, SdpType::Offer).await?;
+        let answer = self.prepare_answer().await?;
+        self.commit_local_answer(&answer.to_sdp_string(), SdpType::Answer).await
     }
 
     async fn sync_negotiated_profile(&self, profile: &NegotiatedLegProfile) -> Result<()> {
@@ -1240,8 +1288,22 @@ impl LegInner {
         self.inband_dtmf.lock().generation
     }
 
+    /// Commit the SIP answer after codec and direction selection, then use it for RTP.
+    pub async fn commit_local_answer(&self, sdp: &str, kind: SdpType) -> Result<String> {
+        let answer = set_local(&self.pc, SessionDescription::parse(kind, sdp)?)?;
+        if let Some(desc) = self.pc.local_description()
+            && let Some(addr) = advertised_audio_addr(&desc)
+        {
+            *self.advertised_addr.lock() = Some(addr);
+        }
+        self.refresh_observer();
+        let remote = self.pc.remote_description().map(|desc| desc.to_sdp_string()).unwrap_or_default();
+        self.sync_answer_profile(&answer, &remote).await?;
+        Ok(answer)
+    }
+
     /// Update the leg's negotiated profile and sender from an SDP built outside
-    /// [`Self::apply_sdp`], including peer-selected initial answers and
+    /// [`Self::answer`], including peer-selected initial answers and
     /// re-INVITEs. Keeps `MediaBridge::bridge()` and egress in sync with the
     /// SDP returned to the remote peer.
     pub async fn apply_profile_from_sdp(&self, sdp: &str) -> Result<()> {
@@ -2545,7 +2607,7 @@ mod tests {
         let relay_b = LegInner::new("callee", &cfg, None).unwrap();
         let offer = relay_a.create_offer().await.unwrap();
         let answer = relay_b.answer(&offer).await.unwrap();
-        relay_a.apply_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
+        relay_a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
         relay_a.set_egress_source(EgressSource::RewriteRelay {
             peer_pc: relay_b.pc().clone(), options: Default::default(), rules: Vec::new(),
             video_payload_types: Vec::new(), on_arm_failed: None,
@@ -2845,7 +2907,7 @@ mod tests {
             a=fingerprint:sha-256 F3:04:99:7A:51:6A:C4:D7:30:46:B5:69:82:2A:38:D3:37:D9:66:5B:B6:2F:AD:D3:77:DA:F5:09:2C:9E:DF:8B\r\n";
 
         let answer = leg
-            .apply_sdp(&offer, rustrtc::SdpType::Offer)
+            .answer(&offer)
             .await
             .expect("leg answers video offer");
         assert!(
@@ -2881,6 +2943,24 @@ mod tests {
             relay_attributes == playback_attributes,
             "WebRTC relay must use the advertised sender SSRC"
         );
+        leg.stop();
+    }
+
+    #[tokio::test]
+    async fn reinvite_draft_leaves_local_answer_uncommitted_until_direction_is_aligned() {
+        let leg = LegInner::new("unbridged", &LegConfig::rtp_pcmu(), None).unwrap();
+        let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0\r\na=sendrecv\r\n";
+        leg.answer(offer).await.unwrap();
+
+        let hold = offer.replace("a=sendrecv", "a=sendonly");
+        leg.apply_remote_sdp(&hold, SdpType::Offer).await.unwrap();
+        let draft = leg.prepare_answer().await.unwrap();
+        assert!(leg.pc().local_description().is_none_or(|desc| desc.sdp_type != SdpType::Pranswer));
+        let aligned = negotiate::MediaNegotiator::align_answer_direction_with_offer(&hold, &draft.to_sdp_string());
+        let answer = leg.commit_local_answer(&aligned, SdpType::Answer).await.unwrap();
+        assert!(answer.lines().any(|line| line == "a=recvonly"));
+        assert_eq!(leg.pc().local_description().unwrap().to_sdp_string(), answer);
+        assert_eq!(leg.pc().signaling_state(), rustrtc::SignalingState::Stable);
         leg.stop();
     }
 
@@ -2950,7 +3030,7 @@ mod tests {
             a=fmtp:101 0-16\r\n";
 
         let _answer = leg
-            .apply_sdp(offer, SdpType::Offer)
+            .answer(offer)
             .await
             .expect("leg answers baresip/sipbot offer");
 
@@ -2963,7 +3043,7 @@ mod tests {
         tap.on_ingress(&pkt, addr);
         let ev = rx
             .try_recv()
-            .expect("DTMF on offered PT 101 must be detected after apply_sdp");
+            .expect("DTMF on offered PT 101 must be detected after answer");
         assert_eq!(ev.digit, '5');
 
         leg.stop();
@@ -2978,7 +3058,10 @@ mod p24_uac_test {
     async fn uac_leg_apply_answer_after_own_offer() {
         // A leg generates its own offer (UAC), then applies a remote answer with
         // a codec it offered. This mirrors RWI originate's callee leg.
-        let cfg = LegConfig::rtp_pcmu();
+        let mut cfg = LegConfig::rtp_pcmu();
+        cfg.codecs.insert(0, CodecInfo {
+            codec: CodecType::PCMA, payload_type: 8, clock_rate: 8000, channels: 1, fmtp: None,
+        });
         let leg = LegInner::new("uac", &cfg, None).unwrap();
         let offer = leg.create_offer().await.expect("offer");
         assert!(!offer.is_empty());
@@ -2987,11 +3070,17 @@ mod p24_uac_test {
         let answer = format!(
             "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 4000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=sendrecv\r\n"
         );
-        let local = leg
-            .apply_sdp(&answer, SdpType::Answer)
+        leg
+            .apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
             .await
             .expect("apply answer");
-        assert!(local.is_empty());
+        let resume = leg.negotiated_local_sdp().unwrap();
+        let offered = SessionDescription::parse(SdpType::Offer, &offer).unwrap();
+        let audio = &resume.media_sections[0];
+        assert_eq!(audio.port, offered.media_sections[0].port, "keep this leg's local port");
+        assert!(offered.media_sections[0].formats.contains(&"8".to_owned()));
+        assert_eq!(audio.formats.first().map(String::as_str), Some("0"));
+        assert!(!audio.formats.contains(&"8".to_owned()), "do not re-offer rejected PCMA");
         let p = leg.negotiated().expect("negotiated profile");
         assert!(
             p.audio.is_some(),
@@ -3116,7 +3205,7 @@ mod ice_lite_tests {
             a=rtpmap:101 telephone-event/8000\r\n\
             a=sendrecv\r\n";
         let answer = leg
-            .apply_sdp(remote_offer, SdpType::Offer)
+            .answer(remote_offer)
             .await
             .expect("apply offer");
         assert!(
@@ -3164,7 +3253,7 @@ mod ice_lite_tests {
             a=candidate:1 1 UDP 2130706431 127.0.0.1 4002 typ host\r\n\
             a=sendrecv\r\n";
         let answer = leg
-            .apply_sdp(remote_offer, SdpType::Offer)
+            .answer(remote_offer)
             .await
             .expect("apply offer");
         for attr in ["a=ice-lite", "a=ice-ufrag", "a=ice-pwd", "a=candidate", "a=crypto"] {
@@ -3204,7 +3293,7 @@ mod ice_lite_tests {
             a=rtpmap:0 PCMU/8000\r\n\
             a=sendrecv\r\n";
         let answer = leg
-            .apply_sdp(remote_offer, SdpType::Offer)
+            .answer(remote_offer)
             .await
             .expect("apply offer");
         assert!(

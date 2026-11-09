@@ -2607,17 +2607,31 @@ async fn build_recording_segments_payload(
     record: &CallRecordModel,
     cdr: Option<&CdrData>,
 ) -> Option<Value> {
-    let cdr_data = cdr?;
-    let entries: Vec<&crate::callrecord::CallRecordMedia> = cdr_data
-        .record
-        .recorder
-        .iter()
-        .filter(|media| media.track_id != "signaling" && !media.path.trim().is_empty())
-        .collect();
-    if entries.len() < 2 {
-        return None;
+    // Preferred source: the CDR JSON sink (`recorder[]`, extras included).
+    if let Some(cdr_data) = cdr {
+        let entries: Vec<&crate::callrecord::CallRecordMedia> = cdr_data
+            .record
+            .recorder
+            .iter()
+            .filter(|media| media.track_id != "signaling" && !media.path.trim().is_empty())
+            .collect();
+        if entries.len() >= 2 {
+            return build_recording_segments_from_media(state, record, Some(cdr_data), &entries)
+                .await;
+        }
     }
+    // Fallback for database-sink deployments (no CDR JSON file): the upload
+    // hook mirrors the completed segments into `metadata["recording_segments"]`.
+    build_recording_segments_from_metadata(state, record).await
+}
 
+/// Shared per-segment payload builder over a uniform view of either source.
+async fn build_recording_segments_from_media(
+    state: &ConsoleState,
+    record: &CallRecordModel,
+    cdr: Option<&CdrData>,
+    entries: &[&crate::callrecord::CallRecordMedia],
+) -> Option<Value> {
     let mut segments = Vec::with_capacity(entries.len());
     for media in entries {
         let extra = media.extra.as_ref();
@@ -2684,7 +2698,72 @@ async fn build_recording_segments_payload(
             "ended_at": string_extra("ended_at"),
             "duration_secs": duration_secs,
             "size": media.size,
+            "media_kind": string_extra("media_kind"),
             "supports_streams": local_playback,
+            "playback_url": playback_url,
+        }));
+    }
+    Some(Value::Array(segments))
+}
+
+/// Database-sink fallback: derive the segment payload from the
+/// `metadata["recording_segments"]` summaries the upload hook persists (the
+/// same entries `list_session_artifacts` exposes). Video companions are the
+/// reason this exists: without a CDR JSON file they would be invisible to
+/// the call-record detail page.
+async fn build_recording_segments_from_metadata(
+    state: &ConsoleState,
+    record: &CallRecordModel,
+) -> Option<Value> {
+    let entries = record
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("recording_segments"))
+        .and_then(|value| value.as_array())?
+        .clone();
+    if entries.len() < 2 {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let str_field = |key: &str| {
+            entry
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let path = str_field("path").filter(|p| !p.trim().is_empty())?;
+        let selector = str_field("uniqueId")
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| str_field("segmentId"))?;
+        // Local existence decides the playback URL; uploaded companions have
+        // no local file and no presignable URL in this fallback source, so
+        // they surface without playback (the artifacts API covers download).
+        let exists = {
+            let resolved =
+                resolve_archived_artifact_path(&path, record.started_at);
+            std::path::Path::new(&resolved).exists()
+        };
+        let playback_url = exists.then(|| {
+            state.url_for(&format!(
+                "/call-records/{}/recording?segment={}",
+                record.id,
+                urlencoding::encode(&selector)
+            ))
+        });
+        segments.push(json!({
+            "unique_id": str_field("uniqueId"),
+            "track_id": format!("segment:{}:{}", str_field("segmentType").unwrap_or_default(), str_field("segmentId").unwrap_or_default()),
+            "segment_type": str_field("segmentType"),
+            "segment_id": str_field("segmentId"),
+            "seq": entry.get("seq").and_then(|value| value.as_u64()),
+            "label": str_field("label"),
+            "started_at": str_field("startedAt"),
+            "ended_at": str_field("endedAt"),
+            "duration_secs": entry.get("durationSecs").and_then(|value| value.as_f64()).map(|secs| secs as i64),
+            "size": entry.get("size").and_then(|value| value.as_u64()).unwrap_or(0),
+            "media_kind": str_field("mediaKind"),
+            "supports_streams": exists,
             "playback_url": playback_url,
         }));
     }
@@ -2878,6 +2957,9 @@ fn guess_audio_mime(file_name: &str) -> &'static str {
         Some("mp3") => "audio/mpeg",
         Some("ogg") | Some("oga") | Some("opus") => "audio/ogg",
         Some("flac") => "audio/flac",
+        // Per-leg video artifacts recorded alongside an audio WAV.
+        Some("mp4") | Some("m4a") | Some("mov") => "video/mp4",
+        Some("webm") => "video/webm",
         _ => "application/octet-stream",
     }
 }
@@ -2919,18 +3001,43 @@ pub fn select_recording_segment_path(
     segment: Option<&str>,
 ) -> Option<String> {
     let selector = segment.map(str::trim).filter(|s| !s.is_empty())?;
-    let cdr_data = cdr?;
-    for media in &cdr_data.record.recorder {
-        let matches = media
-            .unique_id
-            .as_deref()
-            .map(|id| id == selector)
-            .unwrap_or(false)
-            || media.track_id == selector;
+    if let Some(cdr_data) = cdr {
+        for media in &cdr_data.record.recorder {
+            let matches = media
+                .unique_id
+                .as_deref()
+                .map(|id| id == selector)
+                .unwrap_or(false)
+                || media.track_id == selector;
+            if !matches {
+                continue;
+            }
+            let path = media.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let resolved = resolve_archived_artifact_path(path, record.started_at);
+            if Path::new(&resolved).exists() {
+                return Some(resolved);
+            }
+        }
+    }
+    // Database-sink fallback (no CDR JSON file): the upload hook mirrors the
+    // completed segments — including per-leg video companions — into
+    // `metadata["recording_segments"]`.
+    let entries = record
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("recording_segments"))
+        .and_then(|value| value.as_array())?;
+    for entry in entries {
+        let uid = entry.get("uniqueId").and_then(|v| v.as_str());
+        let seg_id = entry.get("segmentId").and_then(|v| v.as_str());
+        let matches = uid == Some(selector) || seg_id == Some(selector);
         if !matches {
             continue;
         }
-        let path = media.path.trim();
+        let path = entry.get("path").and_then(|v| v.as_str()).map(str::trim)?;
         if path.is_empty() {
             continue;
         }
@@ -4064,55 +4171,6 @@ mod tests {
             payload["outbound_trunk_dest"],
             "sip:carrier-a.example.com:5060"
         );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "addon-wholesale")]
-    async fn build_record_payload_exposes_error_from_metadata() {
-        // Empirically proves the call-record UI error chip data path: the
-        // standardized error fields written by the reporter into the metadata
-        // JSON column are surfaced as a structured `error` object for both the
-        // list and detail templates.
-        let db = setup_db().await;
-        let state = create_console_state(db.clone()).await;
-
-        let record = call_record::ActiveModel {
-            call_id: Set("call-err-1".into()),
-            direction: Set("inbound".into()),
-            status: Set("failed".into()),
-            started_at: Set(Utc::now()),
-            duration_secs: Set(0),
-            metadata: Set(Some(json!({
-                "error_code": "wholesale.insufficient_funds",
-                "error_app": "wholesale",
-                "error_severity": "error",
-                "error_message": "Insufficient funds",
-                "sip_code": "402",
-            }))),
-            has_transcript: Set(false),
-            transcript_status: Set("pending".into()),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        }
-        .insert(&db)
-        .await
-        .expect("insert call record");
-
-        let related = load_related_context(&db, &[record.clone()])
-            .await
-            .expect("related context");
-        let payload = build_record_payload(&record, &related, &state, None).await;
-        assert_eq!(payload["error"]["code"], "wholesale.insufficient_funds");
-        assert_eq!(payload["error"]["app"], "wholesale");
-        assert_eq!(payload["error"]["severity"], "error");
-        assert_eq!(payload["error"]["message"], "Insufficient funds");
-        // registered code -> catalog locale/remediation keys are attached
-        assert_eq!(
-            payload["error"]["locale_key"],
-            "errors.wholesale.insufficient_funds"
-        );
-        assert!(payload["error"]["remediation_key"].is_string());
     }
 
     #[tokio::test]

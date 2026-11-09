@@ -131,6 +131,13 @@ pub trait Locator: Send + Sync {
     /// registration events. Backends use it only when removing bindings on
     /// their own, so all event producers observe the same ordering boundary.
     fn set_event_lock(&self, _lock: Option<LocatorEventLock>) {}
+    /// Dump all live registrations as `(aor, location)` pairs. Used by the
+    /// rolling handover to push the predecessor's registration table to the
+    /// successor (memory-locator deployments; DB-backed locators already
+    /// share rows). Default: empty (backend does not support dumping).
+    async fn dump_registrations(&self) -> Vec<(String, Location)> {
+        Vec::new()
+    }
     async fn register(&self, username: &str, realm: Option<&str>, location: Location)
     -> Result<()>;
     async fn has_active_bindings(&self, username: &str, realm: Option<&str>) -> Result<bool>;
@@ -492,6 +499,13 @@ impl DialogTargetLocator {
 #[async_trait]
 impl TargetLocator for DialogTargetLocator {
     async fn locate(&self, uri: &rsipstack::sip::Uri) -> Result<SipAddr, rsipstack::Error> {
+        let dest = self.locate_inner(uri).await?;
+        Ok(dest)
+    }
+}
+
+impl DialogTargetLocator {
+    async fn locate_inner(&self, uri: &rsipstack::sip::Uri) -> Result<SipAddr, rsipstack::Error> {
         let locs = self.locator.lookup(uri).await;
         if let Ok(locs) = &locs
             && !locs.is_empty()
@@ -658,6 +672,20 @@ impl MemoryLocator {
 
 #[async_trait]
 impl Locator for MemoryLocator {
+    async fn dump_registrations(&self) -> Vec<(String, Location)> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for entry in self.locations.iter() {
+            let identifier = entry.key().clone();
+            for loc in entry.value().values() {
+                if !loc.is_expired_at(now) {
+                    out.push((identifier.clone(), loc.clone()));
+                }
+            }
+        }
+        out
+    }
+
     async fn is_local_realm(&self, realm: &str) -> bool {
         let checker = self.realm_checker.lock().clone();
         if let Some(checker) = checker {
@@ -1163,7 +1191,7 @@ mod tests {
     use rsipstack::sip::HostWithPort;
     use rsipstack::sip::transport::Transport;
     use rsipstack::transport::SipAddr;
-    use std::time::Duration;
+    
 
     // ── shared helper unit tests ────────────────────────────────────────
 
@@ -1886,15 +1914,16 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::unbounded_channel();
         let mut dialog = None;
         let mut old_token: Option<CancellationToken> = None;
+        let mut old_connection: Option<SipConnection> = None;
         let (bye_tx, mut bye_rx) = mpsc::unbounded_channel();
         let mut peers = Vec::new();
 
         for flow in [&old_flow, &new_flow] {
-            if let Some(token) = old_token.take() {
+            if let (Some(token), Some(connection)) = (old_token.take(), old_connection.take()) {
                 // Axum's WSS adapter cancels the old flow and removes its
                 // cached connection before a replacement is registered.
                 token.cancel();
-                endpoint.inner.transport_layer.del_connection(&old_flow);
+                endpoint.inner.transport_layer.remove_connection(&connection);
             }
             let flow_token = cancel.child_token();
             let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -1913,6 +1942,7 @@ mod tests {
                 .inner
                 .transport_layer
                 .add_connection(connection.clone());
+            old_connection = Some(connection.clone());
             let peer_connection = connection.clone();
             let peer_flow = flow.clone();
             let bye_tx = bye_tx.clone();
@@ -2395,3 +2425,4 @@ mod tests {
         assert!(locations.is_empty(), "expired old AoR should not be found");
     }
 }
+
