@@ -90,3 +90,9 @@ Weixin*.png
 
 # Rotated runtime logs
 *.log.*
+
+builds
+autopub-musl
+.output
+autopub
+autopub.exe
