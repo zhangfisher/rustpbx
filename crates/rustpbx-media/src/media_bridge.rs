@@ -2205,7 +2205,6 @@ fn wire_rtcp_sender_forward(
             return;
         };
 
-        let mut forwarded_count: u64 = 0;
         loop {
             tokio::select! {
                 biased;
@@ -2256,19 +2255,6 @@ fn wire_rtcp_sender_forward(
                     };
                     if dst_tx.send_rtcp(&[forwarded]).await.is_err() {
                         break;
-                    }
-                    forwarded_count += 1;
-                    // Surface the feedback path: while diagnosing one-way
-                    // video, a silently-relaying forwarder was
-                    // indistinguishable from a dead one.
-                    if forwarded_count == 1 || forwarded_count.is_multiple_of(100) {
-                        info!(
-                            session_id = %src_leg.pc().config().label.as_deref().unwrap_or_default(),
-                            media = ?kind,
-                            target_ssrc = target,
-                            forwarded = forwarded_count,
-                            "RTCP feedback forwarded to peer leg"
-                        );
                     }
                 }
             }
