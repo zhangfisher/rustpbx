@@ -1,8 +1,8 @@
 use super::*;
 use crate::proxy::proxy_call::dtmf::RtpDtmfDetector;
-use crate::proxy::proxy_call::sip_session::util::trunk_host_port;
 use crate::proxy::call::parse_allowed_codecs;
 use crate::proxy::proxy_call::sip_session::builtin_app_factory::BuiltinAppFactory;
+use crate::proxy::routing::trunk_dest_host_port;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A sequential attempt for an INVITE; a `None` policy keeps the dialer's legacy advance.
@@ -5992,7 +5992,7 @@ a=fmtp:102 profile-level-id=42801F;packetization-mode=1\r\n";
         &crate::config::default_video_codecs(),
     );
     let accepted_video_caps =
-        MediaNegotiator::accepted_video_capabilities(&caller_video_caps, callee_answer);
+        MediaNegotiator::accepted_video_capabilities(&caller_video_caps, callee_answer, None);
     let answer = MediaNegotiator::rewrite_video_capabilities(
         rustrtc::SdpType::Answer,
         generated_answer,
@@ -6214,6 +6214,88 @@ a=rtcp:42001\r\n";
         "re-INVITE video needs a relay destination SSRC"
     );
     leg.stop();
+}
+
+#[tokio::test]
+async fn callee_reinvite_enables_existing_bundle_only_video() {
+    use crate::call::{DialDirection, Dialplan, MediaConfig};
+    use crate::config::MediaProxyMode;
+    use crate::media::leg::{LegConfig, LegInner};
+    use crate::proxy::tests::common::create_test_request;
+    use crate::proxy::tests::test_sip_session_regressions::build_session_with_cmd_rx;
+
+    let request = create_test_request(
+        rsipstack::sip::Method::Invite,
+        "caller",
+        None,
+        "rustpbx.com",
+        None,
+    );
+    let dialplan = Dialplan::new("bundle-video".into(), request, DialDirection::Inbound)
+        .with_media(MediaConfig::new().with_proxy_mode(MediaProxyMode::All));
+    let (mut session, _handle, _commands) = build_session_with_cmd_rx(dialplan).await;
+    let _guard = session.cancel_token.clone().drop_guard();
+    let mut cfg = LegConfig::rtp_pcmu();
+    cfg.video_codecs = vec![make_video_cap(96, "H264", Some("profile-level-id=42801F"), &[])];
+
+    let sendrecv_offer = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+a=group:BUNDLE as vs\r\n\
+m=audio 45033 RTP/AVP 0\r\n\
+a=mid:as\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+m=video 0 RTP/AVP 96\r\n\
+a=mid:vs\r\n\
+a=bundle-only\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 profile-level-id=42801F\r\n";
+    let recvonly_offer = format!("{sendrecv_offer}a=recvonly\r\n");
+    let caller = LegId::from("caller");
+    let callee = LegId::from("callee");
+    for (id, offer) in [(&caller, sendrecv_offer), (&callee, recvonly_offer.as_str())] {
+        let leg = LegInner::new(id.as_str(), &cfg, None).unwrap();
+        leg.answer(offer).await.unwrap();
+        leg.accept();
+        session.legs.set_media_leg(id, leg);
+        assert!(session.legs.leg_has_video(id));
+        session.update_leg_state(id, LegState::Connected);
+    }
+    let bridged = session
+        .execute_command(
+            CallCommand::Bridge {
+                leg_a: caller,
+                leg_b: callee.clone(),
+                mode: crate::call::domain::P2PMode::Audio,
+            },
+            None,
+        )
+        .await;
+    assert!(bridged.success, "{:?}", bridged.message);
+
+    let offer = sendrecv_offer.replace("o=- 1 1", "o=- 1 2");
+    let answer = session
+        .build_local_dialog_answer(
+            DialogSide::Callee,
+            &callee,
+            rsipstack::sip::Method::Invite,
+            &offer,
+        )
+        .await
+        .unwrap();
+    let parsed = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, &answer).unwrap();
+    let video = parsed
+        .media_sections
+        .iter()
+        .find(|section| section.kind == rustrtc::MediaKind::Video)
+        .unwrap();
+    assert!(!parsed.is_media_rejected(video), "{answer}");
+    assert_eq!(video.direction, rustrtc::Direction::SendRecv, "{answer}");
+    assert!(session.legs.leg_has_video(&callee));
 }
 
 // ── MediaBridge caller leg: video SDP ─────────────────────────────────
@@ -6613,53 +6695,53 @@ a=fingerprint:sha-256 F3:04:99:7A:51:6A:C4:D7:30:46:B5:69:82:2A:38:D3:37:D9:66:5
 
 // ── DTMF payload building ─────────────────────────────────────────────
 
-// --- trunk_host_port tests ---
+// --- trunk destination host/port tests ---
 
 #[test]
 fn test_trunk_host_port_sip_uri_with_port() {
-    let (host, port) = trunk_host_port("sip:198.51.100.74:6988").unwrap();
+    let (host, port) = trunk_dest_host_port("sip:198.51.100.74:6988").unwrap();
     assert_eq!(host, "198.51.100.74");
     assert_eq!(port, 6988);
 }
 
 #[test]
 fn test_trunk_host_port_sip_uri_without_port() {
-    let (host, port) = trunk_host_port("sip:pbx.example.com").unwrap();
+    let (host, port) = trunk_dest_host_port("sip:pbx.example.com").unwrap();
     assert_eq!(host, "pbx.example.com");
     assert_eq!(port, 5060);
 }
 
 #[test]
 fn test_trunk_host_port_sip_uri_with_user_and_port() {
-    let (host, port) = trunk_host_port("sip:user@203.0.113.5:5060").unwrap();
+    let (host, port) = trunk_dest_host_port("sip:user@203.0.113.5:5060").unwrap();
     assert_eq!(host, "203.0.113.5");
     assert_eq!(port, 5060);
 }
 
 #[test]
 fn test_trunk_host_port_bare_host_port() {
-    let (host, port) = trunk_host_port("198.51.100.74:6988").unwrap();
+    let (host, port) = trunk_dest_host_port("198.51.100.74:6988").unwrap();
     assert_eq!(host, "198.51.100.74");
     assert_eq!(port, 6988);
 }
 
 #[test]
 fn test_trunk_host_port_bare_host_only() {
-    let (host, port) = trunk_host_port("203.0.113.10").unwrap();
+    let (host, port) = trunk_dest_host_port("203.0.113.10").unwrap();
     assert_eq!(host, "203.0.113.10");
     assert_eq!(port, 5060);
 }
 
 #[test]
 fn test_trunk_host_port_bare_ipv6() {
-    let (host, port) = trunk_host_port("[::1]").unwrap();
+    let (host, port) = trunk_dest_host_port("[::1]").unwrap();
     assert_eq!(host, "[::1]");
     assert_eq!(port, 5060);
 }
 
 #[test]
 fn test_trunk_host_port_empty() {
-    assert!(trunk_host_port("").is_none());
+    assert!(trunk_dest_host_port("").is_none());
 }
 
 // --- resolve_effective_codecs priority logic tests ---
@@ -11499,12 +11581,14 @@ async fn rwi_manual_parallel_retry_and_leg_cleanup_body() {
                     call_id: "rwi-manual".into(),
                     target: format!("sip:alice@{addr}"),
                     leg_id: None,
+                    offer: None,
                 })
                 .await
         });
         // Acknowledge enqueueing before the session executes the dial.
         let RwiResult::LegAdded {
             leg_id: returned_id,
+            answer: None,
         } = timeout(Duration::from_secs(3), task)
             .await
             .unwrap()
@@ -11858,6 +11942,235 @@ async fn rwi_manual_parallel_retry_and_leg_cleanup_body() {
     }
     server.endpoint.shutdown();
     serving.await.unwrap();
+}
+
+#[test]
+fn rwi_leg_add_offer_answers_webrtc_and_bridges_to_caller() {
+    // Same DEBUG-build frame depth as rwi_manual_parallel_retry_and_leg_cleanup.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rwi-offer runtime")
+                .block_on(rwi_leg_add_offer_body())
+        })
+        .expect("spawn rwi-offer test thread")
+        .join()
+        .expect("rwi-offer test body panicked");
+}
+
+async fn rwi_leg_add_offer_body() {
+    use crate::call::{DialDirection, Dialplan, TransactionCookie};
+    use crate::config::ProxyConfig;
+    use crate::media::TransportMode;
+    use crate::media::leg::{LegConfig, LegInner};
+    use crate::media::negotiate::CodecInfo;
+    use crate::proxy::tests::common::{create_test_request, create_test_server_with_rwi_gateway};
+    use crate::rwi::processor::{CommandResult as RwiResult, RwiCommandProcessor};
+    use crate::rwi::{RwiCommandPayload, RwiGateway};
+    use rsipstack::sip::Method;
+    use tokio::time::timeout;
+
+    let gateway = Arc::new(parking_lot::RwLock::new(RwiGateway::new()));
+    let mut events = gateway.read().subscribe_events();
+    let (server, _) =
+        create_test_server_with_rwi_gateway(ProxyConfig::default(), gateway.clone()).await;
+    let request = create_test_request(Method::Invite, "bob", None, "rustpbx.com", None);
+    let context = CallContext {
+        session_id: "rwi-offer".into(),
+        dialplan: Arc::new(Dialplan::new(
+            "rwi-offer".into(),
+            request,
+            DialDirection::Inbound,
+        )),
+        cookie: TransactionCookie::default(),
+        start_time: Instant::now(),
+        original_caller: "sip:bob@rustpbx.com".into(),
+        original_callee: "sip:alice@rustpbx.com".into(),
+        max_forwards: 70,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        metadata: None,
+    };
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    let (mut session, handle, mut commands) =
+        SipSession::new_uac(server.clone(), cancel.clone(), None, context, true);
+    server
+        .active_call_registry
+        .register_handle("rwi-offer".into(), handle);
+    let processor = Arc::new(RwiCommandProcessor::new(
+        server.active_call_registry.clone(),
+        gateway,
+        Arc::new(crate::call::runtime::ConferenceManager::new()),
+    ));
+
+    // A connected PCMU caller, as a carrier leg would be.
+    let caller = LegInner::new("caller", &LegConfig::rtp_pcmu(), None).unwrap();
+    let caller_remote = LegInner::new("caller-remote", &LegConfig::rtp_pcmu(), None).unwrap();
+    let offer = caller_remote.create_offer().await.unwrap();
+    let answer = caller.answer(&offer).await.unwrap();
+    caller_remote
+        .apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
+        .await
+        .unwrap();
+    caller.accept();
+    caller_remote.accept();
+    session
+        .legs
+        .set_media_leg(&LegId::from("caller"), caller.clone());
+    session.update_leg_state(&LegId::from("caller"), LegState::Connected);
+
+    // A WebRTC client that prefers Opus, as browsers do.
+    let client = LegInner::new(
+        "client",
+        &LegConfig {
+            transport: TransportMode::WebRtc,
+            codecs: vec![
+                CodecInfo {
+                    payload_type: 111,
+                    codec: CodecType::Opus,
+                    clock_rate: 48000,
+                    channels: 2,
+                    fmtp: None,
+                },
+                CodecInfo {
+                    payload_type: 0,
+                    codec: CodecType::PCMU,
+                    clock_rate: 8000,
+                    channels: 1,
+                    fmtp: None,
+                },
+            ],
+            ..LegConfig::rtp_pcmu()
+        },
+        None,
+    )
+    .unwrap();
+    let client_offer = client.create_offer().await.unwrap();
+
+    // A target and an offer are exclusive.
+    let both = processor
+        .process_command(RwiCommandPayload::LegAdd {
+            call_id: "rwi-offer".into(),
+            target: "sip:alice@rustpbx.com".into(),
+            leg_id: None,
+            offer: Some(client_offer.clone()),
+        })
+        .await;
+    assert!(both.is_err(), "{both:?}");
+
+    let task = {
+        let processor = processor.clone();
+        let offer = client_offer.clone();
+        tokio::spawn(async move {
+            processor
+                .process_command(RwiCommandPayload::LegAdd {
+                    call_id: "rwi-offer".into(),
+                    target: String::new(),
+                    leg_id: Some("agent".into()),
+                    offer: Some(offer),
+                })
+                .await
+        })
+    };
+    // The processor waits for the session to answer the offer.
+    let command = timeout(Duration::from_secs(3), commands.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&command, CallCommand::LegAddOffer { leg_id: Some(id), .. } if id.as_str() == "agent")
+    );
+    assert!(session.execute_command(command, None).await.success);
+    let RwiResult::LegAdded {
+        leg_id,
+        answer: Some(answer),
+    } = timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected leg ID and answer in result");
+    };
+    assert_eq!(leg_id, "agent");
+    assert!(
+        answer.contains("a=ice-ufrag") && answer.contains("a=fingerprint"),
+        "{answer}"
+    );
+    let audio = answer
+        .lines()
+        .find(|line| line.starts_with("m=audio"))
+        .expect("audio m-line");
+    assert!(audio.contains("UDP/TLS/RTP/SAVPF"), "{audio}");
+    assert_eq!(
+        audio.split_whitespace().nth(3),
+        Some("0"),
+        "the caller's PCMU is answered first so the bridge passes audio through: {answer}"
+    );
+    assert!(!answer.to_lowercase().contains("opus"), "{answer}");
+    client
+        .apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
+        .await
+        .unwrap();
+
+    let agent = LegId::from("agent");
+    assert_eq!(
+        session.legs.get(&agent).map(|leg| leg.state),
+        Some(LegState::Connected)
+    );
+    let mut answered = false;
+    while let Ok(entry) = events.try_recv() {
+        if entry.event.event_type == "call_answered" && entry.event.payload["leg_id"] == "agent" {
+            answered = true;
+        }
+    }
+    assert!(answered, "the added leg reports call_answered");
+
+    // A duplicate ID is refused while the leg is live.
+    let (reply, refused) = tokio::sync::oneshot::channel();
+    let duplicate = session
+        .execute_command(
+            CallCommand::LegAddOffer {
+                leg_id: Some(agent.clone()),
+                offer: client_offer,
+                reply,
+            },
+            None,
+        )
+        .await;
+    assert!(!duplicate.success);
+    assert!(refused.await.unwrap().is_err());
+
+    let bridged = session
+        .execute_command(
+            CallCommand::Bridge {
+                leg_a: LegId::from("caller"),
+                leg_b: agent.clone(),
+                mode: crate::call::domain::P2PMode::Audio,
+            },
+            None,
+        )
+        .await;
+    assert!(bridged.success, "{bridged:?}");
+    assert!(session.bridge.contains_leg(&agent));
+
+    let removed = session
+        .execute_command(
+            CallCommand::LegRemove {
+                leg_id: agent.clone(),
+                reason: None,
+            },
+            None,
+        )
+        .await;
+    assert!(removed.success, "{removed:?}");
+    assert!(session.legs.get(&agent).is_none());
+    caller_remote.stop();
+    client.stop();
+    session.cleanup().await;
 }
 
 #[test]

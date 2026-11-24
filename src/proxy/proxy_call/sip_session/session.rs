@@ -457,6 +457,30 @@ impl SipSessionHandle {
             .map_err(|_| anyhow::anyhow!("session closed before answering recorder query"))?
     }
 
+    /// Add a leg answering `offer` and return its ID with the local SDP
+    /// answer. ICE gathering runs before the answer is returned, so this
+    /// waits up to ten seconds for the session to finish it.
+    pub async fn add_offer_leg(
+        &self,
+        leg_id: Option<LegId>,
+        offer: String,
+    ) -> Result<(LegId, String), String> {
+        const OFFER_LEG_TIMEOUT: Duration = Duration::from_secs(10);
+        let (reply, response) = oneshot::channel();
+        self.cmd_tx
+            .send(self.sourced_command(CallCommand::LegAddOffer {
+                leg_id,
+                offer,
+                reply,
+            }))
+            .await
+            .map_err(|_| "session closed".to_string())?;
+        tokio::time::timeout(OFFER_LEG_TIMEOUT, response)
+            .await
+            .map_err(|_| "timed out waiting for the leg answer".to_string())?
+            .map_err(|_| "session closed before answering the offer".to_string())?
+    }
+
     /// Query the owning session and queue loops; no cached snapshot is consulted.
     pub async fn queue_dispatch_diagnostic(
         &self,
@@ -7245,12 +7269,11 @@ if self
             }
             let plan = Self::plan_for_attempt(&self.server, &base, attempt);
             self.activate_attempt(attempt, plan).await;
-            // Each trunk's own ring time limits its attempt (408 when it runs out);
-            // the call's ring timer wraps the whole loop. A single target's ring
-            // time is the call's, so it gets no attempt timer.
-            let attempt_timeout = (targets.len() > 1)
-                .then(|| attempt.hints.as_ref().and_then(|hints| hints.max_ring_time))
-                .flatten();
+            // Each target's own ring time limits its dial attempt (408 when it runs out);
+            // the call's ring timer wraps the whole loop (whether 1 or N targets).
+            let attempt_timeout = attempt
+                .max_ring_time
+                .or_else(|| attempt.hints.as_ref().and_then(|hints| hints.max_ring_time));
             let started_at = Instant::now();
             info!(session_id = %self.id, index = idx, target = %attempt.location.aor, "Trying sequential target");
             let (label, detail) = Self::attempt_trace_target(idx, attempt);
@@ -9223,6 +9246,12 @@ if self
             .media_sections
             .iter()
             .any(|section| section.kind == rustrtc::MediaKind::Video);
+        if has_video
+            && let Some(caps) = video_caps
+            && !caps.is_empty()
+        {
+            pc.set_video_capabilities(caps.to_vec());
+        }
         pc.set_remote_description(offer)
             .await
             .map_err(|e| anyhow!("Failed to apply re-INVITE offer: {}", e))?;
@@ -9279,7 +9308,7 @@ if self
             .iter()
             .find(|s| s.kind == rustrtc::MediaKind::Video);
         let offer_video_active = offer_video_section.is_some_and(|section| {
-            section.port != 0 && section.direction != rustrtc::Direction::Inactive
+            !parsed.is_media_rejected(section) && section.direction != rustrtc::Direction::Inactive
         });
         let mut offered_video_caps = offer_video_active.then(|| {
             if self.video_relay_enabled() {
@@ -9298,7 +9327,28 @@ if self
             let peer_key = peer_leg_id
                 .as_ref()
                 .ok_or_else(|| anyhow!("No bridged peer for re-INVITE leg {}", leg_id))?;
-            if !self.legs.leg_has_video(peer_key) {
+            let has_compatible_peer_video = self.legs.leg_has_video(peer_key)
+                && self
+                    .media
+                    .bridge
+                    .as_ref()
+                    .and_then(|_| self.media_leg(peer_key))
+                    .and_then(|leg| leg.negotiated())
+                    .is_some_and(|peer_profile| {
+                        let peer_video = peer_profile.video;
+                        if let Some(caps) = offered_video_caps.as_mut() {
+                            let matching = MediaNegotiator::intersect_video_capabilities(
+                                caps,
+                                &peer_video,
+                            );
+                            if !matching.is_empty() {
+                                *caps = matching;
+                                return true;
+                            }
+                        }
+                        false
+                    });
+            if !has_compatible_peer_video {
                 let accepted_by_peer = self
                     .negotiate_added_video_with_peer(
                         leg_id,
@@ -9308,22 +9358,6 @@ if self
                     )
                     .await?;
                 offered_video_caps = Some(accepted_by_peer);
-            } else if let Some(peer_profile) = self
-                .media
-                .bridge
-                .as_ref()
-                .and_then(|_| self.media_leg(peer_key))
-                .and_then(|leg| leg.negotiated())
-            {
-                let peer_video = peer_profile.video;
-                if let Some(caps) = offered_video_caps.as_mut() {
-                    caps.retain(|offered_cap| {
-                        peer_video.iter().any(|peer_cap| {
-                            offered_cap.codec_name.eq_ignore_ascii_case(&peer_cap.name)
-                                && offered_cap.clock_rate == peer_cap.clock_rate
-                        })
-                    });
-                }
             }
         }
         let accepted_video_active = offered_video_caps
@@ -9340,10 +9374,6 @@ if self
             .and_then(|leg| leg.negotiated())
             .and_then(|profile| profile.audio.map(|codec| codec.codec));
 
-        // Track whether this leg accepted active video. A later re-INVITE may
-        // transition the leg from audio-only to video and create the video
-        // transceiver while building the local answer below.
-        self.legs.set_video_state(leg_id, accepted_video_active);
         if accepted_video_active && !had_video {
             if let Some(video_codec) = offered_video_caps.as_ref().and_then(|caps| caps.first()) {
                 info!(session_id = %self.id,
@@ -9381,6 +9411,14 @@ if self
         answer_sdp = MediaNegotiator::align_answer_direction_with_offer(offer_sdp, &answer_sdp);
 
         let answer_sdp = leg.commit_local_answer(&answer_sdp, rustrtc::SdpType::Answer).await?;
+        // A video re-INVITE can keep the same codecs while changing the
+        // BUNDLE transport or the MID that the relay stamps on outgoing RTP.
+        if (had_video || accepted_video_active)
+            && let Some(bridge) = self.media.bridge.as_mut()
+            && bridge.side_for_leg(leg_id).is_some()
+        {
+            bridge.invalidate_route_cache();
+        }
 
         match side {
             DialogSide::Caller => {
@@ -11928,6 +11966,20 @@ impl SipSession {
                 }
             }
 
+            CallCommand::LegAddOffer {
+                leg_id,
+                offer,
+                reply,
+            } => {
+                let added = self.handle_add_offer_leg(leg_id, &offer).await;
+                let result = match &added {
+                    Ok((leg_id, _)) => CommandResult::success_with_leg(leg_id.clone()),
+                    Err(error) => CommandResult::failure(error.to_string()),
+                };
+                let _ = reply.send(added.map_err(|error| error.to_string()));
+                result
+            }
+
             CallCommand::LegRemove { leg_id, reason } => {
                 Self::ok_or_failure(self.handle_remove_leg(leg_id, reason).await)
             }
@@ -13831,6 +13883,101 @@ impl SipSession {
         Ok(location)
     }
 
+    /// Add a leg whose media peer answers `offer` directly, with no SIP
+    /// dialog. The transport follows the offer (ICE + DTLS → WebRTC), so a
+    /// browser or WebRTC agent can join the call through its controller. The
+    /// leg is connected once the answer is committed; like `call.leg_add`, it
+    /// joins media only through an explicit bridge and ends through leg
+    /// removal or session hangup.
+    pub(super) async fn handle_add_offer_leg(
+        &mut self,
+        leg_id: Option<LegId>,
+        offer: &str,
+    ) -> Result<(LegId, String)> {
+        let leg_id = leg_id.unwrap_or_else(|| LegId::new(format!("leg-{}", uuid::Uuid::new_v4())));
+        if self
+            .legs
+            .get(&leg_id)
+            .is_some_and(|leg| leg.state != LegState::Ended)
+        {
+            return Err(anyhow!("Leg already exists: {}", leg_id));
+        }
+        let transport = Self::sdp_transport_mode(offer);
+        let codecs = self.offer_leg_codecs(offer);
+        let video = self.video_caps_from_sdp(offer);
+        let cfg = self.build_leg_config(&leg_id, transport.clone(), codecs, video);
+        let peer = crate::media::create_leg(
+            leg_id.as_str(),
+            &cfg,
+            self.media.recording.capture_sender(),
+            crate::media::CaptureRoute::Deferred,
+        )?;
+        let answer = async {
+            peer.apply_remote_sdp(offer, rustrtc::SdpType::Offer)
+                .await?;
+            let mut answer = peer.prepare_answer().await?.to_sdp_string();
+            if !self.video_relay_enabled()
+                && let Some(stripped) = MediaNegotiator::strip_video_from_sdp(&answer)
+            {
+                answer = stripped;
+            }
+            peer.commit_local_answer(&answer, rustrtc::SdpType::Answer)
+                .await
+        }
+        .await;
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                peer.stop();
+                return Err(error);
+            }
+        };
+        peer.accept();
+        info!(session_id = %self.id, %leg_id, transport = ?transport, "Adding offer-answered leg to session");
+        self.legs.insert(
+            leg_id.clone(),
+            crate::call::domain::Leg::new(leg_id.clone()),
+        );
+        self.update_leg_state(&leg_id, LegState::Initializing);
+        self.record_leg_event(
+            &leg_id.0,
+            crate::callrecord::LegTimelineEventType::Added,
+            None,
+            None,
+        );
+        self.attach_media_leg(&leg_id, peer);
+        self.legs.set_transport(leg_id.clone(), transport);
+        self.legs.set_answer(leg_id.clone(), answer.clone());
+        self.update_leg_state(&leg_id, LegState::Connected);
+        self.update_media_path().await;
+        Ok((leg_id, answer))
+    }
+
+    /// Audio codecs for an offer-answered leg: the caller's negotiated codec
+    /// when offered, so a later bridge passes audio through untranscoded;
+    /// otherwise the effective codec policy (G.711 when none is configured),
+    /// falling back to the offerer's own order when nothing intersects.
+    fn offer_leg_codecs(&self, offer: &str) -> Vec<crate::media::negotiate::CodecInfo> {
+        let offered = MediaNegotiator::build_codec_list_from_offer(offer, &[]);
+        let caller_codec = self
+            .media_leg(&LegId::from("caller"))
+            .and_then(|peer| peer.negotiated())
+            .and_then(|profile| profile.audio.map(|audio| audio.codec))
+            .filter(|codec| offered.iter().any(|offered| offered.codec == *codec));
+        let policy = match caller_codec {
+            Some(codec) => vec![codec],
+            None => {
+                let configured = self.resolve_effective_codecs();
+                if configured.is_empty() {
+                    vec![CodecType::PCMU, CodecType::PCMA]
+                } else {
+                    configured
+                }
+            }
+        };
+        MediaNegotiator::build_codec_list_from_offer(offer, &policy)
+    }
+
     /// Remove a leg from the session.
     pub(super) async fn handle_remove_leg(
         &mut self,
@@ -14000,12 +14147,12 @@ impl SipSession {
         } else {
             Vec::new()
         };
-        if mode == crate::media::TransportMode::WebRtc {
-            MediaNegotiator::remap_bundle_video_payload_types(
-                &mut video,
-                codecs.iter().map(|codec| codec.payload_type),
-            )?;
-        }
+        // Both WebRTC and direct SIP offers can propose BUNDLE. Keep their
+        // audio and video PTs distinct even when each has a fallback port.
+        MediaNegotiator::remap_bundle_video_payload_types(
+            &mut video,
+            codecs.iter().map(|codec| codec.payload_type),
+        )?;
         let cfg = self.build_leg_config(leg_id, mode, codecs, video);
         // Any dynamic leg can become the selected B side after queue dispatch
         // or transfer. Capture stays off until hold selects that exact peer,

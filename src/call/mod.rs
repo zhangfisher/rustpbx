@@ -122,6 +122,56 @@ pub struct VoicePrompts {
     /// the answering agent's display name (percent-encoded inside URLs).
     #[serde(default)]
     pub service_prompt: Option<String>,
+    /// Prompt announcing the wait-for-callback option once
+    /// `QueueCallbackConfig::offer_after_secs` of queue wait elapsed
+    /// (e.g. "Press 2 if you'd like us to call you back"). Absent = the
+    /// option is offered silently (the DTMF key still works past the
+    /// threshold) — deployments without the recording keep the feature usable.
+    #[serde(default)]
+    pub callback_offer_prompt: Option<String>,
+    /// Prompt played after the caller pressed the callback key, confirming
+    /// the request was registered (e.g. "Your callback has been scheduled,
+    /// goodbye"). The queue hangs up (BySystem) when this prompt completes.
+    #[serde(default)]
+    pub callback_confirm_prompt: Option<String>,
+}
+
+/// Wait-for-callback option offered to a queued caller after a configured
+/// wait duration. **Disabled by default** — absent route-queue spec sections
+/// and default-constructed configs never offer the option, so existing
+/// deployments see no behavior change until an operator turns it on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueCallbackConfig {
+    /// Master switch. `false` (the default everywhere) = the queue behaves
+    /// exactly as before the feature existed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Queue wait (seconds, measured from this queue entry's enqueue instant)
+    /// after which the callback option becomes available: the offer prompt
+    /// plays once (when configured) and the DTMF key starts being accepted.
+    #[serde(default = "default_callback_offer_after_secs")]
+    pub offer_after_secs: u64,
+    /// DTMF key the caller presses to request the callback (default `"2"`).
+    #[serde(default = "default_callback_dtmf_key")]
+    pub dtmf_key: String,
+}
+
+fn default_callback_offer_after_secs() -> u64 {
+    30
+}
+
+fn default_callback_dtmf_key() -> String {
+    "2".to_string()
+}
+
+impl Default for QueueCallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            offer_after_secs: default_callback_offer_after_secs(),
+            dtmf_key: default_callback_dtmf_key(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -147,6 +197,8 @@ impl VoicePrompts {
             final_destination_prompt: None,
             comfort_prompts: Vec::new(),
             service_prompt: None,
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
         }
     }
 
@@ -203,13 +255,16 @@ pub struct DialAttempt {
     /// None inherits the shared dialplan caller.
     pub caller: Option<rsipstack::sip::Uri>,
     pub hints: Option<Arc<crate::config::DialplanHints>>,
+    /// Per-attempt dial ring timeout (e.g. from trunk `max_ring_time`).
+    /// Independent of the call-wide `Dialplan::max_ring_time`.
+    pub max_ring_time: Option<Duration>,
     /// None advances after failure; an empty status-code list stops retry.
     pub retry_policy: Option<crate::proxy::routing::RetryPolicy>,
 }
 
 impl From<Location> for DialAttempt {
     fn from(location: Location) -> Self {
-        Self { location, caller: None, hints: None, retry_policy: None }
+        Self { location, caller: None, hints: None, max_ring_time: None, retry_policy: None }
     }
 }
 
@@ -217,6 +272,7 @@ impl From<Location> for DialAttempt {
 impl From<crate::config::RouteTarget> for DialAttempt {
     fn from(target: crate::config::RouteTarget) -> Self {
         let option = target.option;
+        let max_ring_time = target.hints.as_ref().and_then(|hints| hints.max_ring_time);
         Self {
             location: Location {
                 aor: option.callee,
@@ -227,6 +283,7 @@ impl From<crate::config::RouteTarget> for DialAttempt {
             },
             caller: Some(option.caller),
             hints: target.hints.map(Arc::new),
+            max_ring_time,
             // A routed target without a policy never advances.
             retry_policy: Some(target.retry_policy.unwrap_or_default()),
         }
@@ -275,6 +332,7 @@ impl std::fmt::Debug for DialAttempt {
             .field("callee", &self.location.aor)
             .field("caller", &self.caller)
             .field("hints", &self.hints)
+            .field("max_ring_time", &self.max_ring_time)
             .field("retry_policy", &self.retry_policy)
             .finish_non_exhaustive()
     }
@@ -466,6 +524,7 @@ pub fn transfer_target_kind(target: &str) -> Option<String> {
 /// Rules:
 /// - `"sip:user@host"` → unchanged
 /// - `"sip:user"`      → `"sip:user@<realm>"`
+/// - `"sips:host:5061"` → unchanged
 /// - `"user@host"`     → `"sip:user@host"`
 /// - `"user"`          → `"sip:user@<realm>"`
 /// - `"tel:+"`         → unchanged
@@ -475,16 +534,17 @@ pub fn build_sip_uri(target: &str, realm: &str) -> String {
         return format!("sip:anonymous@{}", realm);
     }
 
-    if let Some(rest) = trimmed.strip_prefix("sip:") {
-        if rest.contains('@') {
-            // "sip:user@host" → pass through
+    if let Some(address) = crate::proxy::routing::strip_sip_scheme(trimmed) {
+        let authority = address.split([';', '?']).next().unwrap_or(address);
+        if address.contains('@') || authority.contains(':') {
             trimmed.to_string()
         } else {
-            // "sip:user" → "sip:user@realm"
-            format!("sip:{}@{}", rest, realm)
+            format!("{trimmed}@{realm}")
         }
-    } else if let Some(_rest) = trimmed.strip_prefix("tel:") {
-        // tel: URIs are passed as-is
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tel:"))
+    {
         trimmed.to_string()
     } else if trimmed.contains('@') {
         // "user@host" → "sip:user@host"
@@ -682,6 +742,10 @@ pub struct QueuePlan {
     /// default). Carried from app params (`StartApp("queue", …)` / outbound
     /// `on_answer: enqueue`) through `queue_joined` and the shared-queue row.
     pub priority: u32,
+    /// Wait-for-callback option resolved from the route-queue spec
+    /// (`None` = not enabled — the overwhelming default; existing specs have
+    /// no callback section at all).
+    pub callback: Option<QueueCallbackConfig>,
 }
 
 impl Default for QueuePlan {
@@ -709,6 +773,7 @@ impl Default for QueuePlan {
             voice_prompts: None,
             queue_name: String::new(),
             priority: 0,
+            callback: None,
         }
     }
 }

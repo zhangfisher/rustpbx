@@ -286,7 +286,19 @@ async fn attended_transfer_hold_reaches_customer_via_partner_session() {
     // transfer). The room keeps the customer and the transfer target.
     bob.hangup(&calls[1].0).await.unwrap();
     bob.hangup(&calls[0].1).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait briefly for the PBX to process Bob's BYEs while keeping the two
+    // surviving conference participants intact, then drain any UA events.
+    super::wait::wait_until(Duration::from_secs(2), || async {
+        server
+            .server_ref
+            .conference_manager
+            .list_conferences_detail()
+            .await
+            .into_iter()
+            .any(|room| room.participant_count() == 2)
+    })
+    .await
+    .expect("surviving conference participants must remain active");
     for ua in [&alice, &charlie] {
         ua.process_dialog_events().await.unwrap();
     }
@@ -458,9 +470,17 @@ let server = E2eTestServer::start_with_config(config).await.unwrap();
         "{};to-tag={};from-tag={}",
         consult.call_id, consult.remote_tag, consult.local_tag
     );
+    // The consult dialog's target identity carries the *branded realm* of the
+    // transferor's registration (prod: a WSS-only domain like
+    // `pbx.ruzhila.cn` with no UDP/TCP SIP route). A third-party transferee
+    // (baresip / PSTN-style) dials the Refer-To host literally — against a
+    // WSS-only realm that INVITE never reaches us and the transfer times out
+    // (~15s failure NOTIFY; the 2026-11-19 prd-mac incident). The relay must
+    // repoint the target at the node's routable SIP address before handing
+    // the REFER to the transferee, so the REFER here deliberately carries a
+    // realm the TestUa cannot dial.
     let target = format!(
-        "sip:charlie@{}?Replaces={}",
-        server.proxy_addr,
+        "sip:charlie@wss-only-realm.example.com?Replaces={}",
         urlencoding::encode(&replaces)
     );
     assert_eq!(bob.send_refer(&calls[0].1, &target).await.unwrap(), 202);
@@ -484,6 +504,16 @@ let server = E2eTestServer::start_with_config(config).await.unwrap();
     assert!(
         referred.contains("charlie") && referred.contains("Replaces="),
         "Refer-To must point at the transfer target with Replaces: {referred}"
+    );
+    assert!(
+        referred.contains(&server.proxy_addr.to_string()),
+        "Refer-To host must be repointed at the node's routable SIP address \
+         (a third-party transferee dials the host literally — an unroutable \
+         branded realm kills the transfer): {referred}"
+    );
+    assert!(
+        !referred.contains("wss-only-realm.example.com"),
+        "the unroutable branded realm must not survive the relay: {referred}"
     );
 
     // No transfer room may exist (the relay skips the room handshake).
