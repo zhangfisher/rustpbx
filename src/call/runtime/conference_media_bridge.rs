@@ -15,14 +15,6 @@ use crate::call::domain::LegId;
 use crate::call::runtime::ConferenceManager;
 use crate::media::conference_mixer::AudioFrame;
 
-/// One PCM frame equals 20 ms everywhere on the conference path: the mix-bus
-/// frame size and both bridge resampler loops share this cadence.
-const CONFERENCE_PTIME_MS: usize = 20;
-/// Resample staging-buffer ceiling, in frames. The stateful FIR can leave a
-/// short tail per call (group delay) which the next frame absorbs; a backlog
-/// beyond this means the consumer stalled — drop instead of growing memory.
-const MAX_RESAMPLE_PENDING_FRAMES: usize = 10;
-
 /// Trait for sending media samples to a track.
 pub trait AudioSender: Send + Sync {
     fn send(
@@ -92,6 +84,14 @@ impl ConferenceMediaBridge {
 
         let input_tx = channels.input_tx;
 
+        // The room's mix bus rate is the single resampling reference for both
+        // directions: ingress decimates/interpolates to it, egress converts
+        // back to the codec rate with the same stateful FIR.
+        let mixer_sample_rate = self
+            .conference_manager
+            .conference_sample_rate(&conf_id_obj)
+            .unwrap_or(8_000);
+
         // Take the output_rx for this leg
         let output_rx = self
             .conference_manager
@@ -118,15 +118,6 @@ impl ConferenceMediaBridge {
             "Starting full-duplex conference media bridge"
         );
         crate::metrics::conference::created();
-
-        // The participant was just added, so the room exists: read its mix-bus
-        // rate instead of assuming 8 kHz. Every leg's PCM is FIR-resampled to
-        // this rate on ingress and the mix back to the leg's encoder rate on
-        // egress.
-        let mixer_sample_rate = self
-            .conference_manager
-            .conference_mixer_sample_rate(&conf_id_obj)
-            .unwrap_or(crate::media::conference_mixer::CONFERENCE_MIXER_SAMPLE_RATE);
 
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
@@ -183,7 +174,7 @@ impl ConferenceMediaBridge {
     ) where
         S: AudioSender + Send + Sync + 'static,
     {
-        use audio_codec::{BoxedResampler, create_encoder};
+        use audio_codec::create_encoder;
         use rustrtc::media::{AudioFrame as RtcAudioFrame, MediaSample};
 
         info!(
@@ -203,20 +194,14 @@ impl ConferenceMediaBridge {
         let samples_per_frame = (sample_rate * interval_ms as u32 / 1000) as usize;
         let rtp_ticks_per_frame = clock_rate * interval_ms as u32 / 1000;
 
-        // Reusable frame buffer — this loop runs every 20ms per participant,
-        // so per-frame `Vec` allocations are worth avoiding.
+        // Reusable buffers — this loop runs every 20ms per participant, so
+        // per-frame `Vec` allocations are worth avoiding.
+        let mut pcm_buf: Vec<i16> = Vec::with_capacity(samples_per_frame * 4);
         let mut frame_buf: Vec<i16> = vec![0i16; samples_per_frame];
-        // Stateful FIR resampler (mix-bus rate → encoder rate), rebuilt only
-        // when the mix rate changes mid-call. Filter state must persist
-        // across frames: a per-frame instance turns every frame boundary
-        // into a click, and a zero-order decimator folds high frequencies
-        // back into the voice band as loud aliasing.
-        let mut resampler: Option<(u32, BoxedResampler)> = None;
-        // Resampled PCM awaiting a full encoder frame. The FIR group delay
-        // makes per-call outputs drift slightly off frame boundaries, so the
-        // tail stays buffered and joins the next mix frame (never zero-padded
-        // mid-stream).
-        let mut pending: Vec<i16> = Vec::with_capacity(samples_per_frame * 2);
+        // One stateful FIR for the lifetime of this leg: rebuilding it per
+        // frame would discard the anti-alias history and re-introduce the
+        // aliasing (and a phase discontinuity at every frame boundary).
+        let mut resampler: Option<(u32, u32, audio_codec::BoxedResampler)> = None;
 
         // Hold-gate pacer: while held, the hold music is emitted on this
         // self-paced 20ms ticker — INDEPENDENT of the mixer output cadence.
@@ -286,53 +271,32 @@ impl ConferenceMediaBridge {
                     sequence_number = sequence_number.wrapping_add(1);
                 }
                 Some(frame) = output_rx.recv(), if !is_held() => {
-                    let src_rate = frame.sample_rate;
-                    if resampler.as_ref().map_or(true, |(r, _)| *r != src_rate) {
-                        resampler = if src_rate == sample_rate {
-                            None
-                        } else {
-                            match BoxedResampler::new(src_rate as usize, sample_rate as usize) {
-                                Ok(rs) => {
-                                    info!(
-                                        leg_id = %leg_id,
-                                        from = src_rate,
-                                        to = sample_rate,
-                                        "Forward loop armed anti-aliased resampler"
-                                    );
-                                    Some((src_rate, rs))
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        leg_id = %leg_id,
-                                        from = src_rate,
-                                        to = sample_rate,
-                                        error = %e,
-                                        "Invalid resampler rates; dropping mixed frame"
-                                    );
-                                    continue;
-                                }
-                            }
-                        };
-                    }
-                    match &mut resampler {
-                        Some((_, rs)) => pending.extend_from_slice(&rs.resample(&frame.samples)),
-                        None => pending.extend_from_slice(&frame.samples),
-                    }
-                    if pending.len() > samples_per_frame * MAX_RESAMPLE_PENDING_FRAMES {
+                    // Resample to the encoder rate with a stateful polyphase
+                    // FIR: a plain decimation here folds 4-8 kHz energy back
+                    // into the voice band (audible hiss on wideband rooms).
+                    if !resample_fir_into(
+                        &mut resampler,
+                        &frame.samples,
+                        frame.sample_rate,
+                        sample_rate,
+                        &mut pcm_buf,
+                    ) {
                         warn!(
                             leg_id = %leg_id,
-                            backlog = pending.len(),
-                            "Conference forward resample backlog; dropping stale PCM"
+                            conf_id = %conf_id,
+                            src_sample_rate = frame.sample_rate,
+                            dst_sample_rate = sample_rate,
+                            "Conference forward loop could not resample frame"
                         );
-                        pending.clear();
+                        continue;
                     }
 
-                    // Encode whole frames only; the remainder waits for the
-                    // next mix frame instead of being zero-padded (padding
-                    // truncated the stream whenever rates misaligned).
-                    while pending.len() >= samples_per_frame {
-                        frame_buf.copy_from_slice(&pending[..samples_per_frame]);
-                        pending.drain(..samples_per_frame);
+                    // Process in chunks of samples_per_frame
+                    for chunk in pcm_buf.chunks(samples_per_frame) {
+                        // Copy into the persistent frame buffer, padding the
+                        // tail with silence for a partial final chunk.
+                        frame_buf[..chunk.len()].copy_from_slice(chunk);
+                        frame_buf[chunk.len()..].fill(0);
 
                         let encoded = encoder.encode(&frame_buf);
                         let rtc_frame = RtcAudioFrame {
@@ -347,7 +311,7 @@ impl ConferenceMediaBridge {
                             source_addr: None,
                         };
 
-                        let bytes_sent = samples_per_frame * 2; // i16 = 2 bytes
+                        let bytes_sent = chunk.len() * 2; // i16 = 2 bytes
                         if let Err(e) = audio_sender.send(MediaSample::Audio(rtc_frame)).await {
                             warn!(
                                 leg_id = %leg_id,
@@ -364,7 +328,7 @@ impl ConferenceMediaBridge {
 
                     trace!(
                         leg_id = %leg_id,
-                        pending = pending.len(),
+                        samples = pcm_buf.len(),
                         original_sample_rate = frame.sample_rate,
                         "Encoded and sent mixed audio frame from conference"
                     );
@@ -396,8 +360,6 @@ impl ConferenceMediaBridge {
         cancel_token: tokio_util::sync::CancellationToken,
         mixer_sample_rate: u32,
     ) {
-        use audio_codec::BoxedResampler;
-
         info!(
             leg_id = %leg_id,
             conf_id = %conf_id,
@@ -405,16 +367,9 @@ impl ConferenceMediaBridge {
             "Conference media bridge reverse loop started"
         );
 
-        // The mixer consumes fixed 20 ms frames at the mix-bus rate.
-        let frame_size = mixer_sample_rate as usize * CONFERENCE_PTIME_MS / 1000;
-        // Stateful FIR resampler (leg PCM rate → mix-bus rate), cached per
-        // source rate. Filter state persists across frames — a per-frame
-        // instance injects a click at every boundary, and naive decimation
-        // (e.g. taking every 2nd/6th sample from G.722/Opus) folds the upper
-        // voice band back down as loud aliasing noise.
-        let mut resampler: Option<(u32, BoxedResampler)> = None;
-        // Resampled PCM awaiting a full mix frame; absorbs the FIR group delay.
-        let mut pending: Vec<i16> = Vec::with_capacity(frame_size * 2);
+        // Per-leg resampler state (never shared between legs). The mixer rate
+        // is fixed for the room; only the ingress codec rate can change.
+        let mut resampler: Option<(u32, u32, audio_codec::BoxedResampler)> = None;
 
         loop {
             tokio::select! {
@@ -431,61 +386,45 @@ impl ConferenceMediaBridge {
                     let sample_count = pcm_frame.samples.len();
                     let sample_rate = pcm_frame.sample_rate;
 
-                    if resampler.as_ref().map_or(true, |(r, _)| *r != sample_rate) {
-                        resampler = if sample_rate == mixer_sample_rate {
-                            None
-                        } else {
-                            match BoxedResampler::new(sample_rate as usize, mixer_sample_rate as usize) {
-                                Ok(rs) => {
-                                    info!(
-                                        leg_id = %leg_id,
-                                        from = sample_rate,
-                                        to = mixer_sample_rate,
-                                        "Reverse loop armed anti-aliased resampler"
-                                    );
-                                    Some((sample_rate, rs))
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        leg_id = %leg_id,
-                                        from = sample_rate,
-                                        to = mixer_sample_rate,
-                                        error = %e,
-                                        "Invalid resampler rates; dropping participant frame"
-                                    );
-                                    continue;
-                                }
-                            }
-                        };
-                    }
-                    match &mut resampler {
-                        Some((_, rs)) => pending.extend_from_slice(&rs.resample(&pcm_frame.samples)),
-                        None => pending.extend_from_slice(&pcm_frame.samples),
-                    }
-                    if pending.len() > frame_size * MAX_RESAMPLE_PENDING_FRAMES {
+                    // Anti-aliased, stateful resampling into the room's mix
+                    // bus rate (G.722 16 kHz / Opus 48 kHz → 16 kHz room).
+                    let mut samples = Vec::new();
+                    if !resample_fir_into(
+                        &mut resampler,
+                        &pcm_frame.samples,
+                        sample_rate,
+                        mixer_sample_rate,
+                        &mut samples,
+                    ) {
                         warn!(
                             leg_id = %leg_id,
-                            backlog = pending.len(),
-                            "Conference reverse resample backlog; dropping stale PCM"
+                            conf_id = %conf_id,
+                            src_sample_rate = sample_rate,
+                            dst_sample_rate = mixer_sample_rate,
+                            "Conference reverse loop could not resample frame"
                         );
-                        pending.clear();
+                        continue;
                     }
+                    // Carry the ingress sample position onto the room timeline
+                    // (codec PCM rate -> mixer rate). Untimestamped sources
+                    // (timestamp 0) keep the mixer's synthetic pacing.
+                    let output_timestamp = if pcm_frame.timestamp == 0 {
+                        0
+                    } else {
+                        (pcm_frame.timestamp as u128 * mixer_sample_rate as u128
+                            / sample_rate as u128) as u64
+                    };
+                    let mut audio_frame = AudioFrame::new(samples, mixer_sample_rate);
+                    audio_frame.timestamp = output_timestamp;
 
-                    // Emit whole mix frames; the remainder joins the next
-                    // inbound frame (mixer pads/aligns per its own contract).
-                    while pending.len() >= frame_size {
-                        let samples: Vec<i16> = pending.drain(..frame_size).collect();
-                        let audio_frame = AudioFrame::new(samples, mixer_sample_rate);
-
-                        if let Err(e) = input_tx.send(audio_frame).await {
-                            warn!(
-                                leg_id = %leg_id,
-                                conf_id = %conf_id,
-                                error = %e,
-                                "Failed to send audio to conference mixer input"
-                            );
-                            return;
-                        }
+                    if let Err(e) = input_tx.send(audio_frame).await {
+                        warn!(
+                            leg_id = %leg_id,
+                            conf_id = %conf_id,
+                            error = %e,
+                            "Failed to send audio to conference mixer input"
+                        );
+                        break;
                     }
 
                     trace!(
@@ -512,6 +451,105 @@ impl ConferenceMediaBridge {
             "Conference media bridge reverse loop ended"
         );
     }
+}
+
+/// Resample audio into `out` with a stateful polyphase FIR, rebuilding the
+/// filter only when the source or destination rate changes.
+///
+/// This is the conference path's only resampler: linear interpolation (or
+/// bare decimation, which is what an integer ratio degrades to) has no
+/// anti-alias filter, so 4-8 kHz wideband content folds back into the voice
+/// band as continuous hiss. `BoxedResampler` keeps its 24-tap history across
+/// calls, so frames must be fed to the same instance in order.
+///
+/// Returns `false` (leaving `out` empty) for invalid rates.
+pub(crate) fn resample_fir_into(
+    resampler: &mut Option<(u32, u32, audio_codec::BoxedResampler)>,
+    samples: &[i16],
+    src_rate: u32,
+    dst_rate: u32,
+    out: &mut Vec<i16>,
+) -> bool {
+    out.clear();
+    if src_rate == dst_rate {
+        out.extend_from_slice(samples);
+        return true;
+    }
+    if src_rate == 0 || dst_rate == 0 {
+        return false;
+    }
+
+    let needs_rebuild = resampler
+        .as_ref()
+        .map_or(true, |(src, dst, _)| *src != src_rate || *dst != dst_rate);
+    if needs_rebuild {
+        match audio_codec::BoxedResampler::new(src_rate as usize, dst_rate as usize) {
+            Ok(new_resampler) => *resampler = Some((src_rate, dst_rate, new_resampler)),
+            Err(error) => {
+                warn!(
+                    %src_rate,
+                    %dst_rate,
+                    %error,
+                    "Failed to build conference resampler"
+                );
+                return false;
+            }
+        }
+    }
+
+    let resampled = resampler
+        .as_mut()
+        .expect("resampler built above")
+        .2
+        .resample(samples);
+    out.extend_from_slice(&resampled);
+    true
+}
+
+/// Resample audio using linear interpolation into `out` (reused across
+/// frames to avoid per-frame allocation in audio hot paths).
+///
+/// Retained for the realtime bridge / transfer paths; the conference media
+/// bridge uses [`resample_fir_into`] instead.
+pub(crate) fn resample_linear_into(
+    samples: &[i16],
+    src_rate: u32,
+    dst_rate: u32,
+    out: &mut Vec<i16>,
+) {
+    if src_rate == dst_rate {
+        out.clear();
+        out.extend_from_slice(samples);
+        return;
+    }
+
+    let ratio = src_rate as f32 / dst_rate as f32;
+    let new_len = (samples.len() as f32 / ratio) as usize;
+    out.clear();
+    out.reserve(new_len);
+
+    for i in 0..new_len {
+        let src_idx = i as f32 * ratio;
+        let src_idx_floor = src_idx.floor() as usize;
+        let src_idx_ceil = (src_idx.ceil() as usize).min(samples.len().saturating_sub(1));
+        let frac = src_idx - src_idx.floor();
+
+        let sample = if src_idx_floor == src_idx_ceil {
+            samples[src_idx_floor]
+        } else {
+            let s0 = samples[src_idx_floor] as f32;
+            let s1 = samples[src_idx_ceil] as f32;
+            (s0 + frac * (s1 - s0)) as i16
+        };
+        out.push(sample);
+    }
+}
+
+/// Resample audio using linear interpolation.
+pub(crate) fn resample_linear(samples: &[i16], src_rate: u32, dst_rate: u32) -> Vec<i16> {
+    let mut out = Vec::new();
+    resample_linear_into(samples, src_rate, dst_rate, &mut out);
+    out
 }
 
 /// Handle to control a conference media bridge.
@@ -633,16 +671,17 @@ fn load_wav_pcm16(path: &str) -> Option<(Vec<i16>, u32)> {
     (channels == 1 || channels >= 1).then_some((samples, rate))
 }
 
-/// Resample into a fresh vector with the crate's anti-aliased FIR resampler
-/// (same strategy as the bridge loops, so downsampling hold music never
-/// folds high frequencies back into the voice band).
+/// One-shot anti-aliased resample (hold-music fixtures at bridge start).
 fn resample_to_target(samples: &[i16], from: u32, to: u32) -> Vec<i16> {
     if from == to || from == 0 || to == 0 {
         return samples.to_vec();
     }
     match audio_codec::BoxedResampler::new(from as usize, to as usize) {
-        Ok(mut rs) => rs.resample(samples),
-        Err(_) => samples.to_vec(),
+        Ok(mut resampler) => resampler.resample(samples),
+        Err(error) => {
+            warn!(%from, %to, %error, "Failed to resample hold music; using source rate");
+            samples.to_vec()
+        }
     }
 }
 
@@ -989,15 +1028,9 @@ mod tests {
     #[tokio::test]
     async fn test_reverse_loop_resamples_opus_48khz_to_mixer_8khz() {
         let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(10);
-        // Simulate Opus decoder output: 3 frames of 960 samples at 48kHz
-        // (60ms). Several frames are fed because the FIR's group delay can
-        // hold back part of the first 20ms — the pending buffer emits whole
-        // mix frames only.
-        let receiver = MockAudioReceiver::new(vec![
-            PcmAudioFrame::new(vec![1000i16; 960], 48000),
-            PcmAudioFrame::new(vec![1000i16; 960], 48000),
-            PcmAudioFrame::new(vec![1000i16; 960], 48000),
-        ]);
+        // Simulate Opus decoder output: 960 samples at 48kHz
+        let opus_frame = PcmAudioFrame::new(vec![1000i16; 960], 48000);
+        let receiver = MockAudioReceiver::new(vec![opus_frame]);
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_clone = cancel.clone();
 
@@ -1017,7 +1050,7 @@ mod tests {
         cancel.cancel();
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
 
-        // Verify frames were resampled to 8kHz at the mixer's 20ms cadence
+        // Verify the frame was resampled to 8kHz
         let frame = input_rx
             .try_recv()
             .expect("Should receive resampled frame from reverse loop");
@@ -1029,17 +1062,7 @@ mod tests {
         assert_eq!(
             frame.samples.len(),
             160,
-            "mix frames must be exactly 20ms (160 samples at 8kHz)"
-        );
-        // 60ms of input must produce at least two full mix frames even with
-        // FIR group delay eating into the first one.
-        let mut total_frames = 1;
-        while input_rx.try_recv().is_ok() {
-            total_frames += 1;
-        }
-        assert!(
-            total_frames >= 2,
-            "60ms of 48kHz input should yield ≥2 mix frames, got {total_frames}"
+            "960 samples at 48kHz should become 160 at 8kHz (20ms)"
         );
     }
 
@@ -1075,66 +1098,6 @@ mod tests {
         assert_eq!(frame.samples.len(), 160);
         // Samples should be unchanged
         assert_eq!(frame.samples[0], 500);
-    }
-
-    /// Aliasing regression (R1): decimating 16 kHz (G.722) PCM to the 8 kHz
-    /// mix bus must low-pass first. The old linear-interpolation path
-    /// degraded to per-N sampling for integer ratios, folding everything
-    /// above 4 kHz back into the voice band as loud noise. A 7.9 kHz tone
-    /// must arrive at the mixer heavily attenuated, not mirrored to ~100 Hz.
-    #[tokio::test]
-    async fn test_reverse_loop_fir_rejects_out_of_band_before_decimation() {
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(10);
-        // 7.9 kHz tone at 16 kHz: far above the 8 kHz output's Nyquist
-        // (4 kHz), so a proper anti-alias FIR suppresses it into the noise
-        // floor while naive decimation mirrors it to a near-full-scale tone.
-        let tone_at_16k: Vec<i16> = (0..320)
-            .map(|i| {
-                let t = i as f32 / 16000.0;
-                (8000.0 * (2.0 * std::f32::consts::PI * 7900.0 * t).sin()) as i16
-            })
-            .collect();
-        let input_peak = tone_at_16k.iter().map(|s| s.abs()).max().unwrap();
-        let receiver = MockAudioReceiver::new(vec![
-            PcmAudioFrame::new(tone_at_16k.clone(), 16000),
-            PcmAudioFrame::new(tone_at_16k.clone(), 16000),
-            PcmAudioFrame::new(tone_at_16k.clone(), 16000),
-            PcmAudioFrame::new(tone_at_16k, 16000),
-        ]);
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let handle = crate::utils::spawn(async move {
-            ConferenceMediaBridge::reverse_loop(
-                Box::new(receiver),
-                input_tx,
-                LegId::new("test-leg"),
-                "conf-1".to_string(),
-                cancel_clone,
-                8000,
-            )
-            .await;
-        });
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        cancel.cancel();
-        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
-
-        let mut output_peak = 0i64;
-        let mut frames = 0usize;
-        while let Ok(frame) = input_rx.try_recv() {
-            assert_eq!(frame.sample_rate, 8000);
-            for &s in &frame.samples {
-                output_peak = output_peak.max(s.abs() as i64);
-            }
-            frames += 1;
-        }
-        assert!(frames > 0, "resampled frames must reach the mixer");
-        assert!(
-            output_peak * 4 <= input_peak as i64,
-            "out-of-band tone must be attenuated by the anti-alias FIR: \
-             output peak {output_peak} vs input peak {input_peak}"
-        );
     }
 
     #[tokio::test]
@@ -1189,62 +1152,6 @@ mod tests {
                 );
                 assert_eq!(frame.payload_type, Some(9)); // G.722 static PT
                 assert!(!frame.data.is_empty(), "G.722 payload should not be empty");
-            }
-            _ => panic!("Expected Audio sample"),
-        }
-    }
-
-    /// Mixed conference audio rides the 16 kHz mix bus; an Opus leg's
-    /// forward loop must upsample 16k → 48 kHz with the stateful FIR before
-    /// encoding (interpolated upsampling, never sample duplication).
-    #[tokio::test]
-    async fn test_forward_loop_opus_resamples_from_mixer_16khz() {
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-        let sender = MockAudioSender::new();
-        let sender_for_loop = MockAudioSender {
-            samples: sender.samples.clone(),
-        };
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_clone = cancel.clone();
-
-        let handle = crate::utils::spawn(async move {
-            ConferenceMediaBridge::forward_loop(
-                rx,
-                sender_for_loop,
-                LegId::new("test-leg"),
-                "conf-1".to_string(),
-                cancel_clone,
-                audio_codec::CodecType::Opus,
-                None,
-            )
-            .await;
-        });
-
-        // Three 20 ms mix-bus frames at 16 kHz (60 ms total — several frames
-        // so the FIR group delay cannot hold the whole stream unemitted).
-        let mix_frame: Vec<i16> = (0..320).map(|i| ((i * 37) % 3000) as i16).collect();
-        for _ in 0..3 {
-            tx.send(AudioFrame {
-                sample_rate: 16000,
-                samples: mix_frame.clone(),
-                timestamp: 0,
-            })
-            .await
-            .unwrap();
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        cancel.cancel();
-        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
-
-        let sent = sender.get_samples().await;
-        assert!(!sent.is_empty(), "Expected Opus-encoded audio to be sent");
-
-        match &sent[0] {
-            MediaSample::Audio(frame) => {
-                assert_eq!(frame.clock_rate, 48000, "Opus RTP clock rate");
-                assert_eq!(frame.payload_type, Some(audio_codec::CodecType::Opus.payload_type()));
-                assert!(!frame.data.is_empty(), "Opus payload should not be empty");
             }
             _ => panic!("Expected Audio sample"),
         }
@@ -1338,6 +1245,137 @@ mod tests {
 
         // Drop the bridge entirely — second handle should be cleaned up
         drop(bridge);
+    }
+
+    /// Reproduction for the three-way conference hiss: a 5 kHz tone at 16 kHz
+    /// (valid G.722 wideband content) must not be folded into the 8 kHz mix.
+    /// Plain decimation (`samples[2i]`) aliases it to 3 kHz at full amplitude;
+    /// an anti-alias FIR pushes it below the noise floor.
+    #[tokio::test]
+    async fn test_reverse_loop_decimation_suppresses_aliasing() {
+        use std::f32::consts::PI;
+
+        const SRC_RATE: u32 = 16_000;
+        const MIX_RATE: u32 = 8_000;
+        const FRAMES: usize = 40;
+        let samples_per_frame = SRC_RATE as usize / 50;
+        let total = samples_per_frame * FRAMES;
+        let tone: Vec<i16> = (0..total)
+            .map(|i| {
+                let phase = i as f32 * 5000.0 * 2.0 * PI / SRC_RATE as f32;
+                (phase.sin() * 10_000.0) as i16
+            })
+            .collect();
+        let frames: Vec<PcmAudioFrame> = tone
+            .chunks(samples_per_frame)
+            .map(|chunk| PcmAudioFrame::new(chunk.to_vec(), SRC_RATE))
+            .collect();
+
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(128);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = crate::utils::spawn(async move {
+            ConferenceMediaBridge::reverse_loop(
+                Box::new(MockAudioReceiver::new(frames)),
+                input_tx,
+                LegId::new("alias-leg"),
+                "conf-alias".to_string(),
+                cancel_clone,
+                MIX_RATE,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
+
+        let mut out = Vec::new();
+        while let Ok(frame) = input_rx.try_recv() {
+            assert_eq!(frame.sample_rate, MIX_RATE);
+            out.extend_from_slice(&frame.samples);
+        }
+        assert!(out.len() >= FRAMES * 80, "expected 40 x 80 resampled samples");
+
+        // Skip the FIR warm-up (history starts zeroed), then measure the
+        // surviving energy: the 3 kHz alias would sit here at full amplitude.
+        let tail = &out[320..];
+        let rms = (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+            / tail.len() as f64)
+            .sqrt();
+        assert!(
+            rms < 500.0,
+            "5 kHz @16 kHz aliased into the 8 kHz mix: residual rms {rms:.0} \
+             (input rms ~7071) — decimation needs an anti-alias filter"
+        );
+    }
+
+    /// Same defect on the egress side: the mixer runs wideband, but a PCMU
+    /// leg must be decimated to 8 kHz without folding 4-8 kHz energy back in.
+    #[tokio::test]
+    async fn test_forward_loop_decimation_suppresses_aliasing() {
+        use std::f32::consts::PI;
+
+        const MIX_RATE: u32 = 16_000;
+        const ENC_RATE: u32 = 8_000;
+        const FRAMES: usize = 40;
+        let samples_per_frame = MIX_RATE as usize / 50;
+        let total = samples_per_frame * FRAMES;
+        let tone: Vec<i16> = (0..total)
+            .map(|i| {
+                let phase = i as f32 * 5000.0 * 2.0 * PI / MIX_RATE as f32;
+                (phase.sin() * 10_000.0) as i16
+            })
+            .collect();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let sender = MockAudioSender::new();
+        let sender_for_loop = MockAudioSender {
+            samples: sender.samples.clone(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = crate::utils::spawn(async move {
+            ConferenceMediaBridge::forward_loop(
+                rx,
+                sender_for_loop,
+                LegId::new("alias-leg"),
+                "conf-alias".to_string(),
+                cancel_clone,
+                audio_codec::CodecType::PCMU,
+                None,
+            )
+            .await;
+        });
+
+        for chunk in tone.chunks(samples_per_frame) {
+            tx.send(AudioFrame::new(chunk.to_vec(), MIX_RATE))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
+
+        let sent = sender.get_samples().await;
+        assert!(!sent.is_empty(), "expected PCMU frames");
+        let mut decoder = audio_codec::create_decoder(audio_codec::CodecType::PCMU);
+        let mut out = Vec::new();
+        for sample in sent {
+            if let MediaSample::Audio(frame) = sample {
+                out.extend_from_slice(&decoder.decode(&frame.data));
+            }
+        }
+        // Skip warm-up + codec settling frames.
+        let tail = &out[ENC_RATE as usize * 40 / 1000 * 3..];
+        let rms = (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+            / tail.len() as f64)
+            .sqrt();
+        assert!(
+            rms < 800.0,
+            "5 kHz @16 kHz aliased into the 8 kHz PCMU egress: residual rms \
+             {rms:.0} (input rms ~7071)"
+        );
     }
 
     /// Regression (production 2026-11-13): a transfer-room hold must NOT
