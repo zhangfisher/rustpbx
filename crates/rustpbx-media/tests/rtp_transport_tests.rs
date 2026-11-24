@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use audio_codec::CodecType;
 use rustpbx_media::TransportMode;
-use rustpbx_media::leg::LegInner;
+use rustpbx_media::egress::EgressSource;
+use rustpbx_media::leg::{LegConfig, LegInner};
 use rustpbx_media::media_bridge::{LegSide, MediaBridge};
 use rustpbx_media::negotiate::{CodecInfo, MediaNegotiator};
 use rustrtc::config::BufferDropStrategy;
@@ -38,6 +39,7 @@ struct TestPeer {
     tx: rustrtc::media::track::SampleStreamSource,
     codec: CodecInfo,
     video_tx: Option<rustrtc::media::track::SampleStreamSource>,
+    video_seq: std::sync::atomic::AtomicU16,
 }
 
 impl TestPeer {
@@ -51,6 +53,7 @@ impl TestPeer {
             tx,
             codec,
             video_tx: None,
+            video_seq: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
@@ -71,6 +74,7 @@ impl TestPeer {
             tx,
             codec,
             video_tx: None,
+            video_seq: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
@@ -133,9 +137,10 @@ impl TestPeer {
     /// Push a raw H264 access-unit frame to the remote peer (via the bridge).
     fn send_video(&self, payload: Vec<u8>, ts: u32) {
         if let Some(vtx) = &self.video_tx {
+            let seq = self.video_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             vtx.send(MediaSample::Video(rustrtc::media::frame::VideoFrame {
                 data: bytes::Bytes::from(payload),
-                payload_type: Some(96),
+                payload_type: None,
                 rtp_timestamp: ts,
                 width: 640,
                 height: 480,
@@ -144,7 +149,7 @@ impl TestPeer {
                 is_last_packet: true,
                 header_extension: None,
                 csrcs: Vec::new(),
-                sequence_number: None,
+                sequence_number: Some(seq),
                 source_addr: None,
                 raw_packet: None,
             }))
@@ -1391,8 +1396,9 @@ async fn video_codec_mismatch_degrades_to_audio_only() {
     )
     .await;
     h.assert_video_not_relayed().await;
-    // Audio must keep flowing after the degradation: the bridge falls back to
-    // the transcoding path (PCMU → decode → PCMU), so B still receives audio.
+    // Audio must keep flowing on fast-path relay after the video degradation,
+    // without forcing software transcoding when audio codecs match.
+    h.assert_relay(true);
     let audio = h.relay_audio_a_to_b(3000).await;
     assert!(audio.is_some(), "audio must survive the video degradation");
     h.close();
@@ -2295,6 +2301,94 @@ async fn reinvite_profile_resyncs_egress_codec_and_sender_pt() {
     );
 }
 
+#[tokio::test]
+async fn reinvite_with_same_codec_rebuilds_relay_payload_mapping() {
+    // The default harness installs a video sender. Start with audio-only
+    // legs so a relay rearm requesting video has to wait for a transport.
+    let codec = MediaNegotiator::codec_info_for_type(CodecType::Opus);
+    let config = LegConfig {
+        codecs: vec![codec.clone()],
+        bind_ips: vec!["127.0.0.1".parse().unwrap()],
+        ..LegConfig::rtp_pcmu()
+    };
+    let leg_a = LegInner::new("a", &config, None).unwrap();
+    let leg_b = LegInner::new("b", &config, None).unwrap();
+    let test_a = TestPeer::new(TransportMode::Rtp, codec.clone());
+    let test_b = TestPeer::new(TransportMode::Rtp, codec);
+    negotiate(&test_a, &leg_a).await;
+    negotiate(&test_b, &leg_b).await;
+    let mut bridge = MediaBridge::new("rtp-reinvite");
+    bridge.select_pair(leg_a.clone(), leg_b.clone()).await.unwrap();
+    bridge.accept(LegSide::A).await;
+    bridge.accept(LegSide::B).await;
+    assert!(leg_a.egress_is_relay());
+    assert!(leg_b.egress_is_relay());
+
+    let original = leg_b.negotiated().unwrap().audio.unwrap();
+    let voice = encode_codec_frames(CodecType::Opus, 20);
+    test_a.send_audio(voice[0].clone(), 0);
+    let initial = test_b.recv_audio(2000).await.expect("original relay packet");
+    assert_eq!(initial.payload_type, Some(original.payload_type));
+
+    // A rearm that adds video can wait for its transport even though the
+    // existing audio route is ready. Keep sending audio over that route.
+    let before = {
+        let rearm = leg_b.set_egress_source(EgressSource::RewriteRelay {
+            peer_pc: leg_a.pc().clone(),
+            options: Default::default(),
+            routes: vec![
+                (rustrtc::MediaKind::Audio, Vec::new()),
+                (rustrtc::MediaKind::Video, Vec::new()),
+            ],
+            on_arm_failed: None,
+        });
+        tokio::pin!(rearm);
+        tokio::select! {
+            biased;
+            result = &mut rearm => panic!("expected the video transport to still be pending: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        test_a.send_audio(voice[0].clone(), 960);
+        let during = test_b.recv_audio(2000).await.expect("relay packet while video is pending");
+        assert_eq!(during.payload_type, initial.payload_type);
+        assert_eq!(during.sequence_number, initial.sequence_number.map(|seq| seq.wrapping_add(1)));
+        during
+    };
+
+    let new_pt = 109;
+    let mut offer = test_b.pc.create_offer().await.unwrap();
+    let audio = offer.media_sections.iter_mut().find(|m| m.kind == rustrtc::MediaKind::Audio).unwrap();
+    let old_format = original.payload_type.to_string();
+    let format = audio.formats.iter_mut().find(|f| **f == old_format).unwrap();
+    *format = new_pt.to_string();
+    for attr in &mut audio.attributes {
+        if matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb")
+            && let Some(value) = attr.value.as_mut()
+            && let Some((pt, params)) = value.split_once(' ')
+            && pt == old_format
+        {
+            *value = format!("{new_pt} {params}");
+        }
+    }
+    test_b.pc.set_local_description(offer.clone()).unwrap();
+    let answer = leg_b.answer(&offer.to_sdp_string()).await.unwrap();
+    let audio = leg_b.negotiated().unwrap().audio.unwrap();
+    assert_eq!(audio.codec, original.codec);
+    assert_eq!(audio.payload_type, new_pt);
+    test_b.pc
+        .set_remote_description(SessionDescription::parse(SdpType::Answer, &answer).unwrap())
+        .await.unwrap();
+    bridge.bridge().await.unwrap();
+
+    test_a.send_audio(voice[0].clone(), 1920);
+    let after = test_b.recv_audio(2000).await.expect("relay packet after re-INVITE");
+    assert_eq!(after.payload_type, Some(new_pt));
+    assert_eq!(after.sequence_number, before.sequence_number.map(|seq| seq.wrapping_add(1)));
+    assert_eq!(after.rtp_timestamp.wrapping_sub(before.rtp_timestamp), 960);
+    assert_eq!(after.raw_packet.unwrap().header.ssrc, before.raw_packet.unwrap().header.ssrc);
+    bridge.close();
+}
+
 /// Transcoded call recording (the exact scenario of the reported stutter bug
 /// `0duu44tqb5hs0f8rii8n`: WebRTC-Opus caller ↔ RTP-PCMU callee).
 ///
@@ -3013,7 +3107,8 @@ async fn relay_late_tail_does_not_rewind_paced_hold_clock() {
     h.close();
     assert_eq!(
         resumed.sequence_number,
-        received[2].sequence_number.wrapping_add(1)
+        received[1].sequence_number.wrapping_add(1),
+        "late arrivals must not rewind or reuse outgoing sequence numbers"
     );
     assert_eq!(
         resumed.timestamp.wrapping_sub(high_water),
@@ -3021,7 +3116,6 @@ async fn relay_late_tail_does_not_rewind_paced_hold_clock() {
         "relay-to-paced must anchor to the output high-water sampling time"
     );
 }
-
 
 /// Minimal looping tone source standing in for the hold-music file source.
 struct TestHoldMusicSource {
@@ -3290,6 +3384,8 @@ async fn repeated_hold_unhold_cycles_keep_transcoded_audio_intact() {
 /// tests never reproduced it because frames arrived with zero jitter).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jittered_frame_arrival_keeps_transcode_output_gap_free() {
+    use tokio::time::{Instant, sleep_until, timeout_at};
+
     let mut h = TestMediaHarness::create(
         TransportMode::Rtp,
         CodecType::G729,
@@ -3321,77 +3417,289 @@ async fn jittered_frame_arrival_keeps_transcode_output_gap_free() {
         }
     }
 
-    // Feed B's PCMA tone at a 20 ms AVERAGE cadence with a ~36 ms late spike
-    // on every 5th frame (the spike is recovered by shortening the interval
-    // before it — the RTP timestamps stay on the 20 ms grid, matching how a
-    // real sender's jitter bursts arrive: late, then bunched).
-    let frames = encode_tone_frames(CodecType::PCMA, 20, 120);
-    assert!(!frames.is_empty());
-    let rate = CodecType::PCMA.samplerate();
-    let clock_rate = CodecType::G729.samplerate() as u64;
-    let mut decoder = audio_codec::create_decoder(CodecType::G729);
-    let mut ts = 10_000u32;
-    let mut voiced_samples = 0u64;
-    let mut total_samples = 0u64;
+    // Send at a 20 ms average cadence, with four 16 ms intervals and one
+    // 36 ms interval per cycle. Absolute deadlines keep receive waits from
+    // making the sender fall behind its RTP clock.
+    let packet_ms = 20;
+    let packet_count = 120;
+    let codec_frame_ms = 10;
+    let frames = encode_tone_frames(CodecType::PCMA, packet_ms, packet_count);
+    assert_eq!(frames.len(), packet_count);
+    let start = Instant::now();
+    let receive_until = start + Duration::from_millis(packet_count as u64 * packet_ms + 300);
+    let send = async {
+        let mut send_at = start;
+        let mut timestamp = 10_000u32;
+        for (i, frame) in frames.into_iter().enumerate() {
+            sleep_until(send_at).await;
+            h.test_b.send_audio(frame, timestamp);
+            timestamp = timestamp.wrapping_add(CodecType::PCMA.samplerate() * packet_ms as u32 / 1000);
+            send_at += Duration::from_millis(if i % 5 == 4 { 36 } else { 16 });
+        }
+    };
 
-    // Interleave: send each frame on the jittered cadence, then drain the A
-    // side for the same wall-clock slice (the egress emits one frame per
-    // tick; the drain keeps the receiver ring from overflowing between
-    // counts).
-    for (i, frame) in frames.iter().enumerate() {
-        h.test_b.send_audio(frame.clone(), ts);
-        ts = ts.wrapping_add(rate / 50);
-        let wait = if i % 5 == 4 {
+    let receive = async {
+        let mut decoder = audio_codec::create_decoder(CodecType::G729);
+        let rate = CodecType::G729.samplerate();
+        // G.729 uses 10 ms codec frames. Measure the 440 Hz component in
+        // each one so that a single loud sample cannot hide a quiet frame.
+        let codec_frame_samples = rate as usize * codec_frame_ms as usize / 1000;
+        let tone_basis: Vec<_> = (0..codec_frame_samples)
+            .map(|i| (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(rate)).sin_cos())
+            .collect();
+        let mut has_tone = Vec::new();
+        let mut previous_sequence: Option<u16> = None;
+        while let Ok(received) = timeout_at(receive_until, h.test_a.recv_audio(50)).await {
+            let Some(frame) = received else { continue };
+            let sequence = frame.sequence_number.expect("RTP audio sequence number");
+            if let Some(previous) = previous_sequence.replace(sequence) {
+                assert_eq!(sequence, previous.wrapping_add(1), "RTP audio packet gap");
+            }
+            let pcm = decoder.decode(&frame.data);
+            for chunk in pcm.chunks_exact(codec_frame_samples) {
+                let (sin, cos) = chunk.iter().zip(&tone_basis).fold(
+                    (0.0, 0.0),
+                    |(sin_sum, cos_sum), (&sample, &(sin, cos))| {
+                        let sample = f64::from(sample);
+                        (sin_sum + sample * sin, cos_sum + sample * cos)
+                    },
+                );
+                let amplitude = 2.0 * sin.hypot(cos) / codec_frame_samples as f64;
+                has_tone.push(amplitude > f64::from(VOICED_SAMPLE_THRESHOLD));
+            }
+        }
+        has_tone
+    };
+    let ((), has_tone) = tokio::join!(send, receive);
 
-            Duration::from_millis(36)
-        } else {
-            Duration::from_millis(16)
-        };
-        let deadline = tokio::time::Instant::now() + wait;
-        while tokio::time::Instant::now() < deadline {
-            match h.test_a.recv_audio(4).await {
-                Some(frame) if !frame.data.is_empty() => {
-                    let pcm = decoder.decode(&frame.data);
-                    total_samples += pcm.len() as u64;
-                    if pcm.iter().any(|v| v.abs() > VOICED_SAMPLE_THRESHOLD) {
-                        voiced_samples += pcm.len() as u64;
+    // The drain catches buffered tone after the last send. Count gaps only
+    // inside the tone, and check its recovered duration independently.
+    let first = has_tone.iter().position(|&tone| tone).expect("received tone");
+    let last = has_tone.iter().rposition(|&tone| tone).unwrap();
+    let active = &has_tone[first..=last];
+    let tone_frames = active.iter().filter(|&&tone| tone).count();
+    let expected_tone_frames = packet_count * (packet_ms / codec_frame_ms) as usize;
+    assert!(
+        tone_frames * 100 >= active.len() * 95,
+        "jittered feed produced {tone_frames}/{} tone frames during active audio",
+        active.len(),
+    );
+    assert!(
+        tone_frames * 100 >= expected_tone_frames * 95,
+        "jittered feed recovered {tone_frames}/{expected_tone_frames} tone frames",
+    );
+}
+
+/// Feedback addresses the producer's SSRC and sequence space, not the relay's.
+#[tokio::test]
+async fn video_feedback_translates_nack_gaps_and_keyframe_targets() {
+    use rustrtc::rtp::{
+        FirRequest, FullIntraRequest, GenericNack, PictureLossIndication,
+        RtcpPacket, RtpHeader, RtpPacket,
+    };
+    let mut h = create_video_harness(
+        TransportMode::Rtp, TransportMode::Rtp, h264_caps(96), h264_caps(110),
+    ).await;
+    let video_sender = |pc: &PeerConnection| pc.get_transceivers().into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Video).unwrap().sender().unwrap();
+    let upstream = video_sender(&h.test_a.pc);
+    let downstream = video_sender(&h.test_b.pc);
+    let mut feedback = upstream.subscribe_rtcp();
+    let mut received = Vec::new();
+    // Start on a higher SSRC to ensure feedback still reaches the active
+    // producer even though the tap remembers the previous source for this PT.
+    for (ssrc, seq) in [(u32::MAX, 9), (upstream.ssrc(), 10), (upstream.ssrc(), 12)] {
+        let mut header = RtpHeader::new(96, seq, 9000 + u32::from(seq - 9) * 3600, ssrc);
+        header.marker = true;
+        upstream.transport().unwrap().send_rtp(
+            RtpPacket::new(header, vec![0x65, 1, 2, 3]),
+        ).await.unwrap();
+        let frame = h.test_b.recv_video(2000).await.expect("relayed video");
+        received.push(frame);
+    }
+    let first = received[1].raw_packet.as_ref().unwrap().header.clone();
+    let last = received[2].raw_packet.as_ref().unwrap().header.clone();
+    assert_eq!(last.sequence_number, first.sequence_number.wrapping_add(2));
+    downstream.transport().unwrap().send_rtcp(&[
+        RtcpPacket::GenericNack(GenericNack {
+            sender_ssrc: downstream.ssrc(), media_ssrc: first.ssrc,
+            lost_packets: vec![first.sequence_number.wrapping_add(1), last.sequence_number.wrapping_add(1000)],
+        }),
+        RtcpPacket::PictureLossIndication(PictureLossIndication {
+            sender_ssrc: downstream.ssrc(), media_ssrc: first.ssrc,
+        }),
+        RtcpPacket::FullIntraRequest(FullIntraRequest {
+            sender_ssrc: downstream.ssrc(),
+            requests: vec![FirRequest { ssrc: first.ssrc, sequence_number: 55 }],
+        }),
+    ]).await.unwrap();
+    let mut seen = [false; 3];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while seen != [true; 3] {
+            match feedback.recv().await.unwrap() {
+                RtcpPacket::GenericNack(nack) => {
+                    assert_eq!(nack.media_ssrc, upstream.ssrc());
+                    assert_eq!(nack.lost_packets, vec![11], "lost upstream packet must be reverse-mapped; unknown numbers omitted");
+                    seen[0] = true;
+                }
+                RtcpPacket::PictureLossIndication(pli) => {
+                    assert_eq!(pli.media_ssrc, upstream.ssrc());
+                    seen[1] = true;
+                }
+                RtcpPacket::FullIntraRequest(fir) => {
+                    assert_eq!(fir.requests.len(), 1);
+                    assert_eq!(fir.requests[0].ssrc, upstream.ssrc());
+                    assert_eq!(fir.requests[0].sequence_number, 55);
+                    seen[2] = true;
+                }
+                _ => {}
+            }
+        }
+    }).await.expect("translated feedback reaches original producer");
+    h.close();
+}
+
+#[tokio::test]
+async fn video_relay_translates_rtx_repairs_between_negotiated_streams() {
+    use rustrtc::rtp::{GenericNack, RtcpPacket, RtpHeader, RtpPacket};
+    use rustrtc::rtx::{RtxSenderConfig, decode_osn, wrap_rtx_packet};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    struct Capture {
+        primary_pt: u8,
+        repair_pt: u8,
+        packets: mpsc::UnboundedSender<RtpPacket>,
+    }
+
+    impl RtpObserver for Capture {
+        fn on_ingress(&self, packet: &RtpPacket, _: std::net::SocketAddr) {
+            if [self.primary_pt, self.repair_pt].contains(&packet.header.payload_type) {
+                let _ = self.packets.send(packet.clone());
+            }
+        }
+    }
+
+    for (transport_a, transport_b) in [
+        (TransportMode::WebRtc, TransportMode::Rtp),
+        (TransportMode::WebRtc, TransportMode::WebRtc),
+        (TransportMode::Rtp, TransportMode::Rtp),
+    ] {
+        let mut caps_a = h264_caps(96);
+        caps_a[0].rtx_payload_type = Some(97);
+        caps_a[0].rtcp_fbs.push("nack".into());
+        let mut caps_b = h264_caps(110);
+        caps_b[0].rtx_payload_type = Some(111);
+        caps_b[0].rtcp_fbs.push("nack".into());
+        let mut h = create_video_harness(transport_a, transport_b, caps_a, caps_b).await;
+        h.assert_relay(true);
+
+        for (source, target, target_side, src_pt, src_rtx_pt, dst_pt, dst_rtx_pt) in [
+            (&h.test_a, &h.test_b, LegSide::B, 96, 97, 110, 111),
+            (&h.test_b, &h.test_a, LegSide::A, 110, 111, 96, 97),
+        ] {
+            let video = |pc: &PeerConnection| {
+                pc.get_transceivers()
+                    .into_iter()
+                    .find(|transceiver| transceiver.kind() == rustrtc::MediaKind::Video)
+                    .unwrap()
+            };
+            let source_video = video(&source.pc);
+            let source_sender = source_video.sender().unwrap();
+            let target_sender = video(&target.pc).sender().unwrap();
+            let source_transport = source_sender.transport().unwrap();
+            let target_transport = target_sender.transport().unwrap();
+            let target_leg = h.mb.leg(target_side).unwrap();
+            let target_video = video(target_leg.pc());
+            let target_primary_ssrc = target_video.sender().unwrap().ssrc();
+            let target_rtx_ssrc = target_video.sender_rtx_ssrc().unwrap();
+            let source_rtx = RtxSenderConfig {
+                rtx_ssrc: source_video.sender_rtx_ssrc().unwrap(),
+                rtx_payload_type: src_rtx_pt,
+            };
+            let (capture, mut received) = mpsc::unbounded_channel();
+            target.pc.add_observer(Arc::new(Capture {
+                primary_pt: dst_pt,
+                repair_pt: dst_rtx_pt,
+                packets: capture,
+            }));
+            let mut upstream_feedback = source_sender.subscribe_rtcp();
+            let mut primary = Vec::new();
+            let packet = |seq: u16| {
+                let mut header = RtpHeader::new(
+                    src_pt,
+                    seq,
+                    9_000 + u32::from(seq - 100) * 3_600,
+                    source_sender.ssrc(),
+                );
+                header.marker = true;
+                RtpPacket::new(header, vec![0x65, 1, 2, seq as u8])
+            };
+            for seq in [100, 102, 104] {
+                source_transport.send_rtp(packet(seq)).await.unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .expect("primary crosses the relay")
+                    .unwrap();
+                assert_eq!(received.header.payload_type, dst_pt);
+                assert_eq!(received.header.ssrc, target_primary_ssrc);
+                primary.push(received.header);
+            }
+
+            let start = primary[0].sequence_number;
+            assert_eq!(primary[2].sequence_number, start.wrapping_add(4));
+            target_transport
+                .send_rtcp(&[RtcpPacket::GenericNack(GenericNack {
+                    sender_ssrc: target_sender.ssrc(),
+                    media_ssrc: target_primary_ssrc,
+                    lost_packets: vec![start.wrapping_add(1), start.wrapping_add(3)],
+                })])
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let RtcpPacket::GenericNack(nack) = upstream_feedback.recv().await.unwrap()
+                        && nack.lost_packets == [101, 103]
+                    {
+                        assert_eq!(nack.media_ssrc, source_sender.ssrc());
+                        break;
                     }
                 }
-                _ => tokio::time::sleep(Duration::from_millis(2)).await,
-            }
-        }
-    }
-    // Short post-feed drain (300 ms) to flush the accumulator's last frames —
-    // the comfort-noise tail AFTER this point is the pipeline idling, not a
-    // mid-stream hole, so it stays out of the stats.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    while tokio::time::Instant::now() < deadline {
-        match h.test_a.recv_audio(25).await {
-            Some(frame) if !frame.data.is_empty() => {
-                let pcm = decoder.decode(&frame.data);
-                total_samples += pcm.len() as u64;
-                if pcm.iter().any(|v| v.abs() > VOICED_SAMPLE_THRESHOLD) {
-                    voiced_samples += pcm.len() as u64;
-                }
-            }
-            _ => tokio::time::sleep(Duration::from_millis(5)).await,
-        }
-    }
+            })
+            .await
+            .expect("NACK is translated into the original sequence space");
 
-    // With jitter, the accumulator absorbs late frames: the mid-stream CN
-    // hole ratio stays tiny (≤ 5%). The old blocking-per-tick pull punched a
-    // silent slot per late frame (~20% holes) — that is the regression this
-    // test pins. No input frame may be lost either.
-    let ratio = voiced_samples as f64 / total_samples.max(1) as f64;
-    assert!(
-        ratio >= 0.90,
-        "jittered feed produced {:.1}% voiced audio ({voiced_samples}/{total_samples} samples) —          late frames must merge into the accumulator, not punch silent slots",
-        ratio * 100.0
-    );
-    assert!(
-        total_samples >= 120 * 160,
-        "output lost frames: got {total_samples} samples, fed {}",
-        120 * 160
-    );
-    let _ = clock_rate;
+            let mut repair_sequences = Vec::new();
+            for (original, repair_seq) in [(101, 50), (103, 53)] {
+                let repair = wrap_rtx_packet(&packet(original), &source_rtx, repair_seq);
+                source_transport.send_rtp(repair).await.unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .expect("RTX crosses the relay")
+                    .unwrap();
+                assert_eq!(received.header.payload_type, dst_rtx_pt);
+                assert_eq!(received.header.ssrc, target_rtx_ssrc);
+                assert_eq!(
+                    decode_osn(&received.payload),
+                    Some(start.wrapping_add(original - 100))
+                );
+                assert_eq!(
+                    received.header.timestamp,
+                    primary[0].timestamp.wrapping_add(u32::from(original - 100) * 3_600)
+                );
+                assert!(received.header.marker);
+                assert_eq!(&received.payload[2..], packet(original).payload.as_ref());
+                repair_sequences.push(received.header.sequence_number);
+            }
+            assert_eq!(repair_sequences[1], repair_sequences[0].wrapping_add(1));
+            source_transport.send_rtp(packet(105)).await.unwrap();
+            let next = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .expect("primary relay remains active after RTX")
+                .unwrap();
+            assert_eq!(next.header.sequence_number, start.wrapping_add(5));
+            assert_eq!(next.header.timestamp, primary[0].timestamp.wrapping_add(5 * 3_600));
+        }
+        h.close();
+    }
 }
