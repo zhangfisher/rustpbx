@@ -29,7 +29,40 @@ pub(super) fn normalize_call_hangup_by(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_call_hangup_by;
+    use super::{
+        has_event_package, is_event_package, normalize_call_hangup_by,
+    };
+
+    #[test]
+    fn refer_event_package_ignores_the_rfc3515_id_parameter() {
+        // Plain (restsend) and baresip's `Event: refer;id=…` both select the
+        // refer package; other packages and prefixes must not.
+        assert!(is_event_package("refer", "refer"));
+        assert!(is_event_package("refer;id=40999", "refer"));
+        assert!(is_event_package("REFER ; id=1", "refer"));
+        assert!(!is_event_package("presence", "refer"));
+        assert!(!is_event_package("referx", "refer"));
+        assert!(!is_event_package("", "refer"));
+
+        let typed: rsipstack::sip::Headers = vec![
+            rsipstack::sip::Header::Event(rsipstack::sip::headers::Event::new(
+                "refer;id=40999",
+            )),
+        ]
+        .into();
+        assert!(has_event_package(&typed, "refer"));
+        let untyped: rsipstack::sip::Headers = vec![rsipstack::sip::Header::Other(
+            "Event".into(),
+            "refer;id=40999".into(),
+        )]
+        .into();
+        assert!(has_event_package(&untyped, "refer"));
+        let presence: rsipstack::sip::Headers = vec![rsipstack::sip::Header::Event(
+            rsipstack::sip::headers::Event::new("presence"),
+        )]
+        .into();
+        assert!(!has_event_package(&presence, "refer"));
+    }
 
     #[test]
     fn inbound_agent_hangup_stays_agent_with_cc_context() {
@@ -542,27 +575,6 @@ pub(super) fn emit_suspended_flow_session_end(
     gw.read().fan_out(session_id, &ev);
 }
 
-pub(crate) fn trunk_host_port(dest: &str) -> Option<(String, u16)> {
-    if dest.trim().is_empty() {
-        return None;
-    }
-    if let Ok(uri) = rsipstack::sip::Uri::try_from(dest) {
-        let host = uri.host().to_string();
-        let port = uri.host_with_port.port.map(|p| p.0).unwrap_or(5060);
-        return Some((host, port));
-    }
-    let parts: Vec<&str> = dest.split(':').collect();
-    let host = *parts.first()?;
-    if host.is_empty() {
-        return None;
-    }
-    let port = parts
-        .get(1)
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(5060);
-    Some((host.to_string(), port))
-}
-
 pub(super) fn parse_dial_target(target: &str) -> Result<rsipstack::sip::Uri> {
     let trimmed = target.trim();
     if let Ok(uri) = rsipstack::sip::Uri::try_from(trimmed) {
@@ -595,4 +607,33 @@ pub(crate) fn parse_sipfrag_status(body: &str) -> Option<u16> {
     } else {
         None
     }
+}
+
+/// Event package token from an `Event` header value (RFC 3265 §7.2.1): the
+/// package name is everything before the first `;` parameter.
+///
+/// Baresip stamps the implicit REFER subscription NOTIFY as
+/// `Event: refer;id=40999` (the `id` parameter is legal). A strict
+/// `== "refer"` check missed it, so the relayed-transfer outcome was never
+/// delivered to the transferor and a standard transferee's REFER-Replaces
+/// completion left the original leg held (2026-11-18 baresip e2e).
+pub(super) fn is_event_package(value: &str, package: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .map(|token| token.trim().eq_ignore_ascii_case(package))
+        .unwrap_or(false)
+}
+
+/// Whether any `Event` header in `headers` selects `package` (parameters
+/// ignored). Accepts both the typed `Header::Event` and an untyped `Other`
+/// spelling so a hand-built request cannot bypass the check.
+pub(super) fn has_event_package(headers: &rsipstack::sip::Headers, package: &str) -> bool {
+    headers.iter().any(|header| match header {
+        rsipstack::sip::Header::Event(event) => is_event_package(event.value(), package),
+        rsipstack::sip::Header::Other(name, value) => {
+            name.eq_ignore_ascii_case("Event") && is_event_package(value, package)
+        }
+        _ => false,
+    })
 }

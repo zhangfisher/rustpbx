@@ -106,9 +106,13 @@ impl SipSession {
                     } else {
                         Self::resolve_audio_file_path(&path)
                     };
+                    // The forward loop paces hold music at the ENCODER's PCM
+                    // rate (G.722: 16 kHz, RTP clock is 8 kHz), so the WAV
+                    // must be pre-resampled to that rate — not the clock rate,
+                    // which played G.722 hold music at double pitch.
                     crate::call::runtime::hold_gate_from_wav(
                         &resolved,
-                        self.leg_negotiated_codec(leg_id).clock_rate(),
+                        self.leg_negotiated_codec(leg_id).samplerate(),
                     )
                 }
                 _ => None,
@@ -343,12 +347,14 @@ impl crate::call::runtime::conference_media_bridge::AudioReceiver for MediaBridg
                 if frame.silence {
                     continue;
                 }
-                return Some(
-                    crate::call::runtime::conference_media_bridge::PcmAudioFrame::new(
-                        frame.frame.samples,
-                        frame.frame.sample_rate,
-                    ),
+                // Preserve the tap's timeline so the mixer can place this
+                // frame by time (R3: gaps/packetisation must not shift audio).
+                let mut pcm = crate::call::runtime::conference_media_bridge::PcmAudioFrame::new(
+                    frame.frame.samples,
+                    frame.frame.sample_rate,
                 );
+                pcm.timestamp = frame.frame.timestamp;
+                return Some(pcm);
             }
         })
     }

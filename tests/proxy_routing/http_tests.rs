@@ -1308,7 +1308,7 @@ mod tests {
     async fn test_http_router_trunk_targets_inherit_trunk_config_and_retry() {
         let trunks = [
             ("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", Some(vec![408, 503]))),
-            ("carrier-b".to_string(), trunk("sip:10.0.0.2:5080", None)),
+            ("carrier-b".to_string(), trunk("carrier-b.example.com:5080", None)),
         ]
         .into();
         let plan = resolve_with_trunks(json!({
@@ -1331,7 +1331,11 @@ mod tests {
         assert_eq!(attempts[0].location.aor.to_string(), "sip:target@10.0.0.1:5060");
         assert_eq!(attempts[0].location.destination.as_ref().unwrap().addr.to_string(), "10.0.0.1:5060");
         assert_eq!(attempts[0].location.credential.as_ref().unwrap().username, "acct");
-        assert_eq!(attempts[1].location.aor.to_string(), "sip:8613800000000@10.0.0.2:5080");
+        assert_eq!(attempts[1].location.aor.to_string(), "sip:8613800000000@carrier-b.example.com:5080");
+        assert_eq!(
+            attempts[1].location.destination.as_ref().unwrap().addr.to_string(),
+            "carrier-b.example.com:5080"
+        );
         assert_eq!(outbound_trunk(&attempts[0]), "carrier-a");
         assert_eq!(outbound_trunk(&attempts[1]), "carrier-b");
         assert_eq!(
@@ -1353,15 +1357,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_http_router_single_trunk_target_ring_time_limits_call() {
-        let trunks = [("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", None))].into();
+    async fn test_http_router_keeps_trunk_and_call_ring_times_separate() {
+        let cases = [
+            (
+                json!({"action": "forward", "targets": [{"trunk": "carrier-a"}]}),
+                None,
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "targets": [{"trunk": "carrier-a"}],
+                    "max_ring_time": 45
+                }),
+                Some(std::time::Duration::from_secs(45)),
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "strategy": "parallel",
+                    "targets": [{"trunk": "carrier-a"}],
+                }),
+                None,
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "strategy": "parallel",
+                    "targets": [{"trunk": "carrier-a"}],
+                    "max_ring_time": 45
+                }),
+                Some(std::time::Duration::from_secs(45)),
+            ),
+        ];
+
+        for (response, call_ring_time) in cases {
+            let trunks = [("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", None))].into();
+            let plan = resolve_with_trunks(response, trunks).await.unwrap();
+            assert_eq!(plan.max_ring_time, call_ring_time);
+
+            let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+                panic!("expected sequential targets");
+            };
+            let [attempt] = attempts.as_slice() else {
+                panic!("expected one trunk attempt");
+            };
+            assert_eq!(attempt.max_ring_time, Some(std::time::Duration::from_secs(20)));
+        }
+
+        let mut untimed_trunk = trunk("sip:10.0.0.1:5060", None);
+        untimed_trunk.max_ring_time = None;
         let plan = resolve_with_trunks(
-            json!({"action": "forward", "targets": [{"trunk": "carrier-a"}]}),
-            trunks,
+            json!({
+                "action": "forward",
+                "strategy": "parallel",
+                "targets": [{"trunk": "carrier-a"}],
+            }),
+            [("carrier-a".to_string(), untimed_trunk)].into(),
         )
         .await
         .unwrap();
-        assert_eq!(plan.max_ring_time, Some(std::time::Duration::from_secs(20)));
+        let DialplanFlow::Targets(DialStrategy::Parallel(targets)) = plan.flow else {
+            panic!("expected parallel targets without an attempt timer");
+        };
+        assert_eq!(targets.len(), 1);
     }
 
     #[tokio::test]
