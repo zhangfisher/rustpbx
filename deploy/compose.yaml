@@ -1,0 +1,19 @@
+services:
+  rustpbx:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rustpbx:latest
+    container_name: rustpbx
+    restart: unless-stopped
+    working_dir: /app
+    command:
+      - -c
+      - ./target/release/rustpbx --conf config.toml
+    volumes:
+      - ..:/app
+    ports:
+      - "8080:8080/tcp"
+      - "15060:15060/tcp"
+      - "15060:15060/udp"
+      - "12000-12099:12000-12099/udp"

@@ -1,0 +1,18 @@
+#
+# AutoPub配置
+# 产品信息库地址
+apiUrl: "http://192.168.110.219:8003/api"
+
+# 访问令牌
+apiToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjEsInJvbGVOYW1lIjoiYWRtaW4iLCJpYXQiOjE3NjMzNzMxNjksImV4cCI6MzMzMjA5NzMxNjl9.hugwO5C1mzqx1ct3ATqkCLiFvlv9uG1svqjGPWXSwo0"
+
+#  钉钉手机号，多个手机号使用,分割 
+dingding: "17326085379"
+
+
+# 版本标签
+tags: []
+
+# 预设的发布配置
+# 当执行autopub change时可以选择使用预设的发布配置
+releases:
