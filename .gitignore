@@ -91,14 +91,11 @@ Weixin*.png
 # Rotated runtime logs
 *.log.*
 
-<<<<<<< HEAD
 builds
 autopub-musl
 .output
 autopub
 autopub.exe
-=======
-
 
 /ddocs
->>>>>>> origin/main
+/rustpbx.zip
