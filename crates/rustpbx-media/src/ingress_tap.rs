@@ -394,11 +394,15 @@ impl IngressTap {
         self.ingress_packets.load(Ordering::Relaxed)
     }
 
+<<<<<<< HEAD
     /// The most-recently-seen ingress SSRC that carries any of `pts`. Used by
     /// the RTCP relay to rewrite a receiver's PLI/NACK (whose media_ssrc is
     /// the *relayed* SSRC) back onto the peer browser's real sender SSRC, so
     /// the peer's encoder responds. `None` while the peer hasn't sent that
     /// media type yet.
+=======
+    /// The highest ingress SSRC seen for any of `pts`, if available.
+>>>>>>> deploy
     pub fn ingress_ssrc_for_pts(&self, pts: &[u8]) -> Option<u32> {
         self.ingress_ssrc_pts
             .iter()
@@ -407,6 +411,16 @@ impl IngressTap {
             .max()
     }
 
+<<<<<<< HEAD
+=======
+    /// Whether this leg has received the given source with a matching payload type.
+    pub(crate) fn has_ingress_ssrc_for_pts(&self, ssrc: u32, pts: &[u8]) -> bool {
+        self.ingress_ssrc_pts
+            .get(&ssrc)
+            .is_some_and(|seen| pts.iter().any(|pt| seen.contains(pt)))
+    }
+
+>>>>>>> deploy
     /// Shared processing for both directions: stats + DTMF + record.
     #[inline]
     fn process(

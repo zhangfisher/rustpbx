@@ -150,11 +150,23 @@ the trunk supplies the rest of its configuration:
 
 The trunk is applied as the static routing rules apply it: destination and
 transport, credentials, host rewrite, codecs, network profile and media IPs,
+<<<<<<< HEAD
 `max_ring_time` and the call record's trunk attribution. In a sequence each
 trunk's `max_ring_time` limits its own attempt; a single trunk target's limits
 the call unless the response sets `max_ring_time`. The response's `caller` and
 `headers` apply to trunk targets too. A target cannot name both `uri` and
 `trunk`. Parallel dialing uses the trunk's destination and credentials only.
+=======
+`max_ring_time` and the call record's trunk attribution. In sequential dialing,
+the trunk's `max_ring_time` limits its own attempt, including when there is only
+one target. The top-level response `max_ring_time` limits the entire call setup
+across all attempts. If omitted, the proxy's global ring timeout applies. The
+response's `caller` and `headers` apply to trunk targets too. A target cannot
+name both `uri` and `trunk`. A lone trunk target with its own `max_ring_time`
+uses sequential dialing even when the response requests `parallel`. Parallel
+dialing uses the trunk's destination and credentials only. The call-wide limit
+also applies to parallel dialing.
+>>>>>>> deploy
 
 For a call that arrived on a trunk (`source_trunk`), that trunk's network path
 (network profile, media IPs, ICE-lite) applies to every sequential target, as
@@ -371,7 +383,11 @@ object (empty object when nothing was set).
 ### 2.1.1 Live Call Transcription (SSE)
 Subscribe to text emitted by an external quality service for an active call.
 Effective `[proxy.quality] enabled = true` (or a wholesale route/tenant policy)
+<<<<<<< HEAD
 starts inspection automatically after answer. SSE subscriptions never start or
+=======
+starts inspection automatically after answer by default; `start_when = "early_media"` enables an earlier start after provisional SDP. SSE subscriptions never start or
+>>>>>>> deploy
 stop inspection. `text`, `calltrace`, and `hangup` service responses are forwarded,
 recorded, and executed respectively; there are no separate ASR or action switches.
 The SSE endpoint returns `503` if the event gateway is unavailable.
@@ -529,6 +545,11 @@ For deployment, the v1 WebSocket wire protocol, an example service, wholesale po
 
 The console exposes **Settings → Proxy settings → Realtime quality inspection**. It persists `[proxy.quality]` in the active TOML configuration and reloads it for new calls. Wholesale tenant and route-item policies live under `[addons.wholesale.quality]` and currently require a process restart when changed. They are not stored as tenant database columns.
 
+<<<<<<< HEAD
+=======
+Set `start_when = "early_media"` under `[proxy.quality]` to begin inspection once provisional SDP negotiates media. The default, `start_when = "accepted"`, waits for answer. Early-media mode also starts on answer if no early media was received, and answering does not restart an existing inspection. The per-call quality plan can override `start_when`. Inspection still requires `enabled = true` and anchored media. For RWI and HTTP outbound originate, the first dialed endpoint is the session's caller/A leg; use `sides = "caller"` or `"both"` to inspect its audio.
+
+>>>>>>> deploy
 A connection carries one leg's decoded mono PCM16LE at the sample rate declared by its initial `start` JSON message. Services send WebSocket Ping every 10 seconds; the PBX defaults to closing inspection after 15 seconds without an incoming message. Closing inspection does not hang up the phone call. Use an explicit `hangup` event to terminate the call.
 
 Voicemail observations use `calltrace` with `kind: "quality"`, `code: "quality.voicemail_detected"`, and `detail.method: "asr"` or `"beep"`. These are stored in `rustpbx_call_records.metadata.trace`. Service-requested termination is attributed in the terminal End trace by `detail.source: "realtime_quality"` and `detail.reason`. Join `wholesale_cdrs` by `call_id` to inspect billing; there is no dedicated voicemail column or automatic tag.

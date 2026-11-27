@@ -70,7 +70,11 @@ pub fn map_telephone_event_duration(
     source_clock_rate: u32,
     target_clock_rate: u32,
 ) -> Option<Vec<u8>> {
+<<<<<<< HEAD
     if payload.len() < 4 {
+=======
+    if payload.len() != 4 {
+>>>>>>> deploy
         return None;
     }
     let source_duration = u16::from_be_bytes([payload[2], payload[3]]);
@@ -100,4 +104,15 @@ mod tests {
             .expect("supported clocks");
         assert_eq!(u16::from_be_bytes([mapped[2], mapped[3]]), 65_532);
     }
+<<<<<<< HEAD
+=======
+
+    #[test]
+    fn telephone_event_duration_rejects_non_four_byte_payloads() {
+        assert!(map_telephone_event_duration(&[40], 8000, 8000).is_none());
+        assert!(map_telephone_event_duration(&[40, 1, 2], 8000, 8000).is_none());
+        assert!(map_telephone_event_duration(&[5, 0x87, 0, 160, 0], 8000, 8000).is_none());
+        assert!(map_telephone_event_duration(&[0xFF; 160], 8000, 8000).is_none());
+    }
+>>>>>>> deploy
 }

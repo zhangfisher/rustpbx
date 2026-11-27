@@ -26,7 +26,11 @@ docker run -d --name rustpbx --net host \
   docker.cnb.cool/miuda.ai/rustpbx:commerce --conf /app/config.toml
 
 # Create the admin account (first time only)
+<<<<<<< HEAD
 docker exec rustpbx /app/rustpbx --conf /app/config.toml \
+=======
+docker exec rustpbx /app/app --conf /app/config.toml \
+>>>>>>> deploy
   --super-username admin --super-password changeme
 ```
 

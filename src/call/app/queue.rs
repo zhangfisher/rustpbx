@@ -24,8 +24,8 @@ use super::agent_registry::{
 };
 use super::{AppAction, ApplicationContext, CallApp, CallAppType, CallController, PlaybackToken};
 use crate::call::{
-    DialStrategy, FailureAction, Location, QueueFallbackAction, QueueHoldConfig, QueuePlan,
-    VoicePrompts,
+    DialStrategy, FailureAction, Location, QueueCallbackConfig, QueueFallbackAction,
+    QueueHoldConfig, QueuePlan, VoicePrompts,
 };
 use crate::callrecord::CallRecordHangupReason;
 use crate::models::call_record::extract_sip_username;
@@ -40,6 +40,15 @@ use tracing::{debug, info, warn};
 mod diagnostics;
 pub use diagnostics::{QueueDiagnosticRequest, QueueDispatchDiagnostic};
 
+<<<<<<< HEAD
+=======
+/// Wait-for-callback offer / confirm / finalize chain (see
+/// [`crate::call::QueueCallbackConfig`]). Kept in a sibling file like the
+/// diagnostics submodule — queue.rs is large and this flow is self-contained.
+#[path = "queue_callback.rs"]
+mod callback;
+
+>>>>>>> deploy
 // ===================================================================
 // Queue Statistics (built-in)
 // ===================================================================
@@ -48,6 +57,7 @@ pub use diagnostics::{QueueDiagnosticRequest, QueueDispatchDiagnostic};
 // Queue Configuration Extensions
 // ===================================================================
 
+<<<<<<< HEAD
 /// No-answer action for CC queues (business policy; executed by CC addon).
 ///
 /// Kept on [`QueueConfig`] so the executor can surface the configured action
@@ -67,6 +77,8 @@ pub enum NoAnswerAction {
     BackToIvr,
 }
 
+=======
+>>>>>>> deploy
 /// Extended queue configuration.
 ///
 /// Executor fields (`name`, `hold`, `agents`, `strategy`, `ring_timeout`, …)
@@ -106,8 +118,6 @@ pub struct QueueConfig {
     pub autonomous_routing: bool,
     /// Routing strategy for agent selection.
     pub routing_strategy: RoutingStrategy,
-    /// No-answer action.
-    pub no_answer_action: NoAnswerAction,
     /// Fallback skill group.
     pub fallback_skill_group: Option<String>,
     /// Enable SLA monitoring.
@@ -131,6 +141,12 @@ pub struct QueueConfig {
     /// factory; feeds `fifo_register_wait`, inline-ACD enqueue and the
     /// `queue_joined` / `queue_overflow_joined` event payloads.
     pub priority: u32,
+<<<<<<< HEAD
+=======
+    /// Wait-for-callback option. Default-constructed = disabled; only a
+    /// route-queue spec with `callback.enabled = true` turns it on.
+    pub callback: QueueCallbackConfig,
+>>>>>>> deploy
 }
 
 /// Escalation mode for overflow/skill-group escalation.
@@ -213,15 +229,17 @@ impl Default for QueueConfig {
             max_retries: 2,
             autonomous_routing: false,
             routing_strategy: RoutingStrategy::LongestIdle,
-            no_answer_action: NoAnswerAction::Voicemail,
-            fallback_skill_group: None,
-            sla_monitoring: false,
+            fallback_skill_group: None,            sla_monitoring: false,
             metrics_enabled: false,
             voice_prompts: None,
             escalation_mode: EscalationMode::Replace,
             escalation_timeline: Vec::new(),
             skill_group: None,
             priority: 0,
+<<<<<<< HEAD
+=======
+            callback: QueueCallbackConfig::default(),
+>>>>>>> deploy
         }
     }
 }
@@ -240,6 +258,14 @@ impl QueueConfig {
             voice_prompts: self.voice_prompts.clone(),
             queue_name: self.name.clone(),
             priority: self.priority,
+<<<<<<< HEAD
+=======
+            callback: if self.callback.enabled {
+                Some(self.callback.clone())
+            } else {
+                None
+            },
+>>>>>>> deploy
         }
     }
 }
@@ -277,6 +303,17 @@ pub enum QueueState {
     ExecutingFallback,
     /// Playing comfort/reassurance prompt during hold.
     PlayingComfortPrompt,
+<<<<<<< HEAD
+=======
+    /// Playing the wait-for-callback offer prompt (once, after
+    /// `QueueCallbackConfig::offer_after_secs` of wait). Completion returns
+    /// to hold music; the DTMF callback key stays accepted.
+    PlayingCallbackOffer,
+    /// Playing the callback confirmation prompt after the caller pressed the
+    /// callback key. Completion finalizes the request and hangs up
+    /// (BySystem) — no agent is dialed from here on.
+    PlayingCallbackConfirm,
+>>>>>>> deploy
     /// Playing final-destination prompt before fallback.
     PlayingFinalPrompt,
     /// Terminal state.
@@ -546,6 +583,16 @@ pub struct QueueApp {
     /// which is transient phantom-release bookkeeping and is drained by
     /// `release_phantom_agents`.
     no_answer_agents: Vec<String>,
+<<<<<<< HEAD
+=======
+    /// The caller's own agent identity (the caller device is itself a
+    /// registered agent — self-dispatch). ACD must never hand a queue call
+    /// back to the caller's own device: production 2026-11-15, 1003 dialed
+    /// *81support and ACD dispatched the call BACK to 1003 (the customer
+    /// talked to themselves, then the single-step transfer from that
+    /// self-dispatched state dropped the whole call).
+    caller_agent_id: Option<String>,
+>>>>>>> deploy
     /// Whether the `max_wait_timeout` has been armed for this queue entry.
     /// Re-entering wait retention (e.g. after a failed dial round) must NOT
     /// re-arm it — `set_timeout` replaces timers, which would extend the
@@ -566,6 +613,28 @@ pub struct QueueApp {
     join_attempt: u32,
     targeted_recovery: bool,
     recovery_requests: std::collections::VecDeque<(String, Vec<String>)>,
+<<<<<<< HEAD
+=======
+    // ── Wait-for-callback (inert unless config.callback.enabled) ──
+    /// The caller pressed the callback key and the request was accepted.
+    /// Short-circuits agent-unavailable / max-wait fallback paths — the
+    /// confirm chain now owns the call. Cleared when an agent CONNECTS (the
+    /// real connection overtakes the pending callback).
+    callback_requested: bool,
+    /// The full chain completed: dispatcher notified, RWI events emitted, CDR
+    /// trace written. Reuses the `abandoned_recorded` guard semantics — the
+    /// on_exit abandon classification must not double-count this exit.
+    callback_finalized: bool,
+    /// The offer threshold elapsed while the caller was NOT in an offerable
+    /// state (agent ringing / prompt in flight) — the offer prompt plays on
+    /// the next return to a hold-phase state. One-shot.
+    callback_offer_pending: bool,
+    /// The offer prompt already played (one-shot; the DTMF key stays
+    /// accepted past the threshold regardless).
+    callback_offered: bool,
+    callback_offer_token: Option<PlaybackToken>,
+    callback_confirm_token: Option<PlaybackToken>,
+>>>>>>> deploy
 }
 
 impl QueueApp {
@@ -618,12 +687,25 @@ impl QueueApp {
             fallback_executed: false,
             attempted_agents: Vec::new(),
             no_answer_agents: Vec::new(),
+<<<<<<< HEAD
+=======
+            caller_agent_id: None,
+>>>>>>> deploy
             max_wait_armed: false,
             max_wait_grace_used: false,
             joined_emitted_externally: false,
             join_attempt: 1,
             targeted_recovery: false,
             recovery_requests: std::collections::VecDeque::new(),
+<<<<<<< HEAD
+=======
+            callback_requested: false,
+            callback_finalized: false,
+            callback_offer_pending: false,
+            callback_offered: false,
+            callback_offer_token: None,
+            callback_confirm_token: None,
+>>>>>>> deploy
         }
     }
 
@@ -870,6 +952,43 @@ impl QueueApp {
         );
     }
 
+<<<<<<< HEAD
+=======
+    /// Exclusions for the next dispatch round: the ring-timeout/no-answer
+    /// rotation plus THE CALLER'S OWN identity (never self-dispatch — the
+    /// caller device can itself be a registered agent).
+    fn dispatch_exclusions(&self) -> Vec<String> {
+        let mut excluded = self.no_answer_agents.clone();
+        if let Some(id) = &self.caller_agent_id
+            && !excluded.contains(id)
+        {
+            excluded.push(id.clone());
+        }
+        excluded
+    }
+
+    /// Resolve the caller URI to its agent identity once (the caller device
+    /// can itself be a registered agent — self-dispatch: 1003 dialed
+    /// *81support and ACD handed the call BACK to 1003, production
+    /// 2026-11-15). A non-agent caller leaves this empty.
+    async fn resolve_caller_agent_id(&mut self) {
+        if self.caller_agent_id.is_some() {
+            return;
+        }
+        if let Some(registry) = &self.agent_registry
+            && let Some(record) = registry.find_agent_by_uri(&self.caller).await
+        {
+            info!(
+                call_id = %self.call_id,
+                agent_id = %record.agent_id,
+                %self.caller,
+                "Queue: caller is itself a registered agent — excluded from dispatch (no self-dispatch)"
+            );
+            self.caller_agent_id = Some(record.agent_id);
+        }
+    }
+
+>>>>>>> deploy
     /// Remember an agent id this queue entry dialed (for phantom release).
     fn record_attempted_agent(&mut self, agent_id: String) {
         if agent_id.is_empty() {
@@ -1162,7 +1281,11 @@ impl QueueApp {
                 None,
                 &self.call_id,
                 priority,
+<<<<<<< HEAD
                 &self.no_answer_agents,
+=======
+                &self.dispatch_exclusions(),
+>>>>>>> deploy
             )
             .await;
         if uris.is_empty() {
@@ -1180,7 +1303,11 @@ impl QueueApp {
                         None,
                         &self.call_id,
                         priority,
+<<<<<<< HEAD
                         &self.no_answer_agents,
+=======
+                        &self.dispatch_exclusions(),
+>>>>>>> deploy
                     )
                     .await;
             }
@@ -1197,7 +1324,11 @@ impl QueueApp {
                         None,
                         &self.call_id,
                         priority,
+<<<<<<< HEAD
                         &self.no_answer_agents,
+=======
+                        &self.dispatch_exclusions(),
+>>>>>>> deploy
                     )
                     .await;
                 if !candidate.is_empty() {
@@ -1213,14 +1344,28 @@ impl QueueApp {
         }
         // Start a new rotation only after every joined group has had a
         // chance to reserve a candidate that has not already no-answered.
+<<<<<<< HEAD
         if uris.is_empty() && !self.no_answer_agents.is_empty() {
             for group in &poll_groups {
                 uris = registry
                     .resolve_target_with_priority(
+=======
+        // The fresh rotation drops the no-answer exclusions but KEEPS the
+        // caller exclusion — a rotation reset must never dispatch the call
+        // back to the caller's own device (self-dispatch).
+        if uris.is_empty() && !self.no_answer_agents.is_empty() {
+            for group in &poll_groups {
+                uris = registry
+                    .resolve_target_with_exclusions(
+>>>>>>> deploy
                         &format!("skill-group:{group}"),
                         None,
                         &self.call_id,
                         priority,
+<<<<<<< HEAD
+=======
+                        &self.caller_agent_id.iter().cloned().collect::<Vec<_>>(),
+>>>>>>> deploy
                     )
                     .await;
                 if !uris.is_empty() {
@@ -1384,6 +1529,11 @@ impl QueueApp {
 
     /// Start or restart hold music.
     async fn start_hold_music(&mut self, ctrl: &mut CallController) -> anyhow::Result<()> {
+        // A deferred wait-for-callback offer plays INSTEAD of this hold start
+        // (music resumes when the prompt completes).
+        if self.maybe_resume_pending_callback_offer(ctrl).await {
+            return Ok(());
+        }
         if let Some(ref hold) = self.plan.hold
             && let Some(ref audio_file) = hold.audio_file
         {
@@ -1560,6 +1710,11 @@ impl QueueApp {
 
     /// Resolve agents dynamically if agent registry is available.
     async fn resolve_agents(&mut self) {
+        // The caller identity resolves before any registry borrow: the
+        // caller device can itself be a registered agent (self-dispatch —
+        // production 2026-11-15: 1003 dialed *81support and ACD handed the
+        // call BACK to 1003) and every dispatch round must exclude it.
+        self.resolve_caller_agent_id().await;
         if let Some(ref registry) = self.agent_registry {
             let queue_id = self.config.name.as_str();
 
@@ -1586,8 +1741,27 @@ impl QueueApp {
             {
                 let priority = crate::call::clamp_priority_u32_to_i32(self.config.priority);
                 let target = format!("skill-group:{}", skill_group);
+<<<<<<< HEAD
                 let uris = registry
                     .resolve_target_with_priority(&target, None, &self.call_id, priority)
+=======
+                // dial-time exclusion: never self-dispatch — the caller's own device is
+                // excluded from the offer set (the caller device can itself be
+                // a registered agent).
+                let caller_exclusion = self
+                    .caller_agent_id
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let uris = registry
+                    .resolve_target_with_exclusions(
+                        &target,
+                        None,
+                        &self.call_id,
+                        priority,
+                        &caller_exclusion,
+                    )
+>>>>>>> deploy
                     .await;
                 if !uris.is_empty() {
                     let locations: Vec<Location> = uris
@@ -1902,6 +2076,17 @@ impl QueueApp {
         ctrl: &mut CallController,
         reason: AgentUnavailableReason,
     ) -> anyhow::Result<AppAction> {
+        // The wait-for-callback confirm chain owns the call — skip the
+        // abandon bookkeeping AND the fallback prompts entirely (the caller
+        // asked to be called back; playing "all agents busy" and hanging up
+        // would contradict the just-accepted request).
+        if self.callback_owns_call() {
+            debug!(
+                queue = %self.config.name,
+                "Queue: callback requested — skipping agent-unavailable fallback"
+            );
+            return Ok(AppAction::Continue);
+        }
         let queue_id = self.config.name.clone();
         let wait_secs = self.enqueued_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let abandon_log = match reason {
@@ -2082,12 +2267,26 @@ impl QueueApp {
             else {
                 break;
             };
+<<<<<<< HEAD
+=======
+            // dial-time exclusion: the caller's own device sits in the
+            // plan when the ACD reserved the caller before this app
+            // started (the caller device can itself be a registered
+            // agent - production 2026-11-15: 1003 dialed *81support and
+            // was handed back to itself). Never ring the caller.
+            let next_agent_id = self.agent_id_for_uri(&next_uri).await;
+            let is_the_caller = self
+                .caller_agent_id
+                .as_ref()
+                .is_some_and(|caller| next_agent_id == *caller);
+>>>>>>> deploy
             let availability = match self.agent_registry {
                 Some(ref registry) => {
                     Self::agent_availability(registry.as_ref(), &next_uri, &self.call_id).await
                 }
                 None => None,
             };
+<<<<<<< HEAD
             let skip = match availability {
                 Some(available) => !available,
                 None => ctrl.is_offline_local_user(&next_uri).await,
@@ -2096,6 +2295,17 @@ impl QueueApp {
                 break;
             }
             info!(agent = %next_uri, ?availability, "Queue: skipping agent (no longer available)");
+=======
+            let skip = is_the_caller
+                || match availability {
+                    Some(available) => !available,
+                    None => ctrl.is_offline_local_user(&next_uri).await,
+                };
+            if !skip {
+                break;
+            }
+            info!(call_id = %self.call_id, agent = %next_uri, caller_excluded = is_the_caller, ?availability, "Queue: skipping agent (caller exclusion or no longer available)");
+>>>>>>> deploy
             self.current_agent_idx += 1;
             self.dial_attempts += 1;
             // A skipped agent must not be offered again on the retry round:
@@ -2137,7 +2347,11 @@ impl QueueApp {
                     None,
                     &self.call_id,
                     crate::call::clamp_priority_u32_to_i32(self.config.priority),
+<<<<<<< HEAD
                     &self.no_answer_agents,
+=======
+                    &self.dispatch_exclusions(),
+>>>>>>> deploy
                 )
                 .await;
             info!(call_id = %self.call_id, skill_group = %group, excluded_agent_ids = ?self.no_answer_agents,
@@ -2422,7 +2636,11 @@ impl QueueApp {
                                     &self.call_id,
                                     step.fair,
                                     include_primary,
+<<<<<<< HEAD
                                     &self.no_answer_agents,
+=======
+                                    &self.dispatch_exclusions(),
+>>>>>>> deploy
                                 )
                                 .await
                         }
@@ -2734,6 +2952,14 @@ impl CallApp for QueueApp {
         let queue_id = self.config.name.clone();
         info!(call_id = %self.call_id, queue = %queue_id, "Queue: entering queue application");
         self.caller = ctx.call_info.caller.clone();
+<<<<<<< HEAD
+=======
+        // The caller's extension may itself be a registered agent (a helpdesk
+        // line staffed by the same people who call it). Resolve the identity
+        // once so every dispatch round can exclude the caller's own device.
+        self.caller_agent_id = None;
+        self.resolve_caller_agent_id().await;
+>>>>>>> deploy
         self.state = QueueState::Answering;
         self.enqueued_at = Some(Instant::now());
         self.transfer_prompt_enabled = ctx.config.proxy.queue_transfer_prompt_enabled;
@@ -2755,6 +2981,36 @@ impl CallApp for QueueApp {
                 ctrl.set_timeout("escalation_check", delay);
             }
         }
+
+<<<<<<< HEAD
+        // Notify external systems that the call entered the queue. Skipped
+        // when `SipSession::start_queue_app` already broadcast `queue_joined`
+        // before agent resolution (strict "joined first" ordering); the app
+        // only emits it here when it was started without that preparation.
+        if !self.joined_emitted_externally {
+            let groups = self.all_skill_groups();
+            self.emit_rwi(&crate::rwi::event::QueueJoined {
+                call_id: self.call_id.clone(),
+                queue_id: queue_id.clone(),
+                skill_groups: if groups.is_empty() {
+                    None
+                } else {
+                    Some(groups)
+                },
+                // Absent == 0 so default-priority flows keep the exact same
+                // wire payload as before the field existed.
+                priority: (self.config.priority != 0).then_some(self.config.priority),
+                // First join of this entry — re-joins after an agent miss
+                // carry attempt >= 2 (see `emit_queue_rejoined`).
+                attempt: None,
+                agent_id: None,
+            });
+        }
+
+=======
+        // Arm the one-shot wait-for-callback offer timer (feature default
+        // OFF; see `queue_callback.rs` for the chain).
+        self.arm_callback_offer_timer(ctrl);
 
         // Notify external systems that the call entered the queue. Skipped
         // when `SipSession::start_queue_app` already broadcast `queue_joined`
@@ -2780,6 +3036,7 @@ impl CallApp for QueueApp {
             });
         }
 
+>>>>>>> deploy
         // Resolve agents dynamically if skill routing is enabled and the plan
         // carries no resolved list yet. A skill-group target is resolved (and
         // its primary agent reserved) *before* the queue app starts, and the
@@ -3046,8 +3303,14 @@ impl CallApp for QueueApp {
         _ctrl: &mut CallController,
         _ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
+<<<<<<< HEAD
         // DTMF during queue hold is ignored (callback feature removed).
         Ok(AppAction::Continue)
+=======
+        // Queue hold DTMF: only the wait-for-callback key is consumed
+        // (default-off feature — everything is ignored unless enabled).
+        self.handle_callback_dtmf(&digit, ctrl).await
+>>>>>>> deploy
     }
 
     async fn on_audio_complete(
@@ -3150,6 +3413,14 @@ impl CallApp for QueueApp {
                     return Ok(AppAction::Continue);
                 }
                 return self.execute_fallback(ctrl).await;
+<<<<<<< HEAD
+=======
+            }
+            QueueState::PlayingCallbackOffer | QueueState::PlayingCallbackConfirm => {
+                // The chain owns the continuation (hold resume, or the
+                // finalize action — BySystem hangup).
+                return self.handle_callback_audio_complete(ctrl, &track_id).await;
+>>>>>>> deploy
             }
             _ => {}
         }
@@ -3178,6 +3449,12 @@ impl CallApp for QueueApp {
                     if self.call_already_connected() {
                         return Ok(AppAction::Continue);
                     }
+<<<<<<< HEAD
+=======
+                    // A real connection overtakes any pending wait-for-callback
+                    // request (task must not be created for a served call).
+                    self.callback_reset_on_connect();
+>>>>>>> deploy
                     {
                         let agent_leg = leg_id.clone().or_else(|| {
                             self.pending_agents
@@ -3722,6 +3999,20 @@ impl CallApp for QueueApp {
                     .await
             }
             "max_wait_timeout" => {
+<<<<<<< HEAD
+=======
+                // Wait-for-callback confirm chain owns the call — the
+                // fallback must not run while a request is pending (defer
+                // one re-check tick at a time). After the chain finalizes the
+                // session is already exiting via the BySystem hangup.
+                if self.callback_requested && !self.callback_finalized {
+                    ctrl.set_timeout("max_wait_timeout", Duration::from_secs(2));
+                    return Ok(AppAction::Continue);
+                }
+                if self.callback_finalized {
+                    return Ok(AppAction::Continue);
+                }
+>>>>>>> deploy
                 // Escalation (overflow) steps still pending? The wall-clock
                 // max_wait doubles as the escalation threshold when the plan
                 // is synthesized from a skill group's `max_wait_secs`, so the
@@ -3808,6 +4099,10 @@ impl CallApp for QueueApp {
                 }
                 Ok(AppAction::Continue)
             }
+            id if id == callback::CALLBACK_OFFER_TIMER => {
+                self.on_callback_offer_timeout(ctrl).await;
+                Ok(AppAction::Continue)
+            }
             _ => Ok(AppAction::Continue),
         }
     }
@@ -3838,7 +4133,11 @@ impl CallApp for QueueApp {
                 connected_agent: Some(_)
             }
         );
+<<<<<<< HEAD
         if !was_connected && !self.abandoned_recorded {
+=======
+        if !was_connected && !self.abandoned_recorded && !self.callback_finalized {
+>>>>>>> deploy
             self.abandoned_recorded = true;
             let queue_id = self.config.name.clone();
             // Notify the skill-group dispatcher that the call was abandoned
@@ -3867,3 +4166,47 @@ impl CallApp for QueueApp {
         Ok(())
     }
 }
+<<<<<<< HEAD
+=======
+
+#[cfg(test)]
+mod caller_exclusion_tests {
+    use super::*;
+
+    /// dial-time exclusion (production 2026-11-15): the caller device can itself be a
+    /// registered agent (1003 dialed *81support and ACD handed the call BACK
+    /// to 1003 — the customer talked to themselves and the subsequent
+    /// single-step transfer from that self-dispatched state dropped the
+    /// whole call). `dispatch_exclusions` must carry the caller's own
+    /// identity on every dispatch round; a non-agent caller adds nothing.
+    #[test]
+    fn dispatch_exclusions_carry_the_caller_agent_identity() {
+        let mut app = QueueApp::new(QueuePlan::default(), QueueConfig {
+            name: "sg_self".into(),
+            ..Default::default()
+        });
+        app.caller = "sip:1003@pbx.ruzhila.cn".into();
+        app.caller_agent_id = Some("1003".into());
+        app.no_answer_agents = vec!["1001".into()];
+
+        let excluded = app.dispatch_exclusions();
+        assert!(
+            excluded.contains(&"1003".to_string()),
+            "the caller's own identity must be excluded from dispatch"
+        );
+        assert!(
+            excluded.contains(&"1001".to_string()),
+            "the no-answer rotation exclusions ride along"
+        );
+
+        // A non-agent caller: only the rotation exclusions.
+        let mut app = QueueApp::new(QueuePlan::default(), QueueConfig {
+            name: "sg_self".into(),
+            ..Default::default()
+        });
+        app.no_answer_agents = vec!["1001".into()];
+        let excluded = app.dispatch_exclusions();
+        assert_eq!(excluded, vec!["1001".to_string()]);
+    }
+}
+>>>>>>> deploy

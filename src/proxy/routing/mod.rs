@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use ipnet::IpNet;
 use regex::Regex;
 use rsipstack::sip::prelude::HeadersExt;
-use rsipstack::sip::{StatusCode, Uri};
+use rsipstack::sip::{Host, StatusCode, Uri};
 use rsipstack::transport::SipAddr;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -154,8 +154,30 @@ pub struct TrunkConfig {
     /// Disabled when unset, independently of authentication credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_p_asserted_identity: Option<bool>,
+<<<<<<< HEAD
+=======
+    /// Whether this trunk's UA executes REFER-with-Replaces (the standard
+    /// attended-transfer transferee role: receive REFER(Refer-To with
+    /// Replaces) → dial the Refer-To target with the Replaces header →
+    /// release the replaced dialog). Defaults to true (PSTN/SBC and modern
+    /// UA behaviour); set false for trunks that do not implement the
+    /// transferee role — their attended transfers fall back to the
+    /// server-side transfer room.
+    #[serde(default = "default_refer_replaces")]
+    pub refer_replaces: bool,
+>>>>>>> deploy
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id_mode: Option<CallIdMode>,
+    /// Session-id correlation header for THIS trunk, both directions.
+    /// Inbound: INVITEs from this trunk adopt the global session id from
+    /// this header (verbatim, top priority after cluster child-leg
+    /// adoption — outranks the standard `Session-ID` header and Call-ID
+    /// reuse). Outbound: INVITEs routed to this trunk stamp the header with
+    /// the current session id. Values follow `normalize_custom` rules
+    /// (non-empty, ≤120 chars, `A-Za-z0-9._@-`). Unset → the global
+    /// `[proxy].session_id_default_header` applies (if set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_header: Option<String>,
 
     // SBC Health Check
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -368,6 +390,7 @@ fn header_name_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+<<<<<<< HEAD
 /// Parse a trunk destination into `(host, port)`. Handles both SIP URIs and
 /// bare `host:port` strings.
 pub fn trunk_dest_host_port(dest: &str) -> Option<(String, u16)> {
@@ -393,6 +416,43 @@ pub fn trunk_dest_host_port(dest: &str) -> Option<(String, u16)> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(5060);
     Some((host.to_string(), port))
+=======
+/// Return the address after a case-insensitive `sip:` or `sips:` prefix.
+pub fn strip_sip_scheme(value: &str) -> Option<&str> {
+    let (scheme, address) = value.split_once(':')?;
+    (scheme.eq_ignore_ascii_case("sip") || scheme.eq_ignore_ascii_case("sips"))
+        .then_some(address)
+}
+
+/// Parse an explicit SIP URI or normalize a bare trunk address to SIP.
+pub fn parse_trunk_uri(dest: &str) -> Result<Uri> {
+    let dest = dest.trim();
+    let address = dest
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(dest)
+        .trim();
+    let uri = if strip_sip_scheme(address).is_some() {
+        Uri::try_from(address)
+    } else if let Some((scheme, rest)) = address.split_once(':')
+        && rest.starts_with("//")
+    {
+        return Err(anyhow!("unsupported SIP URI scheme '{scheme}'"));
+    } else {
+        // A generic URI parser can read the hostname in `host:port` as a scheme.
+        Uri::try_from(format!("sip:{address}"))
+    };
+    uri.map_err(|err| anyhow!("invalid SIP URI '{dest}': {err}"))
+}
+
+/// Parse a trunk destination into `(host, port)`, defaulting to port 5060.
+pub fn trunk_dest_host_port(dest: &str) -> Option<(String, u16)> {
+    let uri = parse_trunk_uri(dest).ok()?;
+    Some((
+        uri.host().to_string(),
+        uri.host_with_port.port.map(|port| port.0).unwrap_or(5060),
+    ))
+>>>>>>> deploy
 }
 
 /// Find a trunk whose destination matches `host:port` (case-insensitive host).
@@ -569,6 +629,10 @@ fn default_rewrite_hostport() -> bool {
     true
 }
 
+fn default_refer_replaces() -> bool {
+    true
+}
+
 impl Default for TrunkConfig {
     fn default() -> Self {
         Self {
@@ -580,6 +644,7 @@ impl Default for TrunkConfig {
             password: None,
             codec: Vec::new(),
             disabled: None,
+            refer_replaces: true,
             max_calls: None,
             concurrent_call_limiter: None,
             max_cps: None,
@@ -600,6 +665,7 @@ impl Default for TrunkConfig {
             rewrite_hostport: true,
             send_p_asserted_identity: None,
             call_id_mode: None,
+            session_id_header: None,
             health_check_enabled: None,
             health_check_per_ip: None,
             health_check_interval_secs: None,
@@ -984,7 +1050,11 @@ impl RouteBusyWaitConfig {
             hold_audio: self
                 .hold_audio
                 .clone()
+<<<<<<< HEAD
                 .unwrap_or_else(|| crate::call::DEFAULT_QUEUE_HOLD_AUDIO.to_string()),
+=======
+                .unwrap_or_else(|| crate::call::DEFAULT_QUEUE_WAIT_AUDIO.to_string()),
+>>>>>>> deploy
         }
     }
 }
@@ -1056,8 +1126,41 @@ pub struct RouteQueueConfig {
     pub strategy: RouteQueueStrategyConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_prompts: Option<crate::call::VoicePrompts>,
+    /// Wait-for-callback option. Absent (the default for every existing
+    /// spec) = disabled — the queue behaves exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback: Option<RouteQueueCallbackConfig>,
     #[serde(skip)]
     pub origin: ConfigOrigin,
+}
+
+/// Route-queue spec section for the wait-for-callback option. Only a spec
+/// with `callback.enabled = true` produces a [`crate::call::QueueCallbackConfig`]
+/// on the plan; partial sections fall back to per-field defaults.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
+pub struct RouteQueueCallbackConfig {
+    /// Master switch — `false` / absent = feature off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Queue wait seconds before the option becomes available (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_after_secs: Option<u64>,
+    /// DTMF key that requests the callback (default `"2"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dtmf_key: Option<String>,
+}
+
+impl RouteQueueCallbackConfig {
+    fn to_callback_config(&self) -> crate::call::QueueCallbackConfig {
+        crate::call::QueueCallbackConfig {
+            enabled: true,
+            offer_after_secs: self.offer_after_secs.unwrap_or(30),
+            dtmf_key: self
+                .dtmf_key
+                .clone()
+                .unwrap_or_else(|| "2".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -1140,6 +1243,11 @@ impl RouteQueueConfig {
         }
         plan.voice_prompts = self.voice_prompts.clone();
         plan.queue_name = self.name.clone().unwrap_or_default();
+        plan.callback = self
+            .callback
+            .as_ref()
+            .filter(|cb| cb.enabled)
+            .map(RouteQueueCallbackConfig::to_callback_config);
         Ok(plan)
     }
 
@@ -1276,15 +1384,15 @@ async fn candidate_matches(candidate: &str, addr: &IpAddr) -> bool {
         return ip == *addr;
     }
 
-    if let Ok(uri) = rsipstack::sip::Uri::try_from(trimmed) {
-        return host_matches(&uri.host_with_port.host.to_string(), addr).await;
+    let Ok(uri) = parse_trunk_uri(trimmed) else {
+        return false;
+    };
+    match uri.host_with_port.host {
+        Host::IpAddr(ip) => ip == *addr,
+        Host::Domain(host) => lookup_host((host.0.as_str(), 0))
+            .await
+            .is_ok_and(|mut addrs| addrs.any(|resolved| resolved.ip() == *addr)),
     }
-
-    if let Some((host, _)) = split_host_port(trimmed) {
-        return host_matches(host, addr).await;
-    }
-
-    host_matches(trimmed, addr).await
 }
 
 /// Public helper to validate whether a candidate host definition resolves to the provided IP.
@@ -1297,57 +1405,10 @@ pub fn source_addr_ip(source_addr: &SipAddr) -> Option<IpAddr> {
     Some(ip)
 }
 
-async fn host_matches(host: &str, addr: &IpAddr) -> bool {
-    let cleaned = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim();
-
-    if cleaned.is_empty() {
-        return false;
-    }
-
-    if let Ok(network) = cleaned.parse::<IpNet>() {
-        return network.contains(addr);
-    }
-
-    if let Ok(socket) = cleaned.parse::<SocketAddr>() {
-        return socket.ip() == *addr;
-    }
-
-    if let Ok(ip) = cleaned.parse::<IpAddr>() {
-        return ip == *addr;
-    }
-
-    let lookup_target = match split_host_port(cleaned) {
-        Some((host_part, _)) => host_part.to_string(),
-        None => cleaned.to_string(),
-    };
-
-    match lookup_host((lookup_target.as_str(), 0)).await {
-        Ok(addrs) => addrs.into_iter().any(|resolved| resolved.ip() == *addr),
-        Err(_) => false,
-    }
-}
-
-fn split_host_port(input: &str) -> Option<(&str, &str)> {
-    if let Some(end) = input.find(']')
-        && input.starts_with('[')
-        && input.len() > end + 1
-        && input[end + 1..].starts_with(':')
-    {
-        return Some((&input[1..end], &input[end + 2..]));
-    }
-
-    if let Some(idx) = input.rfind(':') {
-        if input[..idx].contains(':') {
-            return None;
-        }
-        return Some((&input[..idx], &input[idx + 1..]));
-    }
-
-    None
+pub fn source_addr_ip_port(source_addr: &SipAddr) -> Option<(IpAddr, Option<u16>)> {
+    let ip = source_addr_ip(source_addr)?;
+    let port = source_addr.addr.port.map(|p| p.0);
+    Some((ip, port))
 }
 
 fn matches_user_prefix(pattern: &str, value: &str) -> bool {
@@ -1437,10 +1498,90 @@ fn split_via_values(raw: &str) -> Vec<&str> {
     entries
 }
 
+pub fn extract_trusted_addr(
+    tx: &rsipstack::transaction::transaction::Transaction,
+    trusted_proxies: &[IpNet],
+) -> Option<(IpAddr, Option<u16>)> {
+    let (socket_ip, socket_port) = tx
+        .connection
+        .as_ref()
+        .and_then(|conn| conn.get_remote_addr())
+        .and_then(source_addr_ip_port)?;
+
+    if trusted_proxies.is_empty() || !ip_matches_trusted(&socket_ip, trusted_proxies) {
+        return Some((socket_ip, socket_port));
+    }
+
+    // A SIP proxy prepends its own Via. Once the transport peer has been
+    // verified as trusted, the next Via hop represents the source that sent
+    // the request to that proxy. Via values may be comma-separated or carried
+    // in separate header fields, so preserve their wire order across both
+    // representations.
+    let entries: Vec<&str> = tx
+        .original
+        .headers
+        .iter()
+        .filter_map(|header| match header {
+            rsipstack::sip::Header::Via(via) => Some(via.value()),
+            _ => None,
+        })
+        .flat_map(split_via_values)
+        .collect();
+    let Some(entry) = entries.get(1) else {
+        tracing::debug!(
+            %socket_ip,
+            via_count = entries.len(),
+            "trusted proxy request has no forwarded Via hop; using transport source"
+        );
+        return Some((socket_ip, socket_port));
+    };
+
+    let typed = match rsipstack::sip::headers::typed::Via::parse(entry) {
+        Ok(via) => via,
+        Err(error) => {
+            tracing::debug!(
+                %socket_ip,
+                %error,
+                "trusted proxy forwarded Via is malformed; using transport source"
+            );
+            return Some((socket_ip, socket_port));
+        }
+    };
+    let received_ip = typed.received().and_then(Result::ok);
+    let sent_by_ip: Option<IpAddr> = typed.sent_by().host.clone().try_into().ok();
+    let Some(source_ip) = received_ip.or(sent_by_ip) else {
+        tracing::debug!(
+            %socket_ip,
+            sent_by = %typed.sent_by(),
+            "trusted proxy forwarded Via has no IP address; using transport source"
+        );
+        return Some((socket_ip, socket_port));
+    };
+    let source_port = Some(
+        typed
+            .rport()
+            .and_then(|r| r)
+            .or_else(|| typed.sent_by().port.map(|p| p.0))
+            .unwrap_or_else(|| typed.transport.default_port().0),
+    );
+
+    tracing::debug!(
+        %socket_ip,
+        %source_ip,
+        ?source_port,
+        via_hop = 2,
+        sent_by = %typed.sent_by(),
+        received = ?received_ip,
+        "trusted proxy source resolved from forwarded Via"
+    );
+    Some((source_ip, source_port))
+}
+
 pub fn extract_trusted_ip(
     tx: &rsipstack::transaction::transaction::Transaction,
     trusted_proxies: &[IpNet],
 ) -> Option<IpAddr> {
+<<<<<<< HEAD
     let socket_ip = tx
         .connection
         .as_ref()
@@ -1506,6 +1647,9 @@ pub fn extract_trusted_ip(
         "trusted proxy source resolved from forwarded Via"
     );
     Some(source_ip)
+=======
+    extract_trusted_addr(tx, trusted_proxies).map(|(ip, _)| ip)
+>>>>>>> deploy
 }
 
 pub fn extract_from_user(origin: &rsipstack::sip::Request) -> Option<String> {
@@ -1530,4 +1674,48 @@ pub fn extract_request_user(origin: &rsipstack::sip::Request) -> Option<String> 
 
 pub fn escape_sip_quoted(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod trunk_dest_tests {
+    use super::trunk_dest_host_port;
+
+    #[test]
+    fn parses_bare_host_port_and_sip_uris() {
+        assert_eq!(
+            trunk_dest_host_port("voip.example.com:5060"),
+            Some(("voip.example.com".to_string(), 5060))
+        );
+        assert_eq!(
+            trunk_dest_host_port("voip.example.com:5080"),
+            Some(("voip.example.com".to_string(), 5080))
+        );
+        assert_eq!(
+            trunk_dest_host_port("sip:voip.example.com:5060"),
+            Some(("voip.example.com".to_string(), 5060))
+        );
+        assert_eq!(
+            trunk_dest_host_port("SIP:user@voip.example.com:5070;transport=tcp"),
+            Some(("voip.example.com".to_string(), 5070))
+        );
+        assert_eq!(
+            trunk_dest_host_port("sips:tls.example.com:5061"),
+            Some(("tls.example.com".to_string(), 5061))
+        );
+        assert_eq!(
+            trunk_dest_host_port("<sip:voip.example.com:5060>"),
+            Some(("voip.example.com".to_string(), 5060))
+        );
+        assert_eq!(
+            trunk_dest_host_port("192.168.1.1:5080"),
+            Some(("192.168.1.1".to_string(), 5080))
+        );
+        assert_eq!(
+            trunk_dest_host_port("[2001:db8::10]:5080"),
+            Some(("[2001:db8::10]".to_string(), 5080))
+        );
+        assert_eq!(trunk_dest_host_port("https://user@voip.example.com"), None);
+        assert_eq!(trunk_dest_host_port("voip.example.com:70000"), None);
+        assert_eq!(trunk_dest_host_port("   "), None);
+    }
 }

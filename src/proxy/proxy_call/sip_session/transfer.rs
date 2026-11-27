@@ -1,14 +1,22 @@
 use super::SipSession;
+<<<<<<< HEAD
+=======
+use super::session::PendingCustomerTransferRelease;
+>>>>>>> deploy
 use crate::call::domain::{CallCommand, LegId, LegState, ReturnAppSpec};
 use crate::media::negotiate::MediaNegotiator;
 use anyhow::{Result, anyhow};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use rsipstack::dialog::dialog::DialogState;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+<<<<<<< HEAD
 use std::collections::HashMap;
+=======
+use std::collections::{BTreeMap, HashMap};
+>>>>>>> deploy
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +96,163 @@ fn take_bridge_pcm_frame(
     None
 }
 
+<<<<<<< HEAD
+=======
+/// Decoded result of one inbound RTP packet in `voip_bridge`'s reverse loop.
+#[derive(Debug, PartialEq, Eq)]
+enum ReverseAudio<'a> {
+    /// Active speech PCM at `target_sample_rate`. When `enter_silence` is true,
+    /// the last 10 ms is a G.729 Annex B SID rendered as zeros.
+    Speech {
+        samples: &'a [i16],
+        enter_silence: bool,
+    },
+    /// Explicit DTX / comfort-noise packet (G.729B 2-byte SID, RFC 3389 PT 13
+    /// CN, Opus 1-byte TOC) — emit 20 ms digital silence frames until the next
+    /// active speech packet arrives.
+    Silence,
+}
+
+/// Per-packet dynamic audio decoder + FIR resampler for `voip_bridge`'s reverse loop.
+///
+/// Resolves each packet's RTP payload type by static RFC 3551 audio PT
+/// (`0` PCMU, `8` PCMA, `9` G.722, `18` G.729) first, then dynamic PT (`>= 96`)
+/// via `audio_pt_map` (negotiated answer overriding offer), decoding and
+/// resampling into reusable buffers with `BoxedResampler::resample_into`.
+struct BridgeReverseDecoder {
+    audio_pt_map: BTreeMap<u8, audio_codec::CodecType>,
+    decoders: HashMap<u8, Box<dyn audio_codec::Decoder>>,
+    target_sample_rate: u32,
+    resampler: Option<(u32, audio_codec::BoxedResampler)>,
+    decode_buf: Vec<i16>,
+    resample_buf: Vec<i16>,
+}
+
+impl BridgeReverseDecoder {
+    fn new(
+        negotiated_audio: Option<(u8, audio_codec::CodecType)>,
+        mut audio_pt_map: BTreeMap<u8, audio_codec::CodecType>,
+        target_sample_rate: u32,
+    ) -> Self {
+        let mut decoders = HashMap::new();
+        if let Some((pt, codec)) = negotiated_audio {
+            audio_pt_map.insert(pt, codec);
+            decoders.insert(codec.payload_type(), audio_codec::create_decoder(codec));
+        }
+        Self {
+            audio_pt_map,
+            decoders,
+            target_sample_rate,
+            resampler: None,
+            decode_buf: vec![0i16; 4096],
+            resample_buf: vec![0i16; 4096],
+        }
+    }
+
+    fn resolve_codec(&self, pt: u8) -> Option<audio_codec::CodecType> {
+        // Static RFC 3551 audio PTs (0=PCMU, 8=PCMA, 9=G722, 18=G729) first.
+        if pt < 96 {
+            return audio_codec::CodecType::try_from(pt)
+                .ok()
+                .filter(|c| c.is_audio() && !c.is_dynamic());
+        }
+        // Dynamic PTs (>= 96): answer overrides offer in `audio_pt_map`; DTMF/unknown → None.
+        self.audio_pt_map.get(&pt).copied()
+    }
+
+    /// Decode an inbound RTP payload and resample to `target_sample_rate`.
+    ///
+    /// Explicit DTX / comfort-noise packets (G.729 Annex B 2-byte SID, RFC 3389
+    /// PT 13 CN, Opus short DTX markers) return `Some(ReverseAudio::Silence)` so the
+    /// reverse loop's 20 ms silence timer fills digital zeros until active
+    /// speech resumes. DTMF and unknown PTs return `None`.
+    fn decode(&mut self, pt: u8, data: &[u8]) -> Option<ReverseAudio<'_>> {
+        // RFC 3389 narrowband Comfort Noise (static PT 13).
+        if pt == 13 {
+            return Some(ReverseAudio::Silence);
+        }
+        let codec = self.resolve_codec(pt)?;
+        let opus_dtx = codec == audio_codec::CodecType::Opus
+            && codec.is_silence_frame(data)
+            && short_opus_dtx(data)?;
+        let decoder = self
+            .decoders
+            .entry(codec.payload_type())
+            .or_insert_with(|| audio_codec::create_decoder(codec));
+        if opus_dtx {
+            // Keep the current channel count so an empty packet cannot reset the decoder.
+            let stereo_bit = u8::from(decoder.channels() == 2) << 2;
+            let marker = [
+                (data[0] & !0x04) | stereo_bit,
+                data.get(1).copied().unwrap_or(0),
+            ];
+            // Update decoder state when possible. Valid markers can exceed its 20 ms buffer.
+            let _ = decoder.decode_into(&marker[..data.len()], &mut self.decode_buf);
+            return Some(ReverseAudio::Silence);
+        }
+        let mut written = decoder.decode_into(data, &mut self.decode_buf).ok()?;
+        if decoder.channels() == 2 {
+            // `OpusDecoder::decode_into` outputs interleaved stereo, whereas
+            // `Decoder::decode` downmixes stereo to mono; mirror that in place.
+            let mono_len = written / 2;
+            for i in 0..mono_len {
+                self.decode_buf[i] =
+                    ((self.decode_buf[2 * i] as i32 + self.decode_buf[2 * i + 1] as i32) / 2)
+                        as i16;
+            }
+            written = mono_len;
+        }
+        // RFC 3551 §4.5.6: an Annex B SID follows any speech frames and
+        // decodes to 80 samples (10 ms). Keep that duration in mixed packets.
+        let has_g729_sid = codec == audio_codec::CodecType::G729 && codec.is_silence_frame(data);
+        let sid_samples = if has_g729_sid { 80 } else { 0 };
+        if written <= sid_samples {
+            return has_g729_sid.then_some(ReverseAudio::Silence);
+        }
+        let speech_samples = written - sid_samples;
+        self.decode_buf[speech_samples..written].fill(0);
+
+        let src_rate = decoder.sample_rate();
+        if src_rate == self.target_sample_rate {
+            return Some(ReverseAudio::Speech {
+                samples: &self.decode_buf[..written],
+                enter_silence: has_g729_sid,
+            });
+        }
+
+        if !matches!(self.resampler, Some((rate, _)) if rate == src_rate) {
+            let r = audio_codec::BoxedResampler::new(
+                src_rate as usize,
+                self.target_sample_rate as usize,
+            )
+            .ok()?;
+            self.resampler = Some((src_rate, r));
+        }
+        let (_, resampler) = self.resampler.as_mut()?;
+        let decoded = &self.decode_buf[..written];
+        let needed = resampler.max_output_samples(decoded.len());
+        if self.resample_buf.len() < needed {
+            self.resample_buf.resize(needed, 0);
+        }
+        let (speech, silence) = decoded.split_at(speech_samples);
+        let mut out_len = resampler
+            .resample_into(speech, &mut self.resample_buf)
+            .ok()?;
+        if has_g729_sid {
+            // Advance the FIR phase through the SID and mute any filter tail.
+            let tail = &mut self.resample_buf[out_len..];
+            let silence_len = resampler.resample_into(silence, tail).ok()?;
+            tail[..silence_len].fill(0);
+            out_len += silence_len;
+        }
+        Some(ReverseAudio::Speech {
+            samples: &self.resample_buf[..out_len],
+            enter_silence: has_g729_sid,
+        })
+    }
+}
+
+>>>>>>> deploy
 /// Classify a reverse-pump failure (`ws_write` send / track recv error) so
 /// end-of-call races do not surface as warnings: the WS peer frequently
 /// closes just before local teardown fires the cancel token, so a failure
@@ -208,6 +373,65 @@ async fn bridge_forward_loop<S>(
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Classify a short Opus packet from its framing (RFC 6716 §3.2).
+/// Invalid framing leaves the current DTX state alone.
+fn short_opus_dtx(data: &[u8]) -> Option<bool> {
+    let (&toc, rest) = data.split_first()?;
+    match (toc & 3, rest) {
+        (0, []) | (1, []) | (2, [0]) | (3, [0x81]) => Some(true),
+        // A coded byte may carry audio even when the whole packet is short.
+        (0, [_]) => Some(false),
+        (3, [count @ 1..=48]) => {
+            // Code 3 can carry multiple empty CBR frames, up to 120 ms total.
+            let config = (toc >> 3) as usize;
+            let frame_duration = match config {
+                0..=11 => [4, 8, 16, 24][config & 3],
+                12..=15 => [4, 8][config & 1],
+                _ => 1 << (config & 3),
+            };
+            (usize::from(*count) * frame_duration <= 48).then_some(true) // 2.5 ms units
+        }
+        _ => None,
+    }
+}
+
+/// Discard stale RTP samples already buffered in a receiver track (e.g. 183
+/// early-media ringtone or pre-bridge IVR/hold audio sitting in `rustrtc`'s
+/// 64-slot ring). Retain G.729 or Opus DTX until a later speech packet clears it.
+fn drain_audio_track(
+    track: &dyn rustrtc::media::MediaStreamTrack,
+    decoder: &BridgeReverseDecoder,
+) -> (usize, bool) {
+    use audio_codec::CodecType;
+    use rustrtc::media::MediaSample;
+
+    let mut drained = 0usize;
+    let mut in_dtx = false;
+    while let Some(Ok(sample)) = track.recv().now_or_never() {
+        drained += 1;
+        if let MediaSample::Audio(frame) = sample
+            && !frame.data.is_empty()
+            && let Some(codec) = frame.payload_type.and_then(|pt| decoder.resolve_codec(pt))
+        {
+            let data = frame.data.as_ref();
+            match codec {
+                CodecType::G729 if codec.is_silence_frame(data) => in_dtx = true,
+                CodecType::G729 if data.len() < 10 => {}
+                CodecType::Opus if codec.is_silence_frame(data) => {
+                    if let Some(opus_dtx) = short_opus_dtx(data) {
+                        in_dtx = opus_dtx;
+                    }
+                }
+                _ => in_dtx = false,
+            }
+        }
+    }
+    (drained, in_dtx)
+}
+
+>>>>>>> deploy
 /// Raw return-app specification extracted from a transfer target's query
 /// string.  Resolved to a concrete [`ReturnAppSpec`] by the transfer handler
 /// (which has access to `data_context` for IVR file resolution).
@@ -808,12 +1032,38 @@ impl SipSession {
     /// stamped with that identity. Falls back to a single agent-stamped leg
     /// (agent-DIALED call: `stamp_caller_agent_identity` marks the caller),
     /// then to the active callee. `None` when no agent leg can be identified.
+<<<<<<< HEAD
     pub(super) fn resolve_cc_agent_leg(&self) -> Option<LegId> {
         let callee = LegId::from("callee");
+=======
+    pub(super) fn resolve_cc_agent_leg(
+        &self,
+        operator_agent: Option<&str>,
+        operator_leg_hint: Option<&str>,
+    ) -> Option<LegId> {
+        let callee = LegId::from("callee");
+        // Priority 0 — the operation NAMES its leg: the CTI request's
+        // `call_id` is the operator's own dialog Call-ID (the agent's leg is
+        // the one the client is on). Exact match only; the `-r{n}` sibling
+        // scheme keeps every leg's dialog id unique.
+        if let Some(hint) = operator_leg_hint
+            && !hint.is_empty()
+            && let Some((id, _)) = self.legs.iter().find(|(id, _)| {
+                id.as_str() == hint
+                    || self
+                        .legs
+                        .get_dialog(id)
+                        .is_some_and(|dialog| dialog.id().call_id == hint)
+            })
+        {
+            return Some(id.clone());
+        }
+>>>>>>> deploy
         let callee_live = self
             .legs
             .get(&callee)
             .is_some_and(|leg| matches!(leg.state, LegState::Connected | LegState::Hold));
+<<<<<<< HEAD
         let served = self
             .pinned_agent_id()
             .or_else(|| self.session_ext_get("agent_id"));
@@ -823,6 +1073,70 @@ impl SipSession {
                 .iter()
                 .find(|(_, leg)| leg.agent_id.as_deref() == Some(agent_id.as_str()))
             {
+=======
+        // Priority 0 — the OPERATOR of the current request: the transferor is
+        // the leg that agent's own client operates on. Identity match (leg
+        // stamp, original party, dial endpoint), never positional roles: an
+        // A2A session's CC attribution may name the callee, and the agent on
+        // an agent-dialed call IS the caller.
+        if let Some(operator) = operator_agent
+            && let Some((id, _)) = self
+                .legs
+                .iter()
+                .find(|(id, leg)| {
+                    leg.agent_id.as_deref() == Some(operator)
+                        || leg
+                            .endpoint
+                            .as_deref()
+                            .and_then(Self::uri_user_part)
+                            .is_some_and(|user| user == operator)
+                        || (id.as_str() == "caller"
+                            && Self::uri_user_part(&self.context.original_caller)
+                                .is_some_and(|user| user == operator))
+                        || (id.as_str() == "callee"
+                            && Self::uri_user_part(&self.context.original_callee)
+                                .is_some_and(|user| user == operator))
+                })
+        {
+            return Some(id.clone());
+        }
+        let served = self
+            .pinned_agent_id()
+            .or_else(|| self.session_ext_get("agent_id"));
+        // An INBOUND session's caller leg is the CUSTOMER dialog — even when
+        // the customer device is itself a registered agent (SELF-DISPATCH:
+        // 1003 dialed *81support and ACD handed the call BACK to 1003, whose
+        // device is a support agent). The LegConnected endpoint stamp still
+        // pins agent_id on that customer leg, which used to make the
+        // served-agent match below release THE CUSTOMER on single-step
+        // transfer (production 2026-11-15: the whole call dropped).
+        let inbound_caller_is_customer = self.context.dialplan.direction
+            == crate::call::DialDirection::Inbound;
+        if let Some(agent_id) = served {
+            if let Some((id, _)) = self.legs.iter().find(|(id, leg)| {
+                !(inbound_caller_is_customer && id.as_str() == "caller")
+                    && leg.agent_id.as_deref() == Some(agent_id.as_str())
+            }) {
+                return Some(id.clone());
+            }
+            // The served agent's OWN dialog (agent-DIALED call): the caller
+            // leg carries the agent's AOR as its endpoint and usually has no
+            // `agent_id` stamp (the stamp happens on the callee answer path,
+            // which belongs to the customer here). Resolve by endpoint
+            // identity BEFORE the callee fallback — otherwise the customer's
+            // leg is mistaken for the agent leg and a blind transfer releases
+            // the customer instead of the transferor (production 2026-11-14
+            // outbound-direction single-step transfer: customer torn down, the
+            // agent stayed bridged to the target).
+            if let Some((id, _)) = self.legs.iter().find(|(id, leg)| {
+                !(inbound_caller_is_customer && id.as_str() == "caller")
+                    && leg
+                        .endpoint
+                        .as_deref()
+                        .and_then(Self::uri_user_part)
+                        .is_some_and(|user| user == agent_id.as_str())
+            }) {
+>>>>>>> deploy
                 return Some(id.clone());
             }
             // The served agent IS the active callee (classic inbound / queue).
@@ -834,7 +1148,14 @@ impl SipSession {
         let mut agent_legs = self
             .legs
             .iter()
+<<<<<<< HEAD
             .filter(|(_, leg)| leg.agent_id.is_some())
+=======
+            .filter(|(id, leg)| {
+                !(inbound_caller_is_customer && id.as_str() == "caller")
+                    && leg.agent_id.is_some()
+            })
+>>>>>>> deploy
             .map(|(id, _)| id.clone());
         let first = agent_legs.next();
         if first.is_some() && agent_legs.next().is_none() {
@@ -845,9 +1166,17 @@ impl SipSession {
     }
 
     /// The CUSTOMER leg (the party that keeps talking) for a customer-anchored
+<<<<<<< HEAD
     /// transfer: the caller/callee leg opposite the resolved agent leg.
     /// Queue-dispatched agents dial into DYNAMIC legs (`LegPurpose::Agent`),
     /// so for those the customer is the other side of the active bridge pair.
+=======
+    /// transfer: **the transferor's CURRENT bridge peer** — the operation acts
+    /// on the live bridge pair, never on positional slots. Positional
+    /// caller/callee roles invert the parties on agent-dialed calls (the agent
+    /// IS the caller there), so they are only a last-resort fallback when no
+    /// bridge is armed.
+>>>>>>> deploy
     ///
     /// The peer must be a LIVE party (Connected/Hold): a slot-only or
     /// not-yet-established entry is nobody to hand off. The consult-into-queue
@@ -862,12 +1191,19 @@ impl SipSession {
                 matches!(leg.state, LegState::Connected | LegState::Hold)
             })
         };
+<<<<<<< HEAD
         let caller = LegId::from("caller");
         let callee = LegId::from("callee");
         if agent_leg == &caller || agent_leg == &callee {
             let customer = if agent_leg == &caller { callee } else { caller };
             return live(&customer).then_some(customer);
         }
+=======
+        // 1) The transferor's bridge peer — the party it is actually talking
+        // to right now (both directions resolve the same way: caller-slot
+        // agent on agent-dialed calls, callee-slot / dynamic agent on
+        // queue-dispatched ones).
+>>>>>>> deploy
         if self.bridge.legs.len() == 2 && self.bridge.contains_leg(agent_leg) {
             if let Some(peer) = self
                 .bridge
@@ -878,6 +1214,19 @@ impl SipSession {
                 return Some(peer.clone());
             }
         }
+<<<<<<< HEAD
+=======
+        // 2) Positional fallback only when no bridge is armed (the transfer
+        // arrived between bridge re-configurations). Classic inbound keeps
+        // working (customer == caller); agent-dialed calls reach here only in
+        // the degenerate no-bridge window.
+        let caller = LegId::from("caller");
+        let callee = LegId::from("callee");
+        if agent_leg == &caller || agent_leg == &callee {
+            let customer = if agent_leg == &caller { callee } else { caller };
+            return live(&customer).then_some(customer);
+        }
+>>>>>>> deploy
         None
     }
 
@@ -919,7 +1268,11 @@ impl SipSession {
         // The transferor: the CC-attributed AGENT leg, regardless of which
         // slot it occupies (caller on agent-dialed calls, callee/dynamic on
         // queue-dispatched ones).
+<<<<<<< HEAD
         let agent_leg = self.resolve_cc_agent_leg()?;
+=======
+        let agent_leg = self.resolve_cc_agent_leg(None, None)?;
+>>>>>>> deploy
         if !self
             .legs
             .get(&agent_leg)
@@ -2275,8 +2628,18 @@ impl SipSession {
     }
 
     /// Dial the transfer target as an independent leg anchored on the
+<<<<<<< HEAD
     /// customer, release the agent, and bridge customer ↔ target. Shared by
     /// every [`Self::handle_customer_blind_transfer_sip`] dial outcome.
+=======
+    /// customer and bridge customer ↔ target; the transferring agent is
+    /// released when the target ANSWERS (see
+    /// `PendingCustomerTransferRelease`), not at dial time — a dispatch-time
+    /// BYE races the target leg's setup on its home node (cluster child
+    /// teardown cancels a sibling dial still in setup) and a failed dial
+    /// must keep the call alive. Shared by every
+    /// [`Self::handle_customer_blind_transfer_sip`] dial outcome.
+>>>>>>> deploy
     async fn dial_customer_transfer_leg(
         &mut self,
         agent_leg: &LegId,
@@ -2310,6 +2673,38 @@ impl SipSession {
                 target,
             ])
             .await;
+<<<<<<< HEAD
+=======
+        // dial-time exclusion: the transfer target agent in break (Away) or after-call work
+        // (Wrapup) must not be rung — refuse BEFORE the dial and BEFORE the
+        // transferor release, so the original customer↔agent call is fully
+        // preserved and the CTI API reports the failure to the transferor
+        // (production 2026-11-16: consulted agents must not be dialed). Non-agent targets and
+        // dispatchable (Idle) targets pass.
+        if let Some(target_agent_id) = &target_agent
+            && let Some(registry) = self.server.agent_registry.as_ref()
+            && let Some(refused_agent) = registry.unavailable_transfer_target(target_agent_id).await
+        {
+            warn!(
+                session_id = %self.id,
+                target_agent = %refused_agent,
+                "transfer target is on break/after-call work — transfer refused (consulted agents must not be dialed)"
+            );
+            return Err(anyhow::anyhow!(
+                "transfer target {refused_agent} is on break or after-call work"
+            ));
+        }
+        // Canonical event form: a bare extension target ("1003") is reported
+        // as `sip:1003` — URI-shaped like the B2BUA dial path.
+        let target_display = {
+            let t = target.trim();
+            if !t.contains('@') && !t.starts_with("sip:") && !t.starts_with("sips:") {
+                format!("sip:{t}")
+            } else {
+                t.to_string()
+            }
+        };
+>>>>>>> deploy
         self.handle_add_leg_routed(
             target.to_string(),
             Some(target_leg.clone()),
@@ -2319,8 +2714,93 @@ impl SipSession {
             location,
         )
         .await?;
+<<<<<<< HEAD
         self.release_api_transfer_agent_leg(agent_leg).await;
         self.setup_bridge(customer_leg.clone(), target_leg.clone()).await;
+=======
+        // The transferring agent is released when the target ANSWERS
+        // (`complete_pending_customer_transfer` from the leg's LegConnected),
+        // not at dial time: an immediate BYE races the target leg's setup on
+        // its home node — the cluster child teardown triggered by that BYE
+        // cancels a sibling dial still in setup (production 2026-11-14,
+        // cross-node single-step transfer died with 487 before the target
+        // rang). A failed dial restores the customer↔agent bridge instead
+        // (`abort_pending_customer_transfer`), so a failed transfer keeps
+        // the call alive.
+        self.pending_customer_transfer_release = Some(PendingCustomerTransferRelease {
+            agent_leg: agent_leg.clone(),
+            customer_leg: customer_leg.clone(),
+            target_leg: target_leg.clone(),
+            target_display: target_display.clone(),
+            transfer_source: source.clone(),
+            attribution_handed_over: false,
+        });
+        // The bridge defers until the target leg negotiates; LegConnected
+        // re-runs it for the answered pair (the media pair is REGISTERED
+        // here, before the transferor leaves — a removal re-running the
+        // media path must see the pair or it clears the route).
+        self.setup_bridge(customer_leg.clone(), target_leg.clone()).await;
+        // 发起即释放 — standard blind-transfer semantics, RESTORED (accepted
+        // 2026-10-13): the transferor exits at DIAL time; the target rings
+        // with no take-back. The races that forced the 11-14 deferral are
+        // guarded at their actual sites now:
+        //   - the pending_hangup alias fallback skips while this pending is
+        //     set, so a drain round cannot CANCEL the in-flight target dial;
+        //   - the release's termination echo no longer tears the session
+        //     down (the caller-leg + callee-dialog transferred guards);
+        //   - the CC hook admits the stamped TARGET leg's instant-answer
+        //     connect (the wrapup late-answer rebind), so the ACW agent
+        //     goes Busy on the transferred answer.
+        // The ATTRIBUTION hand-over stays on the target's answer edge (the
+        // CC hook reads the session pin when the leg connects — the target
+        // leg has no agent stamp at dial time).
+        self.release_api_transfer_agent_leg(agent_leg).await;
+        self.emit_typed_rwi_event(&crate::rwi::CallTransferred {
+            call_id: self.context.session_id.to_string(),
+            transfer_target: Some(target_display.clone()),
+            transfer_target_type: Some("sip".to_string()),
+            transfer_source: source.clone(),
+        });
+        Ok(())
+    }
+
+    /// Consume the pending customer-transfer release if `leg_id` is its
+    /// target leg.
+    pub(super) fn take_pending_customer_transfer_for(
+        &mut self,
+        leg_id: &LegId,
+    ) -> Option<PendingCustomerTransferRelease> {
+        if self
+            .pending_customer_transfer_release
+            .as_ref()
+            .is_some_and(|pending| &pending.target_leg == leg_id)
+        {
+            self.pending_customer_transfer_release.take()
+        } else {
+            None
+        }
+    }
+
+    /// Hand-over HALF of the deferred customer-transfer completion: move the
+    /// session attribution to the target agent BEFORE the leg's answer events
+    /// fire (the per-leg `call_answered` enrichment reads the session
+    /// attribution at emit time — the old dial-time release had already
+    /// re-pinned by that point). Leg/media state is untouched; the releasing
+    /// half (`finish_pending_customer_transfer`) runs once the answer edge
+    /// and the bridge are settled.
+    pub(super) fn begin_pending_customer_transfer(
+        &mut self,
+        mut pending: PendingCustomerTransferRelease,
+    ) -> PendingCustomerTransferRelease {
+        if pending.attribution_handed_over {
+            return pending;
+        }
+        info!(
+            session_id = %self.id,
+            target = %pending.target_display,
+            "customer blind transfer target answered; handing attribution to the target"
+        );
+>>>>>>> deploy
         // The transfer target (independent leg anchored on the customer) owns
         // the call's next stage — the departing agent's attribution stops
         // here; its identity lives on in the stashed `transfer_source`. A
@@ -2330,7 +2810,11 @@ impl SipSession {
         // (→ client_ip) — the blanket clear used to strip the new agent too.
         let target_agent = self
             .legs
+<<<<<<< HEAD
             .get(&target_leg)
+=======
+            .get(&pending.target_leg)
+>>>>>>> deploy
             .and_then(|leg| leg.agent_id.clone());
         self.clear_agent_attribution();
         if let Some(agent) = target_agent {
@@ -2341,6 +2825,7 @@ impl SipSession {
             self.session_ext_set("agent_id", agent);
             self.refresh_rwi_meta();
         }
+<<<<<<< HEAD
         // Canonical event form: a bare extension target ("1003") is reported
         // as `sip:1003` — URI-shaped like the B2BUA dial path.
         let target_event = {
@@ -2358,6 +2843,77 @@ impl SipSession {
             transfer_source: source,
         });
         Ok(())
+=======
+        pending.attribution_handed_over = true;
+        pending
+    }
+
+    /// Releasing HALF of the deferred customer-transfer completion: BYE the
+    /// transferor and emit the canonical `call_transferred` event. Runs AFTER
+    /// the target leg is Connected and the customer↔target bridge is set up —
+    /// removing the transferor re-runs the media-path selection, which must
+    /// see the target leg already established (a Ringing-state target would
+    /// be dropped as the unpaired leg).
+    pub(super) async fn finish_pending_customer_transfer(
+        &mut self,
+        pending: PendingCustomerTransferRelease,
+    ) {
+        info!(
+            session_id = %self.id,
+            target = %pending.target_display,
+            agent_leg = %pending.agent_leg,
+            "customer blind transfer complete; releasing the transferor"
+        );
+        self.release_api_transfer_agent_leg(&pending.agent_leg).await;
+        self.emit_typed_rwi_event(&crate::rwi::CallTransferred {
+            call_id: self.context.session_id.to_string(),
+            transfer_target: Some(pending.target_display),
+            transfer_target_type: Some("sip".to_string()),
+            transfer_source: pending.transfer_source,
+        });
+    }
+
+    /// Target leg failed/ended before answering: restore the original
+    /// customer↔agent bridge so the call survives the failed transfer (the
+    /// transferor was never released). Mirrors the restoration the command's
+    /// error arm used to do for dial-issued failures.
+    pub(super) async fn abort_pending_customer_transfer(
+        &mut self,
+        pending: PendingCustomerTransferRelease,
+        reason: &str,
+    ) {
+        warn!(
+            session_id = %self.id,
+            target = %pending.target_display,
+            %reason,
+            "customer blind transfer target failed before answer; preserving the call"
+        );
+        self.meta.transfer_in_progress = false;
+        self.sync_rtp_timeout_pause();
+        let agent_alive = self.legs.get(&pending.agent_leg).is_some_and(|leg| {
+            matches!(leg.state, LegState::Connected | LegState::Hold)
+        });
+        let customer_alive = self.legs.get(&pending.customer_leg).is_some_and(|leg| {
+            matches!(leg.state, LegState::Connected | LegState::Hold)
+        });
+        if agent_alive && customer_alive {
+            self.setup_bridge(pending.customer_leg.clone(), pending.agent_leg.clone())
+                .await;
+            self.update_media_path().await;
+            return;
+        }
+        if !agent_alive {
+            // 发起即释放: the transferor already left at dial time — after a
+            // failed target there is nobody left to serve the customer. End
+            // the call cleanly instead of stranding them in an unbridged
+            // session (blind-transfer semantics: no take-back).
+            self.handle_hangup(&crate::call::domain::HangupCommand::all(
+                Some(crate::callrecord::CallRecordHangupReason::Canceled),
+                None,
+            ))
+            .await;
+        }
+>>>>>>> deploy
     }
 
     /// Consult the route table for a blind-transfer B-leg target, mapping every
@@ -2421,10 +2977,34 @@ impl SipSession {
                 routed.credential = option.credential.clone();
                 routed.headers = option.headers.clone();
                 routed.contact_raw = Some(option.callee.to_string());
+<<<<<<< HEAD
                 Ok(BlindTransferRoute::Dial(routed, hints))
             }
             Some(crate::config::RouteResult::NotHandled(_, hints)) => {
                 Ok(BlindTransferRoute::Dial(location.clone(), hints))
+=======
+                routed.outbound_trunk = hints
+                    .as_ref()
+                    .and_then(|hints| {
+                        hints
+                            .extensions
+                            .get::<crate::call::OutboundTrunkContext>()
+                    })
+                    .cloned();
+                Ok(BlindTransferRoute::Dial(routed, hints))
+            }
+            Some(crate::config::RouteResult::NotHandled(_, hints)) => {
+                let mut routed = location.clone();
+                routed.outbound_trunk = hints
+                    .as_ref()
+                    .and_then(|hints| {
+                        hints
+                            .extensions
+                            .get::<crate::call::OutboundTrunkContext>()
+                    })
+                    .cloned();
+                Ok(BlindTransferRoute::Dial(routed, hints))
+>>>>>>> deploy
             }
             Some(crate::config::RouteResult::Queue { queue, hints, .. }) => {
                 Ok(BlindTransferRoute::Queue { queue, hints })
@@ -2629,7 +3209,11 @@ impl SipSession {
                 queue_name: format!("agent:{ext}"),
                 ..Default::default()
             }
+<<<<<<< HEAD
             .with_default_hold_music(self.server.proxy_config.load().queue_hold_music.clone());
+=======
+            .with_default_hold_music(self.server.proxy_config.load().queue_wait_music());
+>>>>>>> deploy
             if let Some(spec) = &return_app {
                 apply_return_app_fallback(&mut queue_plan, spec);
             }
@@ -2665,7 +3249,11 @@ impl SipSession {
                     "queue": format!("skill-group:{sg_id}")
                 }))?;
             queue_plan = queue_plan.with_default_hold_music(
+<<<<<<< HEAD
                 self.server.proxy_config.load().queue_hold_music.clone(),
+=======
+                self.server.proxy_config.load().queue_wait_music(),
+>>>>>>> deploy
             );
             if let Some(spec) = &return_app {
                 apply_return_app_fallback(&mut queue_plan, spec);
@@ -3419,6 +4007,7 @@ impl SipSession {
         // whether that endpoint is currently selected in a two-party bridge.
         let leg = self.media_leg(&leg_id).ok_or_else(|| anyhow!("No media endpoint for {}", leg_id))?;
         let pc = leg.pc().clone();
+<<<<<<< HEAD
         let ws_sample_rate = if sample_rate == 0 { 8000 } else { sample_rate };
         let (end_tx, end_rx) = tokio::sync::oneshot::channel();
         let end_tx = std::sync::Mutex::new(Some(end_tx));
@@ -3486,8 +4075,21 @@ impl SipSession {
         // even after the real MediaBridge leg had negotiated Opus.
         let mut decoder = audio_codec::create_decoder(codec_type);
         let dec_sample_rate = decoder.sample_rate();
+=======
+>>>>>>> deploy
         let ws_sample_rate = if sample_rate == 0 { 8000 } else { sample_rate };
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let end_tx = std::sync::Mutex::new(Some(end_tx));
+        let on_end: crate::media::egress::EgressEndCallback = std::sync::Arc::new(move |_| {
+            if let Some(tx) = end_tx.lock().unwrap().take() { let _ = tx.send(()); }
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        leg.play(Box::new(crate::media::audio_source::ChannelAudioSource::new(rx, ws_sample_rate)),
+            false, Some(on_end)).await?;
+        let forward_sink = tx;
+        let pcm_ended_rx = Some(end_rx);
 
+<<<<<<< HEAD
         // ── 3. Cancellation token (parent = session cancel) ──────────
         let cancel_token = self.cancel_token.child_token();
 
@@ -3500,6 +4102,52 @@ impl SipSession {
         dtmf_payload_types.dedup();
 
         // ── 5. DTMF JSON text-frame channel ─────────────────────────
+=======
+        // MediaBridge legs are authoritative for app-anchored calls because
+        // Answer negotiation stores the actual negotiated codec/PT/DTMF profile there.
+        // Keep the session SDP caches as a fallback for legacy peer paths.
+        let negotiated_profile = leg.negotiated()
+            .or_else(|| {
+                self.legs
+                    .get_answer(&leg_id)
+                    .or_else(|| {
+                        if leg_id.as_str() == "caller" {
+                            self.media.answer.as_deref()
+                        } else if leg_id.as_str() == "callee" {
+                            self.media.callee_answer_sdp.as_deref()
+                        } else {
+                            None
+                        }
+                    })
+                    .map(MediaNegotiator::extract_leg_profile)
+            });
+
+        // ── 2. Reverse decoder (per-packet PT → decoder) ─────────────────
+        let negotiated_audio = negotiated_profile
+            .as_ref()
+            .and_then(|profile| profile.audio.as_ref())
+            .map(|audio| {
+                info!(
+                    %leg_id,
+                    negotiated_codec = ?audio.codec,
+                    negotiated_pt = audio.payload_type,
+                    negotiated_clock_rate = audio.clock_rate,
+                    bridge_codec = %codec,
+                    "voip_bridge using leg-negotiated codec/PT"
+                );
+                (audio.payload_type, audio.codec)
+            });
+        let mut reverse_decoder = BridgeReverseDecoder::new(
+            negotiated_audio,
+            leg.offered_audio_pt_map(),
+            ws_sample_rate,
+        );
+
+        // ── 3. Cancellation token (parent = session cancel) ──────────
+        let cancel_token = self.cancel_token.child_token();
+
+        // ── 4. DTMF JSON text-frame channel ─────────────────────────
+>>>>>>> deploy
         let (dtmf_json_tx, mut dtmf_json_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         *self.bridge_dtmf_tx.write() = Some(dtmf_json_tx.clone());
         let bridge_dtmf_tx_state = self.bridge_dtmf_tx.clone();
@@ -3546,6 +4194,7 @@ impl SipSession {
                     }
                 };
 
+<<<<<<< HEAD
                 // Stateful FIR for decode-rate → WS-rate conversion, built
                 // once: filter state must persist across frames (a per-frame
                 // instance clicks at every boundary, and naive decimation
@@ -3565,14 +4214,31 @@ impl SipSession {
                 } else {
                     None
                 };
+=======
+                let (drained, mut in_dtx) = drain_audio_track(track.as_ref(), &reverse_decoder);
+                if drained > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        %leg_id,
+                        drained_frames = drained,
+                        "Bridge reverse loop drained stale buffered audio frames"
+                    );
+                }
+
+                let frame_samples = ((ws_sample_rate as usize) * 20 / 1000).max(1);
+                let silence_frame = bytes::Bytes::from(vec![0u8; frame_samples * 2]);
+                let mut silence_interval = tokio::time::interval(Duration::from_millis(20));
+                silence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+>>>>>>> deploy
 
                 loop {
-                    tokio::select! {
+                    let outbound = tokio::select! {
                         biased;
                         _ = reverse_cancel.cancelled() => {
                             info!(session_id = %session_id, %leg_id, "Bridge reverse loop cancelled");
                             break;
                         }
+<<<<<<< HEAD
                         json = dtmf_json_rx.recv() => {
                             match json {
                                 Some(json) => {
@@ -3585,17 +4251,46 @@ impl SipSession {
                                                 break;
                                             }
                                         }
+=======
+                        json = dtmf_json_rx.recv() => match json {
+                            Some(json) => Some((Message::Text(json.into()), "Bridge WS DTMF json write failed")),
+                            None => break,
+                        },
+                        sample = track.recv() => match sample {
+                            Ok(MediaSample::Audio(frame)) => match frame
+                                .payload_type
+                                .and_then(|pt| reverse_decoder.decode(pt, &frame.data))
+                            {
+                                Some(ReverseAudio::Speech { samples, enter_silence }) => {
+                                    let bytes = bytemuck::cast_slice::<i16, u8>(samples).to_vec();
+                                    in_dtx = enter_silence;
+                                    if in_dtx {
+                                        silence_interval.reset();
+>>>>>>> deploy
                                     }
+                                    Some((Message::Binary(bytes.into()), "Bridge reverse audio write failed"))
                                 }
-                                None => break,
+                                Some(ReverseAudio::Silence) => {
+                                    if !in_dtx {
+                                        in_dtx = true;
+                                        silence_interval.reset_immediately();
+                                    }
+                                    None
+                                }
+                                None => None,
+                            },
+                            Ok(_) => None,
+                            Err(e) => {
+                                log_bridge_reverse_failure(&reverse_cancel, &session_id, &leg_id, &format!("Bridge reverse track error: {e}")).await;
+                                break;
                             }
+                        },
+                        _ = silence_interval.tick(), if in_dtx => {
+                            Some((Message::Binary(silence_frame.clone()), "Bridge reverse silence write failed"))
                         }
-                        sample = track.recv() => {
-                            match sample {
-                                Ok(MediaSample::Audio(frame)) => {
-                                    let is_dtmf = frame.payload_type
-                                        .map_or(false, |pt| dtmf_payload_types.contains(&pt));
+                    };
 
+<<<<<<< HEAD
                                     if !is_dtmf {
                                         // Regular audio frame — decode to PCM, resample, send as binary
                                         let pcm = decoder.decode(&frame.data);
@@ -3622,6 +4317,15 @@ impl SipSession {
                                 Ok(_) => {}
                                 Err(e) => {
                                     log_bridge_reverse_failure(&reverse_cancel, &session_id, &leg_id, &format!("Bridge reverse track error: {e}")).await;
+=======
+                    if let Some((msg, err_msg)) = outbound {
+                        tokio::select! {
+                            biased;
+                            _ = reverse_cancel.cancelled() => break,
+                            result = ws_write.send(msg) => {
+                                if result.is_err() {
+                                    log_bridge_reverse_failure(&reverse_cancel, &session_id, &leg_id, err_msg).await;
+>>>>>>> deploy
                                     break;
                                 }
                             }
@@ -4747,6 +5451,8 @@ mod tests {
             .close()
             .await
             .expect("close WS connection gracefully");
+<<<<<<< HEAD
+=======
 
         let mut buffered: Vec<i16> = rx_bytes
             .chunks_exact(2)
@@ -4772,5 +5478,347 @@ mod tests {
         assert_eq!(&last[..40], &tx_samples[160..]);
         assert!(last[40..].iter().all(|sample| *sample == 0));
         assert_eq!(source.read_samples(&mut last), 0);
+    }
+>>>>>>> deploy
+
+        let mut buffered: Vec<i16> = rx_bytes
+            .chunks_exact(2)
+            .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]]))
+            .collect();
+        let mut frames = Vec::new();
+        while let Some(frame) = take_bridge_pcm_frame(&mut buffered, 160, true) {
+            frames.push(frame);
+        }
+        let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(4);
+        for frame in frames {
+            pcm_tx.send(frame).await.unwrap();
+        }
+        drop(pcm_tx);
+
+        use crate::media::audio_source::{AudioSource, ChannelAudioSource};
+        let mut source = ChannelAudioSource::new(pcm_rx, 8000);
+        let mut first = vec![0i16; 160];
+        let mut last = vec![0i16; 160];
+        assert_eq!(source.read_samples(&mut first), 160);
+        assert_eq!(source.read_samples(&mut last), 160);
+        assert_eq!(first, tx_samples[..160]);
+        assert_eq!(&last[..40], &tx_samples[160..]);
+        assert!(last[40..].iter().all(|sample| *sample == 0));
+        assert_eq!(source.read_samples(&mut last), 0);
+    }
+
+    fn sine_pcm(sample_rate: u32, samples: usize, freq_hz: f32) -> Vec<i16> {
+        (0..samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                ((2.0 * std::f32::consts::PI * freq_hz * t).sin() * 12_000.0) as i16
+            })
+            .collect()
+    }
+
+    fn unwrap_speech(audio: Option<ReverseAudio<'_>>) -> (&[i16], bool) {
+        match audio {
+            Some(ReverseAudio::Speech {
+                samples,
+                enter_silence,
+            }) => (samples, enter_silence),
+            other => panic!("expected ReverseAudio::Speech, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_switches_g729_to_pcmu_and_pcma() {
+        let mut decoder = BridgeReverseDecoder::new(
+            Some((18, audio_codec::CodecType::G729)),
+            BTreeMap::new(),
+            16_000,
+        );
+
+        let pcm_8k = sine_pcm(8000, 160, 440.0);
+
+        // 1. Negotiated G.729 (PT 18, 20 bytes) → 320 samples (640 bytes) @ 16 kHz.
+        let g729_payload = audio_codec::create_encoder(audio_codec::CodecType::G729).encode(&pcm_8k);
+        assert_eq!(g729_payload.len(), 20);
+        let (g729_16k, enter_silence) = unwrap_speech(decoder.decode(18, &g729_payload));
+        assert_eq!(g729_16k.len(), 320);
+        assert!(!enter_silence);
+
+        // 2. Unsolicited switch to PCMU (PT 0, 160 bytes) → exact 8 kHz PCMU decode
+        //    and 320 samples (640 bytes, NOT 5120 bytes) @ 16 kHz.
+        let pcmu_payload = audio_codec::create_encoder(audio_codec::CodecType::PCMU).encode(&pcm_8k);
+        assert_eq!(pcmu_payload.len(), 160);
+        let (pcmu_16k, enter_silence) = unwrap_speech(decoder.decode(0, &pcmu_payload));
+        assert_eq!(pcmu_16k.len(), 320);
+        assert!(!enter_silence);
+        let expected_pcmu_8k =
+            audio_codec::create_decoder(audio_codec::CodecType::PCMU).decode(&pcmu_payload);
+        assert_eq!(&decoder.decode_buf[..160], expected_pcmu_8k.as_slice());
+
+        // 3. Unsolicited switch to PCMA (PT 8, 160 bytes) → exact 8 kHz PCMA decode
+        //    and 320 samples @ 16 kHz.
+        let pcma_payload = audio_codec::create_encoder(audio_codec::CodecType::PCMA).encode(&pcm_8k);
+        assert_eq!(pcma_payload.len(), 160);
+        let (pcma_16k, enter_silence) = unwrap_speech(decoder.decode(8, &pcma_payload));
+        assert_eq!(pcma_16k.len(), 320);
+        assert!(!enter_silence);
+        let expected_pcma_8k =
+            audio_codec::create_decoder(audio_codec::CodecType::PCMA).decode(&pcma_payload);
+        assert_eq!(&decoder.decode_buf[..160], expected_pcma_8k.as_slice());
+
+        // 4. Switching back to G.729 (PT 18) reuses the same buffers cleanly.
+        let (g729_again, enter_silence) = unwrap_speech(decoder.decode(18, &g729_payload));
+        assert_eq!(g729_again.len(), 320);
+        assert!(!enter_silence);
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_uses_active_codec_sample_rate() {
+        // Negotiated G.729 (8 kHz) switching to G.722 (16 kHz) reports 16 kHz,
+        // so targeting a 16 kHz WS consumer stays 320 samples (not 640).
+        let mut decoder = BridgeReverseDecoder::new(
+            Some((18, audio_codec::CodecType::G729)),
+            BTreeMap::new(),
+            16_000,
+        );
+
+        let pcm_16k = sine_pcm(16_000, 320, 440.0);
+        let g722_payload =
+            audio_codec::create_encoder(audio_codec::CodecType::G722).encode(&pcm_16k);
+        assert_eq!(g722_payload.len(), 160);
+
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(9, &g722_payload));
+        assert_eq!(samples.len(), 320);
+        assert!(!enter_silence);
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_skips_dtmf_and_unknown_pts() {
+        let mut decoder = BridgeReverseDecoder::new(
+            Some((18, audio_codec::CodecType::G729)),
+            BTreeMap::new(),
+            16_000,
+        );
+
+        assert!(decoder.decode(102, &[1, 0x0a, 0, 160]).is_none());
+        assert_eq!(decoder.decode(13, &[40]), Some(ReverseAudio::Silence));
+        assert!(decoder.decode(111, &[0u8; 40]).is_none());
+        assert!(decoder.decode(120, &[0u8; 40]).is_none());
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_handles_offered_dynamic_pt() {
+        // Answer negotiated G.729 (18), offer also included Opus on dynamic PT 106.
+        // Switching to PT 106 resolves via `audio_pt_map` from the offer.
+        let audio_pt_map = BTreeMap::from([
+            (18, audio_codec::CodecType::G729),
+            (106, audio_codec::CodecType::Opus),
+        ]);
+        let mut decoder = BridgeReverseDecoder::new(
+            Some((18, audio_codec::CodecType::G729)),
+            audio_pt_map,
+            16_000,
+        );
+
+        let pcm_48k = sine_pcm(48_000, 960, 440.0);
+        let opus_payload =
+            audio_codec::create_encoder(audio_codec::CodecType::Opus).encode(&pcm_48k);
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(106, &opus_payload));
+        assert_eq!(samples.len(), 320);
+        assert!(!enter_silence);
+    }
+
+    #[tokio::test]
+    async fn test_drain_audio_track_discards_stale_frames_and_keeps_live_audio() {
+        use rustrtc::media::MediaStreamTrack;
+        use rustrtc::media::frame::{AudioFrame, MediaKind, MediaSample};
+        use rustrtc::media::track::sample_track;
+
+        let (source, track, _fb) = sample_track(MediaKind::Audio, 64);
+        let decoder = BridgeReverseDecoder::new(None, BTreeMap::new(), 16_000);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (0, false));
+
+        for seq in 0u16..10 {
+            source
+                .send_audio(AudioFrame {
+                    sequence_number: Some(seq),
+                    payload_type: Some(0),
+                    data: vec![0x7F; 160].into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (10, false));
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (0, false));
+
+        source
+            .send_audio(AudioFrame {
+                sequence_number: Some(10),
+                payload_type: Some(0),
+                data: vec![0x55; 160].into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let MediaSample::Audio(frame) = track.recv().await.unwrap() else {
+            panic!("expected live audio frame");
+        };
+        assert_eq!(frame.sequence_number, Some(10));
+
+        drop(source);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (0, false));
+    }
+
+    #[tokio::test]
+    async fn test_voip_bridge_drain_retains_queued_dtx() {
+        use rustrtc::media::frame::{AudioFrame, MediaKind};
+        use rustrtc::media::track::sample_track;
+
+        let (source, track, _fb) = sample_track(MediaKind::Audio, 64);
+        let decoder = BridgeReverseDecoder::new(
+            Some((96, audio_codec::CodecType::G729)),
+            BTreeMap::from([(106, audio_codec::CodecType::Opus)]),
+            16_000,
+        );
+        let queue_audio = |pt, data: &[u8]| {
+            source
+                .send_audio(AudioFrame {
+                    payload_type: Some(pt),
+                    data: bytes::Bytes::copy_from_slice(data),
+                    ..Default::default()
+                })
+                .unwrap();
+        };
+
+        queue_audio(96, &[0; 20]);
+        queue_audio(96, &[0x12, 0x34]);
+        queue_audio(102, &[1, 0x0a, 0, 160]);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (3, true));
+
+        queue_audio(96, &[0x12, 0x34]);
+        queue_audio(96, &[0; 20]);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (2, false));
+
+        queue_audio(96, &[0; 22]);
+        queue_audio(0, &[0x7f; 160]);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (2, false));
+
+        queue_audio(96, &[0; 22]);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (1, true));
+
+        queue_audio(106, &[0xf8]);
+        queue_audio(106, &[0xfa]); // Code 2 requires a frame-length byte.
+        queue_audio(102, &[1, 0x0a, 0, 160]);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (3, true));
+
+        queue_audio(106, &[0xfa, 0]); // Two empty Opus frames.
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (1, true));
+
+        queue_audio(106, &[0xfb, 2]); // Two empty CBR frames.
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (1, true));
+
+        queue_audio(106, &[0xfb, 7]); // Seven 20 ms frames exceed 120 ms.
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (1, false));
+
+        queue_audio(106, &[0xf8, 0]); // One coded byte follows the TOC.
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (1, false));
+
+        let pcm = sine_pcm(48_000, 960, 440.0);
+        let speech = audio_codec::create_encoder(audio_codec::CodecType::Opus).encode(&pcm);
+        assert!(speech.len() > 2);
+        queue_audio(106, &[0xf8]);
+        queue_audio(106, &speech);
+        assert_eq!(drain_audio_track(track.as_ref(), &decoder), (2, false));
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_classifies_g729_sid_cn_and_opus_dtx() {
+        let audio_pt_map = BTreeMap::from([
+            (18, audio_codec::CodecType::G729),
+            (106, audio_codec::CodecType::Opus),
+        ]);
+        let mut decoder = BridgeReverseDecoder::new(
+            Some((18, audio_codec::CodecType::G729)),
+            audio_pt_map,
+            16_000,
+        );
+
+        let pcm_20ms = sine_pcm(8000, 160, 440.0);
+        let g729_20ms = audio_codec::create_encoder(audio_codec::CodecType::G729).encode(&pcm_20ms);
+        assert_eq!(g729_20ms.len(), 20);
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(18, &g729_20ms));
+        assert_eq!(samples.len(), 320);
+        assert!(!enter_silence);
+
+        // Standalone 2-byte G.729 Annex B SID enters DTX silence.
+        let sid = [0x12u8, 0x34u8];
+        assert_eq!(decoder.decode(18, &sid), Some(ReverseAudio::Silence));
+
+        // The mixed packet preserves the SID's 10 ms as zeros.
+        let mut speech_10ms_plus_sid = g729_20ms[..10].to_vec();
+        speech_10ms_plus_sid.extend_from_slice(&sid);
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(18, &speech_10ms_plus_sid));
+        assert_eq!(samples.len(), 320);
+        assert_eq!(&samples[160..], &[0; 160]);
+        assert!(enter_silence);
+
+        let mut speech_20ms_plus_sid = g729_20ms.clone();
+        speech_20ms_plus_sid.extend_from_slice(&sid);
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(18, &speech_20ms_plus_sid));
+        assert_eq!(samples.len(), 480);
+        assert_eq!(&samples[320..], &[0; 160]);
+        assert!(enter_silence);
+
+        // At 22,050 Hz the first 10 ms SID spans 221 samples on the FIR grid.
+        let mut fractional_rate_decoder = BridgeReverseDecoder::new(None, BTreeMap::new(), 22_050);
+        let (samples, enter_silence) =
+            unwrap_speech(fractional_rate_decoder.decode(18, &speech_20ms_plus_sid));
+        assert_eq!(samples.len(), 662);
+        assert_eq!(&samples[441..], &[0; 221]);
+        assert!(enter_silence);
+
+        // RFC 3389 PT 13 CN and valid short Opus DTX both return Silence.
+        assert_eq!(decoder.decode(13, &[40]), Some(ReverseAudio::Silence));
+        assert_eq!(decoder.decode(106, &[0xF8]), Some(ReverseAudio::Silence));
+        // Two 20 ms empty frames exceed the decoder's buffer but still signal DTX.
+        assert_eq!(decoder.decode(106, &[0xFA, 0]), Some(ReverseAudio::Silence));
+        assert_eq!(decoder.decode(106, &[0xFB, 2]), Some(ReverseAudio::Silence));
+        assert!(decoder.decode(106, &[0xFA]).is_none());
+        assert!(decoder.decode(106, &[0xFB, 7]).is_none());
+        assert_ne!(decoder.decode(106, &[0xF8, 0]), Some(ReverseAudio::Silence));
+
+        // Active speech resumes cleanly and clears enter_silence.
+        let (samples, enter_silence) = unwrap_speech(decoder.decode(18, &g729_20ms));
+        assert_eq!(samples.len(), 320);
+        assert!(!enter_silence);
+    }
+
+    #[test]
+    fn test_voip_bridge_reverse_decoder_keeps_opus_state_through_dtx() {
+        let codec = audio_codec::CodecType::Opus;
+        let mut bridge = BridgeReverseDecoder::new(Some((106, codec)), BTreeMap::new(), 48_000);
+        let mut encoder = audio_codec::create_encoder(codec);
+        let speech = encoder.encode(&sine_pcm(48_000, 960, 440.0));
+        let resumed = encoder.encode(&sine_pcm(48_000, 960, 660.0));
+        let marker = [speech[0] & !3];
+
+        let mut reference = audio_codec::create_decoder(codec);
+        assert_eq!(reference.decode(&speech).len(), 960);
+        assert_eq!(reference.decode(&marker).len(), 960);
+        let expected = reference.decode(&resumed);
+
+        let mut without_marker = audio_codec::create_decoder(codec);
+        without_marker.decode(&speech);
+        assert_ne!(without_marker.decode(&resumed), expected);
+
+        let (samples, enter_silence) = unwrap_speech(bridge.decode(106, &speech));
+        assert_eq!(samples.len(), 960);
+        assert!(!enter_silence);
+        let other_channel_marker = [marker[0] ^ 0x04];
+        assert_eq!(
+            bridge.decode(106, &other_channel_marker),
+            Some(ReverseAudio::Silence)
+        );
+        let (samples, enter_silence) = unwrap_speech(bridge.decode(106, &resumed));
+        assert_eq!(samples, expected.as_slice());
+        assert!(!enter_silence);
     }
 }

@@ -21,7 +21,12 @@ use std::time::Duration;
 
 use audio_codec::CodecType;
 use rustpbx_media::TransportMode;
+<<<<<<< HEAD
 use rustpbx_media::leg::LegInner;
+=======
+use rustpbx_media::egress::EgressSource;
+use rustpbx_media::leg::{LegConfig, LegInner};
+>>>>>>> deploy
 use rustpbx_media::media_bridge::{LegSide, MediaBridge};
 use rustpbx_media::negotiate::{CodecInfo, MediaNegotiator};
 use rustrtc::config::BufferDropStrategy;
@@ -38,6 +43,10 @@ struct TestPeer {
     tx: rustrtc::media::track::SampleStreamSource,
     codec: CodecInfo,
     video_tx: Option<rustrtc::media::track::SampleStreamSource>,
+<<<<<<< HEAD
+=======
+    video_seq: std::sync::atomic::AtomicU16,
+>>>>>>> deploy
 }
 
 impl TestPeer {
@@ -51,6 +60,10 @@ impl TestPeer {
             tx,
             codec,
             video_tx: None,
+<<<<<<< HEAD
+=======
+            video_seq: std::sync::atomic::AtomicU16::new(0),
+>>>>>>> deploy
         }
     }
 
@@ -71,6 +84,10 @@ impl TestPeer {
             tx,
             codec,
             video_tx: None,
+<<<<<<< HEAD
+=======
+            video_seq: std::sync::atomic::AtomicU16::new(0),
+>>>>>>> deploy
         }
     }
 
@@ -133,9 +150,16 @@ impl TestPeer {
     /// Push a raw H264 access-unit frame to the remote peer (via the bridge).
     fn send_video(&self, payload: Vec<u8>, ts: u32) {
         if let Some(vtx) = &self.video_tx {
+<<<<<<< HEAD
             vtx.send(MediaSample::Video(rustrtc::media::frame::VideoFrame {
                 data: bytes::Bytes::from(payload),
                 payload_type: Some(96),
+=======
+            let seq = self.video_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            vtx.send(MediaSample::Video(rustrtc::media::frame::VideoFrame {
+                data: bytes::Bytes::from(payload),
+                payload_type: None,
+>>>>>>> deploy
                 rtp_timestamp: ts,
                 width: 640,
                 height: 480,
@@ -144,7 +168,11 @@ impl TestPeer {
                 is_last_packet: true,
                 header_extension: None,
                 csrcs: Vec::new(),
+<<<<<<< HEAD
                 sequence_number: None,
+=======
+                sequence_number: Some(seq),
+>>>>>>> deploy
                 source_addr: None,
                 raw_packet: None,
             }))
@@ -1391,8 +1419,14 @@ async fn video_codec_mismatch_degrades_to_audio_only() {
     )
     .await;
     h.assert_video_not_relayed().await;
+<<<<<<< HEAD
     // Audio must keep flowing after the degradation: the bridge falls back to
     // the transcoding path (PCMU → decode → PCMU), so B still receives audio.
+=======
+    // Audio must keep flowing on fast-path relay after the video degradation,
+    // without forcing software transcoding when audio codecs match.
+    h.assert_relay(true);
+>>>>>>> deploy
     let audio = h.relay_audio_a_to_b(3000).await;
     assert!(audio.is_some(), "audio must survive the video degradation");
     h.close();
@@ -2295,6 +2329,97 @@ async fn reinvite_profile_resyncs_egress_codec_and_sender_pt() {
     );
 }
 
+<<<<<<< HEAD
+=======
+#[tokio::test]
+async fn reinvite_with_same_codec_rebuilds_relay_payload_mapping() {
+    // The default harness installs a video sender. Start with audio-only
+    // legs so a relay rearm requesting video has to wait for a transport.
+    let codec = MediaNegotiator::codec_info_for_type(CodecType::Opus);
+    let config = LegConfig {
+        codecs: vec![codec.clone()],
+        bind_ips: vec!["127.0.0.1".parse().unwrap()],
+        ..LegConfig::rtp_pcmu()
+    };
+    let leg_a = LegInner::new("a", &config, None).unwrap();
+    let leg_b = LegInner::new("b", &config, None).unwrap();
+    let test_a = TestPeer::new(TransportMode::Rtp, codec.clone());
+    let test_b = TestPeer::new(TransportMode::Rtp, codec);
+    negotiate(&test_a, &leg_a).await;
+    negotiate(&test_b, &leg_b).await;
+    let mut bridge = MediaBridge::new("rtp-reinvite");
+    bridge.select_pair(leg_a.clone(), leg_b.clone()).await.unwrap();
+    bridge.accept(LegSide::A).await;
+    bridge.accept(LegSide::B).await;
+    assert!(leg_a.egress_is_relay());
+    assert!(leg_b.egress_is_relay());
+
+    let original = leg_b.negotiated().unwrap().audio.unwrap();
+    let voice = encode_codec_frames(CodecType::Opus, 20);
+    test_a.send_audio(voice[0].clone(), 0);
+    let initial = test_b.recv_audio(2000).await.expect("original relay packet");
+    assert_eq!(initial.payload_type, Some(original.payload_type));
+
+    // A rearm that adds video can wait for its transport even though the
+    // existing audio route is ready. Keep sending audio over that route.
+    let before = {
+        let rearm = leg_b.set_egress_source(EgressSource::RewriteRelay {
+            peer_pc: leg_a.pc().clone(),
+            options: Default::default(),
+            routes: vec![
+                (rustrtc::MediaKind::Audio, Vec::new()),
+                (rustrtc::MediaKind::Video, Vec::new()),
+            ],
+            on_arm_failed: None,
+        });
+        tokio::pin!(rearm);
+        tokio::select! {
+            biased;
+            result = &mut rearm => panic!("expected the video transport to still be pending: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        test_a.send_audio(voice[0].clone(), 960);
+        let during = test_b.recv_audio(2000).await.expect("relay packet while video is pending");
+        assert_eq!(during.payload_type, initial.payload_type);
+        assert_eq!(during.sequence_number, initial.sequence_number.map(|seq| seq.wrapping_add(1)));
+        during
+    };
+
+    let new_pt = 109;
+    let mut offer = test_b.pc.create_offer().await.unwrap();
+    let audio = offer.media_sections.iter_mut().find(|m| m.kind == rustrtc::MediaKind::Audio).unwrap();
+    let old_format = original.payload_type.to_string();
+    let format = audio.formats.iter_mut().find(|f| **f == old_format).unwrap();
+    *format = new_pt.to_string();
+    for attr in &mut audio.attributes {
+        if matches!(attr.key.as_str(), "rtpmap" | "fmtp" | "rtcp-fb")
+            && let Some(value) = attr.value.as_mut()
+            && let Some((pt, params)) = value.split_once(' ')
+            && pt == old_format
+        {
+            *value = format!("{new_pt} {params}");
+        }
+    }
+    test_b.pc.set_local_description(offer.clone()).unwrap();
+    let answer = leg_b.answer(&offer.to_sdp_string()).await.unwrap();
+    let audio = leg_b.negotiated().unwrap().audio.unwrap();
+    assert_eq!(audio.codec, original.codec);
+    assert_eq!(audio.payload_type, new_pt);
+    test_b.pc
+        .set_remote_description(SessionDescription::parse(SdpType::Answer, &answer).unwrap())
+        .await.unwrap();
+    bridge.bridge().await.unwrap();
+
+    test_a.send_audio(voice[0].clone(), 1920);
+    let after = test_b.recv_audio(2000).await.expect("relay packet after re-INVITE");
+    assert_eq!(after.payload_type, Some(new_pt));
+    assert_eq!(after.sequence_number, before.sequence_number.map(|seq| seq.wrapping_add(1)));
+    assert_eq!(after.rtp_timestamp.wrapping_sub(before.rtp_timestamp), 960);
+    assert_eq!(after.raw_packet.unwrap().header.ssrc, before.raw_packet.unwrap().header.ssrc);
+    bridge.close();
+}
+
+>>>>>>> deploy
 /// Transcoded call recording (the exact scenario of the reported stutter bug
 /// `0duu44tqb5hs0f8rii8n`: WebRTC-Opus caller ↔ RTP-PCMU callee).
 ///
@@ -3013,7 +3138,12 @@ async fn relay_late_tail_does_not_rewind_paced_hold_clock() {
     h.close();
     assert_eq!(
         resumed.sequence_number,
+<<<<<<< HEAD
         received[2].sequence_number.wrapping_add(1)
+=======
+        received[1].sequence_number.wrapping_add(1),
+        "late arrivals must not rewind or reuse outgoing sequence numbers"
+>>>>>>> deploy
     );
     assert_eq!(
         resumed.timestamp.wrapping_sub(high_water),
@@ -3021,3 +3151,991 @@ async fn relay_late_tail_does_not_rewind_paced_hold_clock() {
         "relay-to-paced must anchor to the output high-water sampling time"
     );
 }
+<<<<<<< HEAD
+=======
+
+/// Minimal looping tone source standing in for the hold-music file source.
+struct TestHoldMusicSource {
+    pos: usize,
+}
+
+impl rustpbx_media::audio_source::AudioSource for TestHoldMusicSource {
+    fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
+        for (i, sample) in buffer.iter_mut().enumerate() {
+            let t = (self.pos + i) as f32 / 8000.0;
+            *sample = (4000.0 * (2.0 * std::f32::consts::PI * 500.0 * t).sin()) as i16;
+        }
+        self.pos += buffer.len();
+        buffer.len()
+    }
+    fn sample_rate(&self) -> u32 {
+        8000
+    }
+    fn channels(&self) -> u16 {
+        1
+    }
+    fn has_data(&self) -> bool {
+        true
+    }
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hold → unhold on a transcoded bridge must keep the audio intact.
+///
+/// Production incident 2026-11-13 (cluster call `c8935420…`): a G729↔PCMA
+/// transcode bridge carried clean audio after call setup, but after the peer
+/// placed the call on hold and resumed it the far end heard broadband noise.
+/// The hold path detaches the bridge route (`unbridge` → both egresses go
+/// silent, hold music takes over); the resume path rebuilds the route via
+/// `bridge()`, which creates **fresh decoders** (`create_decoder`) that must
+/// pick up both RTP streams **mid-stream** — the streams never stopped during
+/// hold (each UA kept sending real frames, seq continuous).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_unhold_route_rebuild_keeps_transcoded_audio_intact() {
+    let mut h = TestMediaHarness::create(
+        TransportMode::Rtp,
+        CodecType::G729,
+        TransportMode::Rtp,
+        CodecType::PCMA,
+    )
+    .await;
+    h.bridge_and_accept().await;
+    h.assert_relay(false);
+
+    // Baseline: both directions carry the fed tone losslessly on the freshly
+    // built transcode pipeline (matches the 25 s of clean audio the production
+    // call carried between transfer and hold).
+    let fed_ab = transcode_voiced_duration(
+        &h.test_a,
+        CodecType::G729,
+        &h.test_b,
+        CodecType::PCMA,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, fed_ab, "baseline A→B G729→PCMA");
+    let fed_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, fed_ba, "baseline B→A PCMA→G729");
+
+    // Hold: the session detaches the route (hold music takes the egress) —
+    // but the UAs keep streaming real frames for the whole hold window, so
+    // feed both directions while the route is down. Feed MORE frames than the
+    // receiver track's ring holds (~100): the production hold lasted 2.7 s
+    // (≈135 frames @20 ms) and overflowed the un-consumed ring, which is the
+    // state the rebuilt pipeline inherits. The held leg also plays looping
+    // hold music during this window (propagate_hold_to_leg's play_media),
+    // so the egress history is relay→silence→media→transcode_peer.
+    h.mb.unbridge().await.expect("unbridge");
+    let held_leg = h.mb.leg(LegSide::A).expect("caller leg").clone();
+    held_leg
+        .play_media(Box::new(TestHoldMusicSource { pos: 0 }), true)
+        .await
+        .expect("hold music");
+    let _hold_ab = transcode_voiced_duration(
+        &h.test_a,
+        CodecType::G729,
+        &h.test_b,
+        CodecType::PCMA,
+        20,
+        160,
+        Some(20),
+    )
+    .await;
+    let _hold_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        160,
+        Some(20),
+    )
+    .await;
+    held_leg.stop_playback().await.expect("stop hold music");
+
+    // Resume: the session re-arms the route — fresh decoders attach to both
+    // mid-stream flows.
+    h.bridge_and_accept().await;
+
+    // Post-resume audio must still be intact in both directions. The
+    // production defect surfaced exactly here: broadband noise instead of the
+    // peer's audio.
+    let post_ab = transcode_voiced_duration(
+        &h.test_a,
+        CodecType::G729,
+        &h.test_b,
+        CodecType::PCMA,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, post_ab, "post-resume A→B G729→PCMA");
+    let post_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, post_ba, "post-resume B→A PCMA→G729");
+}
+
+/// Acceptance scenario "保持再取回" is usually exercised more than once per
+/// call — every cycle rebuilds the route, so each must stay clean.
+/// The production caller was a WebRTC (DTLS-SRTP) leg; rerun the rebuild
+/// sequence with a WebRTC leg A to cover the latching/jitter-buffer path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_unhold_rebuild_webrtc_leg_keeps_transcoded_audio_intact() {
+    let mut h = TestMediaHarness::create(
+        TransportMode::WebRtc,
+        CodecType::G729,
+        TransportMode::Rtp,
+        CodecType::PCMA,
+    )
+    .await;
+    h.bridge_and_accept().await;
+    h.assert_relay(false);
+
+    let fed_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, fed_ba, "baseline B→A PCMA→G729 (webrtc)");
+
+    h.mb.unbridge().await.expect("unbridge");
+    let _hold_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        160,
+        Some(20),
+    )
+    .await;
+    h.bridge_and_accept().await;
+
+    let post_ba = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, post_ba, "post-resume B→A PCMA→G729 (webrtc)");
+    let post_ab = transcode_voiced_duration(
+        &h.test_a,
+        CodecType::G729,
+        &h.test_b,
+        CodecType::PCMA,
+        20,
+        50,
+        Some(20),
+    )
+    .await;
+    assert_voiced_duration_preserved(1000, post_ab, "post-resume A→B G729→PCMA (webrtc)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_hold_unhold_cycles_keep_transcoded_audio_intact() {
+    let mut h = TestMediaHarness::create(
+        TransportMode::Rtp,
+        CodecType::G729,
+        TransportMode::Rtp,
+        CodecType::PCMA,
+    )
+    .await;
+    h.bridge_and_accept().await;
+
+    for cycle in 0..2 {
+        h.mb.unbridge().await.expect("unbridge");
+        let _hold = transcode_voiced_duration(
+            &h.test_a,
+            CodecType::G729,
+            &h.test_b,
+            CodecType::PCMA,
+            20,
+            25,
+            Some(20),
+        )
+        .await;
+        h.bridge_and_accept().await;
+
+        let post_ab = transcode_voiced_duration(
+            &h.test_a,
+            CodecType::G729,
+            &h.test_b,
+            CodecType::PCMA,
+            20,
+            50,
+            Some(20),
+        )
+        .await;
+        assert_voiced_duration_preserved(1000, post_ab, &format!("cycle{cycle} A→B"));
+        let post_ba = transcode_voiced_duration(
+            &h.test_b,
+            CodecType::PCMA,
+            &h.test_a,
+            CodecType::G729,
+            20,
+            50,
+            Some(20),
+        )
+        .await;
+        assert_voiced_duration_preserved(1000, post_ba, &format!("cycle{cycle} B→A"));
+    }
+}
+
+
+/// Network jitter (frames arriving AFTER the egress tick's deadline) must not
+/// punch silent slots into the transcoded output: a late frame is decoded on
+/// the next tick and carried by the accumulator, so the far end hears a
+/// continuous tone. Production incident 2026-11-13 (G729↔PCMA calls heard
+/// broadband noise after hold/resume under real-network jitter; localhost
+/// tests never reproduced it because frames arrived with zero jitter).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jittered_frame_arrival_keeps_transcode_output_gap_free() {
+    use tokio::time::{Instant, sleep_until, timeout_at};
+
+    let mut h = TestMediaHarness::create(
+        TransportMode::Rtp,
+        CodecType::G729,
+        TransportMode::Rtp,
+        CodecType::PCMA,
+    )
+    .await;
+    h.bridge_and_accept().await;
+    h.assert_relay(false);
+
+    // Prime the pipeline with evenly-paced frames first.
+    let _prime = transcode_voiced_duration(
+        &h.test_b,
+        CodecType::PCMA,
+        &h.test_a,
+        CodecType::G729,
+        20,
+        25,
+        Some(20),
+    )
+    .await;
+
+    // Drain the prime tail so it does not pollute the jitter-window stats.
+    let drain_until = tokio::time::Instant::now() + Duration::from_millis(400);
+    while tokio::time::Instant::now() < drain_until {
+        match h.test_a.recv_audio(25).await {
+            Some(_) => {}
+            None => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+
+    // Send at a 20 ms average cadence, with four 16 ms intervals and one
+    // 36 ms interval per cycle. Absolute deadlines keep receive waits from
+    // making the sender fall behind its RTP clock.
+    let packet_ms = 20;
+    let packet_count = 120;
+    let codec_frame_ms = 10;
+    let frames = encode_tone_frames(CodecType::PCMA, packet_ms, packet_count);
+    assert_eq!(frames.len(), packet_count);
+    let start = Instant::now();
+    let receive_until = start + Duration::from_millis(packet_count as u64 * packet_ms + 300);
+    let send = async {
+        let mut send_at = start;
+        let mut timestamp = 10_000u32;
+        for (i, frame) in frames.into_iter().enumerate() {
+            sleep_until(send_at).await;
+            h.test_b.send_audio(frame, timestamp);
+            timestamp = timestamp.wrapping_add(CodecType::PCMA.samplerate() * packet_ms as u32 / 1000);
+            send_at += Duration::from_millis(if i % 5 == 4 { 36 } else { 16 });
+        }
+    };
+
+    let receive = async {
+        let mut decoder = audio_codec::create_decoder(CodecType::G729);
+        let rate = CodecType::G729.samplerate();
+        // G.729 uses 10 ms codec frames. Measure the 440 Hz component in
+        // each one so that a single loud sample cannot hide a quiet frame.
+        let codec_frame_samples = rate as usize * codec_frame_ms as usize / 1000;
+        let tone_basis: Vec<_> = (0..codec_frame_samples)
+            .map(|i| (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(rate)).sin_cos())
+            .collect();
+        let mut has_tone = Vec::new();
+        let mut previous_sequence: Option<u16> = None;
+        while let Ok(received) = timeout_at(receive_until, h.test_a.recv_audio(50)).await {
+            let Some(frame) = received else { continue };
+            let sequence = frame.sequence_number.expect("RTP audio sequence number");
+            if let Some(previous) = previous_sequence.replace(sequence) {
+                assert_eq!(sequence, previous.wrapping_add(1), "RTP audio packet gap");
+            }
+            let pcm = decoder.decode(&frame.data);
+            for chunk in pcm.chunks_exact(codec_frame_samples) {
+                let (sin, cos) = chunk.iter().zip(&tone_basis).fold(
+                    (0.0, 0.0),
+                    |(sin_sum, cos_sum), (&sample, &(sin, cos))| {
+                        let sample = f64::from(sample);
+                        (sin_sum + sample * sin, cos_sum + sample * cos)
+                    },
+                );
+                let amplitude = 2.0 * sin.hypot(cos) / codec_frame_samples as f64;
+                has_tone.push(amplitude > f64::from(VOICED_SAMPLE_THRESHOLD));
+            }
+        }
+        has_tone
+    };
+    let ((), has_tone) = tokio::join!(send, receive);
+
+    // The drain catches buffered tone after the last send. Count gaps only
+    // inside the tone, and check its recovered duration independently.
+    let first = has_tone.iter().position(|&tone| tone).expect("received tone");
+    let last = has_tone.iter().rposition(|&tone| tone).unwrap();
+    let active = &has_tone[first..=last];
+    let tone_frames = active.iter().filter(|&&tone| tone).count();
+    let expected_tone_frames = packet_count * (packet_ms / codec_frame_ms) as usize;
+    assert!(
+        tone_frames * 100 >= active.len() * 95,
+        "jittered feed produced {tone_frames}/{} tone frames during active audio",
+        active.len(),
+    );
+    assert!(
+        tone_frames * 100 >= expected_tone_frames * 95,
+        "jittered feed recovered {tone_frames}/{expected_tone_frames} tone frames",
+    );
+}
+
+/// Feedback addresses the producer's SSRC and sequence space, not the relay's.
+#[tokio::test]
+async fn video_feedback_translates_nack_gaps_and_keyframe_targets() {
+    use rustrtc::rtp::{
+        FirRequest, FullIntraRequest, GenericNack, PictureLossIndication,
+        RtcpPacket, RtpHeader, RtpPacket,
+    };
+    let mut h = create_video_harness(
+        TransportMode::Rtp, TransportMode::Rtp, h264_caps(96), h264_caps(110),
+    ).await;
+    let video_sender = |pc: &PeerConnection| pc.get_transceivers().into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Video).unwrap().sender().unwrap();
+    let upstream = video_sender(&h.test_a.pc);
+    let downstream = video_sender(&h.test_b.pc);
+    let mut feedback = upstream.subscribe_rtcp();
+    let mut received = Vec::new();
+    // Start on a higher SSRC to ensure feedback still reaches the active
+    // producer even though the tap remembers the previous source for this PT.
+    for (ssrc, seq) in [(u32::MAX, 9), (upstream.ssrc(), 10), (upstream.ssrc(), 12)] {
+        let mut header = RtpHeader::new(96, seq, 9000 + u32::from(seq - 9) * 3600, ssrc);
+        header.marker = true;
+        upstream.transport().unwrap().send_rtp(
+            RtpPacket::new(header, vec![0x65, 1, 2, 3]),
+        ).await.unwrap();
+        let frame = h.test_b.recv_video(2000).await.expect("relayed video");
+        received.push(frame);
+    }
+    let first = received[1].raw_packet.as_ref().unwrap().header.clone();
+    let last = received[2].raw_packet.as_ref().unwrap().header.clone();
+    assert_eq!(last.sequence_number, first.sequence_number.wrapping_add(2));
+    downstream.transport().unwrap().send_rtcp(&[
+        RtcpPacket::GenericNack(GenericNack {
+            sender_ssrc: downstream.ssrc(), media_ssrc: first.ssrc,
+            lost_packets: vec![first.sequence_number.wrapping_add(1), last.sequence_number.wrapping_add(1000)],
+        }),
+        RtcpPacket::PictureLossIndication(PictureLossIndication {
+            sender_ssrc: downstream.ssrc(), media_ssrc: first.ssrc,
+        }),
+        RtcpPacket::FullIntraRequest(FullIntraRequest {
+            sender_ssrc: downstream.ssrc(),
+            requests: vec![FirRequest { ssrc: first.ssrc, sequence_number: 55 }],
+        }),
+    ]).await.unwrap();
+    let mut seen = [false; 3];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while seen != [true; 3] {
+            match feedback.recv().await.unwrap() {
+                RtcpPacket::GenericNack(nack) => {
+                    assert_eq!(nack.media_ssrc, upstream.ssrc());
+                    assert_eq!(nack.lost_packets, vec![11], "lost upstream packet must be reverse-mapped; unknown numbers omitted");
+                    seen[0] = true;
+                }
+                RtcpPacket::PictureLossIndication(pli) => {
+                    assert_eq!(pli.media_ssrc, upstream.ssrc());
+                    seen[1] = true;
+                }
+                RtcpPacket::FullIntraRequest(fir) => {
+                    assert_eq!(fir.requests.len(), 1);
+                    assert_eq!(fir.requests[0].ssrc, upstream.ssrc());
+                    assert_eq!(fir.requests[0].sequence_number, 55);
+                    seen[2] = true;
+                }
+                _ => {}
+            }
+        }
+    }).await.expect("translated feedback reaches original producer");
+    h.close();
+}
+
+#[tokio::test]
+async fn video_relay_translates_rtx_repairs_between_negotiated_streams() {
+    use rustrtc::rtp::{GenericNack, RtcpPacket, RtpHeader, RtpPacket};
+    use rustrtc::rtx::{RtxSenderConfig, decode_osn, wrap_rtx_packet};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    struct Capture {
+        primary_pt: u8,
+        repair_pt: u8,
+        packets: mpsc::UnboundedSender<RtpPacket>,
+    }
+
+    impl RtpObserver for Capture {
+        fn on_ingress(&self, packet: &RtpPacket, _: std::net::SocketAddr) {
+            if [self.primary_pt, self.repair_pt].contains(&packet.header.payload_type) {
+                let _ = self.packets.send(packet.clone());
+            }
+        }
+    }
+
+    for (transport_a, transport_b) in [
+        (TransportMode::WebRtc, TransportMode::Rtp),
+        (TransportMode::WebRtc, TransportMode::WebRtc),
+        (TransportMode::Rtp, TransportMode::Rtp),
+    ] {
+        let mut caps_a = h264_caps(96);
+        caps_a[0].rtx_payload_type = Some(97);
+        caps_a[0].rtcp_fbs.push("nack".into());
+        let mut caps_b = h264_caps(110);
+        caps_b[0].rtx_payload_type = Some(111);
+        caps_b[0].rtcp_fbs.push("nack".into());
+        let mut h = create_video_harness(transport_a, transport_b, caps_a, caps_b).await;
+        h.assert_relay(true);
+
+        for (source, target, target_side, src_pt, src_rtx_pt, dst_pt, dst_rtx_pt) in [
+            (&h.test_a, &h.test_b, LegSide::B, 96, 97, 110, 111),
+            (&h.test_b, &h.test_a, LegSide::A, 110, 111, 96, 97),
+        ] {
+            let video = |pc: &PeerConnection| {
+                pc.get_transceivers()
+                    .into_iter()
+                    .find(|transceiver| transceiver.kind() == rustrtc::MediaKind::Video)
+                    .unwrap()
+            };
+            let source_video = video(&source.pc);
+            let source_sender = source_video.sender().unwrap();
+            let target_sender = video(&target.pc).sender().unwrap();
+            let source_transport = source_sender.transport().unwrap();
+            let target_transport = target_sender.transport().unwrap();
+            let target_leg = h.mb.leg(target_side).unwrap();
+            let target_video = video(target_leg.pc());
+            let target_primary_ssrc = target_video.sender().unwrap().ssrc();
+            let target_rtx_ssrc = target_video.sender_rtx_ssrc().unwrap();
+            let source_rtx = RtxSenderConfig {
+                rtx_ssrc: source_video.sender_rtx_ssrc().unwrap(),
+                rtx_payload_type: src_rtx_pt,
+            };
+            let (capture, mut received) = mpsc::unbounded_channel();
+            target.pc.add_observer(Arc::new(Capture {
+                primary_pt: dst_pt,
+                repair_pt: dst_rtx_pt,
+                packets: capture,
+            }));
+            let mut upstream_feedback = source_sender.subscribe_rtcp();
+            let mut primary = Vec::new();
+            let packet = |seq: u16| {
+                let mut header = RtpHeader::new(
+                    src_pt,
+                    seq,
+                    9_000 + u32::from(seq - 100) * 3_600,
+                    source_sender.ssrc(),
+                );
+                header.marker = true;
+                RtpPacket::new(header, vec![0x65, 1, 2, seq as u8])
+            };
+            for seq in [100, 102, 104] {
+                source_transport.send_rtp(packet(seq)).await.unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .expect("primary crosses the relay")
+                    .unwrap();
+                assert_eq!(received.header.payload_type, dst_pt);
+                assert_eq!(received.header.ssrc, target_primary_ssrc);
+                primary.push(received.header);
+            }
+
+            let start = primary[0].sequence_number;
+            assert_eq!(primary[2].sequence_number, start.wrapping_add(4));
+            target_transport
+                .send_rtcp(&[RtcpPacket::GenericNack(GenericNack {
+                    sender_ssrc: target_sender.ssrc(),
+                    media_ssrc: target_primary_ssrc,
+                    lost_packets: vec![start.wrapping_add(1), start.wrapping_add(3)],
+                })])
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let RtcpPacket::GenericNack(nack) = upstream_feedback.recv().await.unwrap()
+                        && nack.lost_packets == [101, 103]
+                    {
+                        assert_eq!(nack.media_ssrc, source_sender.ssrc());
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("NACK is translated into the original sequence space");
+
+            let mut repair_sequences = Vec::new();
+            for (original, repair_seq) in [(101, 50), (103, 53)] {
+                let repair = wrap_rtx_packet(&packet(original), &source_rtx, repair_seq);
+                source_transport.send_rtp(repair).await.unwrap();
+                let received = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .expect("RTX crosses the relay")
+                    .unwrap();
+                assert_eq!(received.header.payload_type, dst_rtx_pt);
+                assert_eq!(received.header.ssrc, target_rtx_ssrc);
+                assert_eq!(
+                    decode_osn(&received.payload),
+                    Some(start.wrapping_add(original - 100))
+                );
+                assert_eq!(
+                    received.header.timestamp,
+                    primary[0].timestamp.wrapping_add(u32::from(original - 100) * 3_600)
+                );
+                assert!(received.header.marker);
+                assert_eq!(&received.payload[2..], packet(original).payload.as_ref());
+                repair_sequences.push(received.header.sequence_number);
+            }
+            assert_eq!(repair_sequences[1], repair_sequences[0].wrapping_add(1));
+            source_transport.send_rtp(packet(105)).await.unwrap();
+            let next = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .expect("primary relay remains active after RTX")
+                .unwrap();
+            assert_eq!(next.header.sequence_number, start.wrapping_add(5));
+            assert_eq!(next.header.timestamp, primary[0].timestamp.wrapping_add(5 * 3_600));
+        }
+        h.close();
+    }
+}
+
+/// End-to-end MediaBridge transcode (G.729 + DTMF 101 ↔ PCMU + DTMF 101) under
+/// DTX:
+/// - G.729 speech → 22-byte speech+SID → standalone 2-byte SIDs → 4-byte RFC 3389
+///   PT 13 Comfort Noise → real PT 101 DTMF → resumed G.729 speech.
+/// - Verifies PT 13 CN (4 bytes) never spoofs PT 101 DTMF on leg B, real PT 101
+///   DTMF still relays, and leg B receives clean digital silence during DTX.
+#[tokio::test]
+async fn transcode_g729_dtx_and_cn_do_not_spoof_dtmf_or_leak_cng() {
+    use rustrtc::rtp::{RtpHeader, RtpPacket};
+
+    let g729 = MediaNegotiator::codec_info_for_type(CodecType::G729);
+    let pcmu = MediaNegotiator::codec_info_for_type(CodecType::PCMU);
+    let dtmf = CodecInfo {
+        payload_type: 101,
+        codec: CodecType::TelephoneEvent,
+        clock_rate: 8000,
+        channels: 1,
+        fmtp: Some("0-16".into()),
+    };
+    let caps_for = |audio: &CodecInfo| {
+        let mut caps = rustrtc::config::MediaCapabilities::default();
+        caps.audio = vec![
+            audio.to_audio_capability().unwrap(),
+            dtmf.to_audio_capability().unwrap(),
+        ];
+        caps
+    };
+
+    let mut cfg_a = rtc_config(TransportMode::Rtp, &g729);
+    cfg_a.media_capabilities = Some(caps_for(&g729));
+    let mut cfg_b = rtc_config(TransportMode::Rtp, &pcmu);
+    cfg_b.media_capabilities = Some(caps_for(&pcmu));
+
+    // Disable comfort noise on leg B so DTX silence is exact PCMU digital silence (0xFF).
+    let leg_a = LegInner::from_rtc_config(
+        "a",
+        cfg_a,
+        vec![g729.clone(), dtmf.clone()],
+        false,
+        -35.0,
+        None,
+        None,
+    )
+    .unwrap();
+    let leg_b = LegInner::from_rtc_config(
+        "b",
+        cfg_b,
+        vec![pcmu.clone(), dtmf.clone()],
+        false,
+        -35.0,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let test_a = TestPeer::with_caps(TransportMode::Rtp, g729.clone(), caps_for(&g729));
+    let test_b = TestPeer::with_caps(TransportMode::Rtp, pcmu.clone(), caps_for(&pcmu));
+    negotiate(&test_a, &leg_a).await;
+    negotiate(&test_b, &leg_b).await;
+
+    let mut mb = MediaBridge::new("transcode-dtx-e2e");
+    mb.replace_leg(LegSide::A, leg_a).await;
+    mb.replace_leg(LegSide::B, leg_b).await;
+    mb.accept(LegSide::A).await;
+    mb.accept(LegSide::B).await;
+    assert!(!mb.leg(LegSide::B).unwrap().egress_is_relay());
+
+    let pcmu_silence: Vec<u8> = audio_codec::create_encoder(CodecType::PCMU).encode(&vec![0i16; 160]);
+    let tone: Vec<i16> = (0..160)
+        .map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / 8000.0).sin() * 12_000.0) as i16)
+        .collect();
+    let g729_speech = audio_codec::create_encoder(CodecType::G729).encode(&tone);
+    assert_eq!(g729_speech.len(), 20);
+    let mut g729_mixed = g729_speech.clone();
+    g729_mixed.extend_from_slice(&[0x12, 0x34]);
+
+    let ssrc = test_a
+        .pc
+        .get_transceivers()
+        .into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Audio)
+        .and_then(|t| t.sender())
+        .unwrap()
+        .ssrc();
+    let send_raw = |pt: u8, seq: u16, ts: u32, payload: Vec<u8>| {
+        let pc = test_a.pc.clone();
+        async move {
+            pc.send_raw_rtp(RtpPacket::new(RtpHeader::new(pt, seq, ts, ssrc), payload))
+                .await
+                .unwrap();
+        }
+    };
+
+    // 1. Send 3 speech packets + 22 B mixed speech+SID to prime, arm, and enter DTX.
+    send_raw(18, 1, 160, g729_speech.clone()).await;
+    send_raw(18, 2, 320, g729_speech.clone()).await;
+    send_raw(18, 3, 480, g729_speech.clone()).await;
+    send_raw(18, 4, 640, g729_mixed).await;
+
+    // 2. Send standalone 2 B SIDs and a 4-byte RFC 3389 PT 13 CN packet (event-like
+    //    byte 0 = 5, length = 4) that previously spoofed PT 101 DTMF digit '5'.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    send_raw(18, 5, 1120, vec![0x12, 0x34]).await;
+    send_raw(13, 6, 1280, vec![5, 0x8a, 0x00, 0xA0]).await;
+    send_raw(18, 7, 1440, vec![0x12, 0x34]).await;
+
+    // Wait for transcoded speech and subsequent DTX silence on leg B; assert
+    // zero spoofed PT 101 packets before we send a real digit.
+    let mut saw_speech = false;
+    let mut consecutive_silence = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && !(saw_speech && consecutive_silence >= 4) {
+        if let Some(frame) = test_b.recv_audio(150).await {
+            assert_eq!(
+                frame.payload_type,
+                Some(0),
+                "PT 13 CN must never be emitted as PT 101 DTMF; got PT {:?}",
+                frame.payload_type
+            );
+            if frame.data.as_ref() == pcmu_silence.as_slice() {
+                if saw_speech {
+                    consecutive_silence += 1;
+                }
+            } else {
+                saw_speech = true;
+                consecutive_silence = 0;
+            }
+        }
+    }
+    assert!(saw_speech, "leg B must receive transcoded G.729 speech");
+    assert!(
+        consecutive_silence >= 4,
+        "leg B must receive clean digital silence during G.729B/CN DTX, got {consecutive_silence}"
+    );
+
+    // 3. Real negotiated PT 101 DTMF still crosses transcode cleanly.
+    send_raw(101, 8, 2400, vec![7, 0x8a, 0x00, 0xA0]).await;
+    let mut saw_real_dtmf = false;
+    let dtmf_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < dtmf_deadline {
+        if let Some(frame) = test_b.recv_audio(150).await
+            && frame.payload_type == Some(101)
+            && frame.data.first() == Some(&7)
+        {
+            saw_real_dtmf = true;
+            break;
+        }
+    }
+    assert!(saw_real_dtmf, "negotiated PT 101 DTMF must still relay across transcode");
+
+    mb.close();
+}
+
+/// Pure relay (`RewriteRelay`) with mismatched voice PTs (Opus PT 111 ↔ PT 96)
+/// and shared DTMF PT (101):
+/// - Voice & Opus DTX packets on PT 111 must be rewritten to PT 96.
+/// - RFC 3389 PT 13 Comfort Noise must stay PT 13 (never rewritten to PT 96).
+/// - Shared PT 101 DTMF must stay PT 101 (never rewritten to PT 96).
+#[tokio::test]
+async fn relay_mismatched_voice_pt_preserves_pt13_cn_and_same_pt_dtmf() {
+    use rustrtc::rtp::{RtpHeader, RtpPacket};
+
+    #[derive(Default)]
+    struct WireCapture(std::sync::Mutex<Vec<(u8, Vec<u8>)>>);
+    impl RtpObserver for WireCapture {
+        fn on_ingress(&self, packet: &RtpPacket, _src: std::net::SocketAddr) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((packet.header.payload_type, packet.payload.to_vec()));
+        }
+    }
+
+    let opus_a = CodecInfo {
+        payload_type: 111,
+        codec: CodecType::Opus,
+        clock_rate: 48_000,
+        channels: 2,
+        fmtp: Some("minptime=10;useinbandfec=1".into()),
+    };
+    let opus_b = CodecInfo {
+        payload_type: 96,
+        codec: CodecType::Opus,
+        clock_rate: 48_000,
+        channels: 2,
+        fmtp: Some("minptime=10;useinbandfec=1".into()),
+    };
+    let dtmf = CodecInfo {
+        payload_type: 101,
+        codec: CodecType::TelephoneEvent,
+        clock_rate: 48_000,
+        channels: 1,
+        fmtp: Some("0-16".into()),
+    };
+    let caps_for = |audio: &CodecInfo| {
+        let mut caps = rustrtc::config::MediaCapabilities::default();
+        caps.audio = vec![
+            audio.to_audio_capability().unwrap(),
+            dtmf.to_audio_capability().unwrap(),
+        ];
+        caps
+    };
+
+    let mut cfg_a = rtc_config(TransportMode::Rtp, &opus_a);
+    cfg_a.media_capabilities = Some(caps_for(&opus_a));
+    let mut cfg_b = rtc_config(TransportMode::Rtp, &opus_b);
+    cfg_b.media_capabilities = Some(caps_for(&opus_b));
+
+    let leg_a = LegInner::from_rtc_config("a", cfg_a, vec![opus_a.clone(), dtmf.clone()], false, -35.0, None, None).unwrap();
+    let leg_b = LegInner::from_rtc_config("b", cfg_b, vec![opus_b.clone(), dtmf.clone()], false, -35.0, None, None).unwrap();
+    let test_a = TestPeer::with_caps(TransportMode::Rtp, opus_a.clone(), caps_for(&opus_a));
+    let test_b = TestPeer::with_caps(TransportMode::Rtp, opus_b.clone(), caps_for(&opus_b));
+    let capture_b = std::sync::Arc::new(WireCapture::default());
+    test_b.pc.add_observer(capture_b.clone());
+
+    negotiate(&test_a, &leg_a).await;
+    negotiate(&test_b, &leg_b).await;
+
+    let mut mb = MediaBridge::new("relay-pt-preserve");
+    mb.replace_leg(LegSide::A, leg_a).await;
+    mb.replace_leg(LegSide::B, leg_b).await;
+    mb.accept(LegSide::A).await;
+    mb.accept(LegSide::B).await;
+    assert!(mb.leg(LegSide::B).unwrap().egress_is_relay());
+
+    let ssrc = test_a
+        .pc
+        .get_transceivers()
+        .into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Audio)
+        .and_then(|t| t.sender())
+        .unwrap()
+        .ssrc();
+    let speech = audio_codec::create_encoder(CodecType::Opus).encode(&vec![1000i16; 960]);
+    let dtx_marker = vec![0xF8];
+    let cn_payload = vec![40u8, 0x10, 0x20, 0x30];
+    let dtmf_payload = vec![5u8, 0x8a, 0x00, 0xA0];
+
+    for (seq, ts, pt, payload) in [
+        (1u16, 960u32, 111u8, speech.clone()),
+        (2, 1920, 111, dtx_marker.clone()),
+        (3, 2880, 13, cn_payload.clone()),
+        (4, 3840, 101, dtmf_payload.clone()),
+    ] {
+        test_a
+            .pc
+            .send_raw_rtp(RtpPacket::new(RtpHeader::new(pt, seq, ts, ssrc), payload))
+            .await
+            .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if capture_b.0.lock().unwrap().len() >= 4 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let received = capture_b.0.lock().unwrap().clone();
+    assert!(
+        received.contains(&(96, speech)),
+        "Opus speech PT 111 must rewrite to PT 96; got {:?}",
+        received.iter().map(|(pt, p)| (*pt, p.len())).collect::<Vec<_>>()
+    );
+    assert!(
+        received.contains(&(96, dtx_marker)),
+        "Opus DTX PT 111 must rewrite to PT 96"
+    );
+    assert!(
+        received.contains(&(13, cn_payload)),
+        "RFC 3389 PT 13 CN must stay PT 13, never rewritten to PT 96; got {:?}",
+        received.iter().map(|(pt, p)| (*pt, p.len())).collect::<Vec<_>>()
+    );
+    assert!(
+        received.contains(&(101, dtmf_payload)),
+        "shared PT 101 DTMF must stay PT 101, never rewritten to PT 96; got {:?}",
+        received.iter().map(|(pt, p)| (*pt, p.len())).collect::<Vec<_>>()
+    );
+
+    mb.close();
+}
+
+/// G.729 Annex B mismatch (`annexb=yes` / omitted on Leg A vs `annexb=no` on
+/// Leg B):
+/// - `MediaBridge` must fall back to transcoding rather than forwarding raw
+///   2-byte Annex B SID frames into an `annexb=no` decoder.
+/// - Every G.729 packet reaching Leg B must be a pure multiple of 10 bytes
+///   (zero 2-byte or `10*N + 2` SID frames).
+/// - When both legs agree on `annexb=no`, `MediaBridge` stays on pure relay.
+#[tokio::test]
+async fn g729_annexb_mismatch_transcodes_and_strips_sid_while_matching_relays() {
+    use rustrtc::rtp::{RtpHeader, RtpPacket};
+
+    let g729_yes = CodecInfo {
+        payload_type: 18,
+        codec: CodecType::G729,
+        clock_rate: 8000,
+        channels: 1,
+        fmtp: None, // RFC 3551 default: annexb=yes
+    };
+    let g729_no = CodecInfo {
+        payload_type: 18,
+        codec: CodecType::G729,
+        clock_rate: 8000,
+        channels: 1,
+        fmtp: Some("annexb=no".into()),
+    };
+    let mk_leg_and_peer = |name: &str, codec: &CodecInfo| {
+        let cfg = rtc_config(TransportMode::Rtp, codec);
+        let leg = LegInner::from_rtc_config(name, cfg, vec![codec.clone()], false, -35.0, None, None).unwrap();
+        let peer = TestPeer::new(TransportMode::Rtp, codec.clone());
+        (leg, peer)
+    };
+
+    // Part 1: Matching `annexb=no` on both legs -> pure relay (`RewriteRelay`).
+    {
+        let (leg_a, test_a) = mk_leg_and_peer("a-match", &g729_no);
+        let (leg_b, test_b) = mk_leg_and_peer("b-match", &g729_no);
+        negotiate(&test_a, &leg_a).await;
+        negotiate(&test_b, &leg_b).await;
+        let mut mb = MediaBridge::new("g729-annexb-match");
+        mb.replace_leg(LegSide::A, leg_a).await;
+        mb.replace_leg(LegSide::B, leg_b).await;
+        mb.accept(LegSide::A).await;
+        mb.accept(LegSide::B).await;
+        assert!(
+            mb.leg(LegSide::B).unwrap().egress_is_relay(),
+            "matching G.729 annexb=no on both legs must stay on pure relay"
+        );
+        mb.close();
+    }
+
+    // Part 2: Mismatched `annexb=yes` (A) vs `annexb=no` (B) -> TranscodePeer
+    // strips 2-byte SID frames and emits pure 10-byte-aligned G.729A frames.
+    let (leg_a, test_a) = mk_leg_and_peer("a-yes", &g729_yes);
+    let (leg_b, test_b) = mk_leg_and_peer("b-no", &g729_no);
+    negotiate(&test_a, &leg_a).await;
+    negotiate(&test_b, &leg_b).await;
+
+    let mut mb = MediaBridge::new("g729-annexb-mismatch");
+    mb.replace_leg(LegSide::A, leg_a).await;
+    mb.replace_leg(LegSide::B, leg_b).await;
+    mb.accept(LegSide::A).await;
+    mb.accept(LegSide::B).await;
+    assert!(
+        !mb.leg(LegSide::B).unwrap().egress_is_relay(),
+        "G.729 annexb=yes vs annexb=no must fall back to transcoding"
+    );
+
+    let ssrc = test_a
+        .pc
+        .get_transceivers()
+        .into_iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Audio)
+        .and_then(|t| t.sender())
+        .unwrap()
+        .ssrc();
+    let mut enc = audio_codec::create_encoder(CodecType::G729);
+    let tone: Vec<i16> = (0..160)
+        .map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / 8000.0).sin() * 12_000.0) as i16)
+        .collect();
+    let speech = enc.encode(&tone);
+    let mut mixed_22 = speech.clone();
+    mixed_22.extend_from_slice(&[0x12, 0x34]);
+
+    for (seq, ts, payload) in [
+        (1u16, 160u32, speech.clone()),
+        (2, 320, speech.clone()),
+        (3, 480, mixed_22),
+        (4, 640, vec![0x12, 0x34]),
+        (5, 800, vec![0x12, 0x34]),
+    ] {
+        test_a
+            .pc
+            .send_raw_rtp(RtpPacket::new(RtpHeader::new(18, seq, ts, ssrc), payload))
+            .await
+            .unwrap();
+    }
+
+    let mut received_frames = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline && received_frames < 5 {
+        if let Some(frame) = test_b.recv_audio(150).await {
+            assert_eq!(frame.payload_type, Some(18));
+            assert!(
+                !frame.data.is_empty() && frame.data.len() % 10 == 0,
+                "annexb=no peer must only receive 10*N-byte G.729A frames, never SID; got {} bytes",
+                frame.data.len()
+            );
+            received_frames += 1;
+        }
+    }
+    assert!(received_frames >= 5, "expected >= 5 transcoded G.729A frames, got {received_frames}");
+
+    mb.close();
+}
+>>>>>>> deploy

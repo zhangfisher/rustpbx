@@ -42,12 +42,51 @@ pub mod uui;
 mod call_test;
 pub use cookie::{
     CalleeDisplayName, CalleeOfflineMarker, CallerPeerContext, MatchedRoute, OutboundTrunkContext,
+<<<<<<< HEAD
     TransactionCookie, TrunkContext,
+=======
+    ReferReplacesContext, TransactionCookie, TrunkContext,
+>>>>>>> deploy
 };
+
+/// Attended-transfer REFER-Replaces chain: marker on the REPLACED (consult)
+/// session — its CDR row is suppressed (the replacement session inherits the
+/// root session id and carries the transferred call's record). The CC
+/// call-session hook reads this marker from the session context extensions
+/// and skips the `cc_calls` persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CdrSuppressedMarker;
+
+/// Attended-transfer REFER-Replaces chain: marker on the REPLACEMENT session
+/// — its target leg is a RFC 3891 auto-answered transfer. The CC hook admits
+/// the connect even though the replaced dialog's release already pushed the
+/// agent into Wrapup (the replacement is the agent's live call, not a stale
+/// queue answer) so the transferred call keeps its agent-side recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferReplacesMarker;
 pub use user::SipUser;
 
 /// Default hold audio that ships with config/sounds, relocated in Dockerfile to /app/sounds.
+/// Agent-ringback tone: played to the *caller* once an agent's leg actually
+/// returns 180 Ringing (`[proxy] queue_agent_ringback_enabled`). This is a
+/// "ringing" sound on purpose — it must NOT be used as queue waiting music.
 pub const DEFAULT_QUEUE_HOLD_AUDIO: &str = "sounds/phone-calling.wav";
+
+/// Built-in queue waiting music (Chinese guzheng 五声 loop, **A 宫** — bright
+/// and forward moving with a soft quarter-note bass pulse; 8 kHz mono, the
+/// native telephone rate; original & royalty-free — regenerate with
+/// `tools/gen_builtin_music.py`). Played while the caller is queued / no agent
+/// is available, i.e. the "waiting" half of the queue experience.
+/// `[proxy] queue_hold_music` overrides it.
+pub const DEFAULT_QUEUE_WAIT_AUDIO: &str = "sounds/queue-waiting-8k.wav";
+
+/// Built-in music for the party **on hold** (Chinese guzheng 五声 loop in a
+/// deliberately **different key**: **D 宫**, slower and airier, so a caller can
+/// tell "still queued" from "on hold" by ear alone; regenerate with
+/// `tools/gen_builtin_music.py`). `[proxy] hold_music` overrides it. Distinct
+/// from [`DEFAULT_QUEUE_HOLD_AUDIO`] (the agent ringback) so a held caller
+/// never mistakes "hold" for "someone's phone is ringing".
+pub const DEFAULT_HOLD_AUDIO: &str = "sounds/hold-music-8k.wav";
 /// Default prompt played when a queue cannot find an available agent.
 pub const DEFAULT_QUEUE_FAILURE_AUDIO: &str = "sounds/unavailable-phone.wav";
 
@@ -87,6 +126,59 @@ pub struct VoicePrompts {
     /// the answering agent's display name (percent-encoded inside URLs).
     #[serde(default)]
     pub service_prompt: Option<String>,
+<<<<<<< HEAD
+=======
+    /// Prompt announcing the wait-for-callback option once
+    /// `QueueCallbackConfig::offer_after_secs` of queue wait elapsed
+    /// (e.g. "Press 2 if you'd like us to call you back"). Absent = the
+    /// option is offered silently (the DTMF key still works past the
+    /// threshold) — deployments without the recording keep the feature usable.
+    #[serde(default)]
+    pub callback_offer_prompt: Option<String>,
+    /// Prompt played after the caller pressed the callback key, confirming
+    /// the request was registered (e.g. "Your callback has been scheduled,
+    /// goodbye"). The queue hangs up (BySystem) when this prompt completes.
+    #[serde(default)]
+    pub callback_confirm_prompt: Option<String>,
+}
+
+/// Wait-for-callback option offered to a queued caller after a configured
+/// wait duration. **Disabled by default** — absent route-queue spec sections
+/// and default-constructed configs never offer the option, so existing
+/// deployments see no behavior change until an operator turns it on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueCallbackConfig {
+    /// Master switch. `false` (the default everywhere) = the queue behaves
+    /// exactly as before the feature existed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Queue wait (seconds, measured from this queue entry's enqueue instant)
+    /// after which the callback option becomes available: the offer prompt
+    /// plays once (when configured) and the DTMF key starts being accepted.
+    #[serde(default = "default_callback_offer_after_secs")]
+    pub offer_after_secs: u64,
+    /// DTMF key the caller presses to request the callback (default `"2"`).
+    #[serde(default = "default_callback_dtmf_key")]
+    pub dtmf_key: String,
+}
+
+fn default_callback_offer_after_secs() -> u64 {
+    30
+}
+
+fn default_callback_dtmf_key() -> String {
+    "2".to_string()
+}
+
+impl Default for QueueCallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            offer_after_secs: default_callback_offer_after_secs(),
+            dtmf_key: default_callback_dtmf_key(),
+        }
+    }
+>>>>>>> deploy
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -112,6 +204,11 @@ impl VoicePrompts {
             final_destination_prompt: None,
             comfort_prompts: Vec::new(),
             service_prompt: None,
+<<<<<<< HEAD
+=======
+            callback_offer_prompt: None,
+            callback_confirm_prompt: None,
+>>>>>>> deploy
         }
     }
 
@@ -153,6 +250,102 @@ pub struct Location {
     pub transport: Option<Transport>,
     pub user_agent: Option<String>,
     pub home_proxy: Option<SipAddr>,
+    /// Outbound trunk selected by the route table for this target (if any).
+    /// Carried on the resolved location so per-target outbound INVITEs can
+    /// stamp the trunk's session-id correlation header
+    /// (`session_id_header`) even when the context never reaches the
+    /// session-level dialplan extensions (dynamic legs / transfer targets).
+    pub outbound_trunk: Option<OutboundTrunkContext>,
+}
+
+/// One routed or sequential destination, including its overrides and retry policy.
+#[derive(Clone)]
+pub struct DialAttempt {
+    pub location: Location,
+    /// None inherits the shared dialplan caller.
+    pub caller: Option<rsipstack::sip::Uri>,
+    pub hints: Option<Arc<crate::config::DialplanHints>>,
+    /// Per-attempt dial ring timeout (e.g. from trunk `max_ring_time`).
+    /// Independent of the call-wide `Dialplan::max_ring_time`.
+    pub max_ring_time: Option<Duration>,
+    /// None advances after failure; an empty status-code list stops retry.
+    pub retry_policy: Option<crate::proxy::routing::RetryPolicy>,
+}
+
+impl From<Location> for DialAttempt {
+    fn from(location: Location) -> Self {
+        Self { location, caller: None, hints: None, max_ring_time: None, retry_policy: None }
+    }
+}
+
+/// Preserve trunk rewrites from routing in the destination used for dialing.
+impl From<crate::config::RouteTarget> for DialAttempt {
+    fn from(target: crate::config::RouteTarget) -> Self {
+        let option = target.option;
+        let max_ring_time = target.hints.as_ref().and_then(|hints| hints.max_ring_time);
+        Self {
+            location: Location {
+                aor: option.callee,
+                destination: option.destination,
+                credential: option.credential,
+                headers: option.headers,
+                ..Default::default()
+            },
+            caller: Some(option.caller),
+            hints: target.hints.map(Arc::new),
+            max_ring_time,
+            // A routed target without a policy never advances.
+            retry_policy: Some(target.retry_policy.unwrap_or_default()),
+        }
+    }
+}
+
+impl Location {
+    /// Whether a dial to this resolved location must be delivered through the
+    /// registration's REMOTE home node (`true`) or locally (`false`).
+    ///
+    /// Single source of truth for "the endpoint is not registered on this
+    /// machine": `home_proxy` is stamped at REGISTER time with the owning
+    /// node's cluster-internal address, so a mismatch against this node's
+    /// identity means the INVITE (and the dialog) leave for another node —
+    /// which then owns the leg-role attribution for that leg
+    /// (`SipSession::route_via_home_proxy`, queue agent dialing).
+    ///
+    /// The self check compares the registration's home address against this
+    /// node's deterministic identity: the cluster-internal address resolved
+    /// from `[cluster].peers` when available, otherwise the default contact
+    /// URI. Live endpoint addresses must NOT be consulted here
+    /// (see `SipSession::route_via_home_proxy` for the full rationale).
+    pub fn routes_via_remote_home_proxy(
+        &self,
+        cluster_enabled: bool,
+        self_ident: Option<&SipAddr>,
+    ) -> bool {
+        if !cluster_enabled {
+            return false;
+        }
+        let Some(home_proxy) = self.home_proxy.as_ref() else {
+            return false;
+        };
+        match self_ident {
+            Some(self_addr) => self_addr.addr.to_string() != home_proxy.addr.to_string(),
+            // Unknown self identity: deliver through the home node, which is
+            // authoritative for its own registrations.
+            None => true,
+        }
+    }
+}
+
+impl std::fmt::Debug for DialAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DialAttempt")
+            .field("callee", &self.location.aor)
+            .field("caller", &self.caller)
+            .field("hints", &self.hints)
+            .field("max_ring_time", &self.max_ring_time)
+            .field("retry_policy", &self.retry_policy)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One routed or sequential destination, including its overrides and retry policy.
@@ -425,6 +618,7 @@ pub fn transfer_target_kind(target: &str) -> Option<String> {
 /// Rules:
 /// - `"sip:user@host"` → unchanged
 /// - `"sip:user"`      → `"sip:user@<realm>"`
+/// - `"sips:host:5061"` → unchanged
 /// - `"user@host"`     → `"sip:user@host"`
 /// - `"user"`          → `"sip:user@<realm>"`
 /// - `"tel:+"`         → unchanged
@@ -434,16 +628,17 @@ pub fn build_sip_uri(target: &str, realm: &str) -> String {
         return format!("sip:anonymous@{}", realm);
     }
 
-    if let Some(rest) = trimmed.strip_prefix("sip:") {
-        if rest.contains('@') {
-            // "sip:user@host" → pass through
+    if let Some(address) = crate::proxy::routing::strip_sip_scheme(trimmed) {
+        let authority = address.split([';', '?']).next().unwrap_or(address);
+        if address.contains('@') || authority.contains(':') {
             trimmed.to_string()
         } else {
-            // "sip:user" → "sip:user@realm"
-            format!("sip:{}@{}", rest, realm)
+            format!("{trimmed}@{realm}")
         }
-    } else if let Some(_rest) = trimmed.strip_prefix("tel:") {
-        // tel: URIs are passed as-is
+    } else if trimmed
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tel:"))
+    {
         trimmed.to_string()
     } else if trimmed.contains('@') {
         // "user@host" → "sip:user@host"
@@ -570,13 +765,25 @@ impl QueueHoldConfig {
 }
 
 /// Fill a queue plan's wait audio from the PBX-wide default
+<<<<<<< HEAD
 /// (`[proxy] queue_hold_music`) when the queue has no audio of its own.
+=======
+/// (`queue_wait_music()` = `[proxy] queue_hold_music` > built-in
+/// `sounds/queue-waiting-8k.wav`) when the queue has no audio of its own.
+>>>>>>> deploy
 ///
 /// Priority: per-queue `[proxy.queues.<name>.hold].audio_file` > global
 /// default. An existing hold config keeps its `loop_playback` setting — only
 /// the missing audio file is filled. When this leaves the hold audio unset,
 /// downstream behavior is unchanged (skill-group queues still fall back to
 /// the built-in ringback in the app factory; plain route queues stay silent).
+<<<<<<< HEAD
+=======
+///
+/// The wait audio is deliberately distinct from the agent ringback
+/// (`DEFAULT_QUEUE_HOLD_AUDIO`): a queued caller must not mistake "waiting
+/// for an agent" for "an agent's phone is ringing".
+>>>>>>> deploy
 pub fn apply_queue_hold_music_default(plan: &mut QueuePlan, global: Option<String>) {
     let needs_file = match plan.hold.as_ref() {
         None => true,
@@ -615,7 +822,12 @@ impl Default for BusyWaitPlan {
         Self {
             max_wait: Some(Duration::from_secs(60)),
             retry_interval: Duration::from_secs(5),
+<<<<<<< HEAD
             hold_audio: DEFAULT_QUEUE_HOLD_AUDIO.to_string(),
+=======
+            // Camp-on (busy wait) is a *waiting* phase, not a ringback.
+            hold_audio: DEFAULT_QUEUE_WAIT_AUDIO.to_string(),
+>>>>>>> deploy
         }
     }
 }
@@ -635,6 +847,13 @@ pub struct QueuePlan {
     /// default). Carried from app params (`StartApp("queue", …)` / outbound
     /// `on_answer: enqueue`) through `queue_joined` and the shared-queue row.
     pub priority: u32,
+<<<<<<< HEAD
+=======
+    /// Wait-for-callback option resolved from the route-queue spec
+    /// (`None` = not enabled — the overwhelming default; existing specs have
+    /// no callback section at all).
+    pub callback: Option<QueueCallbackConfig>,
+>>>>>>> deploy
 }
 
 impl Default for QueuePlan {
@@ -642,9 +861,12 @@ impl Default for QueuePlan {
         Self {
             accept_immediately: false,
             passthrough_ringback: false,
-            hold: Some(
-                QueueHoldConfig::default().with_audio_file(DEFAULT_QUEUE_HOLD_AUDIO.to_string()),
-            ),
+            // No wait audio of its own: `apply_queue_hold_music_default`
+            // fills it from `[proxy] queue_hold_music` / `hold_music`, and
+            // skill-group queues fall back to the built-in ringback in the
+            // app factory when nothing is configured. Carrying the ringback
+            // here made every queued caller hear the "agent ringing" tone.
+            hold: None,
             fallback: Some(QueueFallbackAction::Failure(
                 FailureAction::PlayThenHangup {
                     audio_file: DEFAULT_QUEUE_FAILURE_AUDIO.to_string(),
@@ -659,6 +881,10 @@ impl Default for QueuePlan {
             voice_prompts: None,
             queue_name: String::new(),
             priority: 0,
+<<<<<<< HEAD
+=======
+            callback: None,
+>>>>>>> deploy
         }
     }
 }

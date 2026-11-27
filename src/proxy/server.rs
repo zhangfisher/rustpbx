@@ -808,9 +808,23 @@ impl SipServerBuilder {
                     .as_ref()
                     .map(|ip| SocketAddr::new(*ip, udp_port));
                 let udp_conn = if let Some(rolling) = &self.rolling {
+<<<<<<< HEAD
                     // Rolling successor: socket owned by the rolling pump so
                     // inbound datagrams get a pre-transaction forward hook.
                     crate::rolling::create_udp_transport(local_addr, rolling).await?
+=======
+                    // Rolling: a REAL UdpConnection (unreliable semantics,
+                    // per-datagram peer address) whose socket the runtime also
+                    // keeps for relay_egress. Pre-transaction relay decisions
+                    // live in the endpoint's transport inspector.
+                    crate::rolling::create_udp_transport(
+                        local_addr,
+                        external_addr,
+                        rolling.udp_close_token(),
+                        rolling,
+                    )
+                    .await?
+>>>>>>> deploy
                 } else {
                     let udp_conn = UdpConnection::create_connection(
                         local_addr,
@@ -825,6 +839,7 @@ impl SipServerBuilder {
                     info!("start proxy, udp port: {}", udp_port);
                     conn
                 };
+<<<<<<< HEAD
                 // The rolling UDP transport is a ChannelConnection: it must be
                 // served via add_connection (spawns the serve_loop that feeds
                 // injected events into the endpoint) AND present in listens
@@ -833,6 +848,10 @@ impl SipServerBuilder {
                     transport_layer.add_connection(udp_conn.clone());
                     bound_transports.push(udp_conn.clone());
                     let _ = rolling;
+=======
+                if self.rolling.is_some() {
+                    bound_transports.push(udp_conn.clone());
+>>>>>>> deploy
                 }
                 transport_layer.add_transport(udp_conn.clone());
                 local_addrs.insert(local_addr);
@@ -973,6 +992,10 @@ impl SipServerBuilder {
             config.session_id_length,
             config.session_id_header_mode,
             config.session_id_inherit_callid,
+<<<<<<< HEAD
+=======
+            config.session_id_default_header.clone(),
+>>>>>>> deploy
         );
         if session_id_length != config.session_id_length {
             warn!(
@@ -1107,6 +1130,22 @@ impl SipServerBuilder {
             }
         });
 
+<<<<<<< HEAD
+=======
+        let transport_inspector = TransportInspectorLocator::new(
+            locator.clone(),
+            locator_events.clone(),
+            locator_event_lock.clone(),
+        );
+        // Rolling: the successor must relay in-dialog datagrams belonging to
+        // the predecessor's live calls BEFORE a local transaction exists.
+        let transport_inspector = if self.rolling.is_some() {
+            crate::rolling::RollingIngressInspector::new(transport_inspector, self.rolling.clone())
+        } else {
+            transport_inspector
+        };
+
+>>>>>>> deploy
         endpoint_builder = endpoint_builder
             .with_target_locator(DialogTargetLocator::new(
                 locator.clone(),
@@ -1114,11 +1153,15 @@ impl SipServerBuilder {
                 cluster_enabled,
                 cluster_self_addr.clone(),
             ))
+<<<<<<< HEAD
             .with_transport_inspector(TransportInspectorLocator::new(
                 locator.clone(),
                 locator_events.clone(),
                 locator_event_lock.clone(),
             ));
+=======
+            .with_transport_inspector(transport_inspector);
+>>>>>>> deploy
 
         let endpoint = endpoint_builder.build();
 
@@ -1737,13 +1780,19 @@ impl SipServer {
                                 })
                                 .any(|network| network.contains(&ip))
                         });
+<<<<<<< HEAD
+=======
+                        let source_port = remote_addr
+                            .and_then(|addr| addr.addr.port.map(|p| p.0));
+>>>>>>> deploy
                         let is_trunk = if let Some(ref ip) = via_ip {
                             let inbound_trunks = self.inner.data_context.acl_inbound_trunks.load();
                             let source_network = ipnet::IpNet::from(*ip);
-                            inbound_trunks
-                                .cover_values(&source_network)
-                                .next()
-                                .is_some()
+                            inbound_trunks.cover_values(&source_network).any(|candidates| {
+                                candidates
+                                    .iter()
+                                    .any(|c| c.port.is_none() || c.port == source_port)
+                            })
                         } else {
                             false
                         };

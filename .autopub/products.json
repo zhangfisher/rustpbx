@@ -1,0 +1,54 @@
+{
+    "products": [
+        {
+            "id": "1",
+            "name": "nurse-station-host",
+            "title": "护士站主机",
+            "models": [
+                "E8301",
+                "E8302",
+                "E8303"
+            ]
+        },
+        {
+            "id": "2",
+            "name": "sickroom-device",
+            "title": "病房分机",
+            "models": [
+                "E8201",
+                "E8202"
+            ]
+        },
+        {
+            "id": "3",
+            "name": "door-light",
+            "title": "三色门灯",
+            "models": [
+                "E3001",
+                "E3002"
+            ]
+        },
+        {
+            "id": "4",
+            "name": "Ward entrance",
+            "title": "病区门口机",
+            "models": [
+                "E6401A"
+            ]
+        },
+        {
+            "id": "5",
+            "name": "",
+            "title": "",
+            "models": []
+        },
+        {
+            "id": "236",
+            "name": "Voerka Multi-tenant Platform",
+            "title": "Voerka多租户平台",
+            "models": [
+                "VK-MTP-G1"
+            ]
+        }
+    ]
+}

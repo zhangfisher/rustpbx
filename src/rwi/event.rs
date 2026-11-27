@@ -423,6 +423,10 @@ pub const EVENT_TYPES: &[&str] = &[
     QueueAgentNoAnswer::TYPE,
     QueueAgentOffered::TYPE,
     QueueAgentRejected::TYPE,
+<<<<<<< HEAD
+=======
+    QueueCallbackRequested::TYPE,
+>>>>>>> deploy
     QueueCandidatesFound::TYPE,
     QueueFallbackExecuted::TYPE,
     QueueJoined::TYPE,
@@ -1214,7 +1218,29 @@ pub struct QueueWaitTimeout {
 }
 rwi_event!(QueueWaitTimeout, "queue_wait_timeout");
 
+/// The caller requested a wait-for-callback via the queue's DTMF key (the
+/// wait had exceeded `offer_after_secs`). The queue hangup follows — webhook
+/// consumers use this event to create the follow-up callback task in their
+/// own system; the queue exit is reported separately as
+/// `queue_left{reason:"callback"}` (NEVER "abandoned" — this caller did not
+/// give up).
 #[derive(Debug, Clone, Serialize)]
+<<<<<<< HEAD
+=======
+pub struct QueueCallbackRequested {
+    pub call_id: String,
+    pub queue_id: String,
+    /// Caller identity — the number a callback task should dial.
+    pub caller: String,
+    /// Queue wait seconds elapsed when the request was registered.
+    pub wait_secs: u64,
+    /// DTMF key the caller pressed (echoed for audit).
+    pub dtmf_key: String,
+}
+rwi_event!(QueueCallbackRequested, "queue_callback_requested");
+
+#[derive(Debug, Clone, Serialize)]
+>>>>>>> deploy
 pub struct QueueCandidatesFound {
     pub call_id: String,
     pub queue_id: String,

@@ -11,6 +11,11 @@ mod audio_feature;
 mod busy_wait;
 #[path = "call/conference_server_test.rs"]
 mod conference_server_test;
+<<<<<<< HEAD
+=======
+#[path = "call/mcu_audio_content_qc.rs"]
+mod mcu_audio_content_qc;
+>>>>>>> deploy
 #[path = "call/mcu_perf_leak.rs"]
 mod mcu_perf_leak;
 #[path = "call/mcu_three_way.rs"]

@@ -90,11 +90,16 @@ impl HttpCallRouter {
         if trunk.disabled.unwrap_or(false) {
             return Err(anyhow!("trunk '{trunk_name}' is disabled"));
         }
+<<<<<<< HEAD
         let dest: rsipstack::sip::Uri = trunk
             .dest
             .as_str()
             .try_into()
             .map_err(|e| anyhow!("trunk '{trunk_name}' has invalid destination: {e:?}"))?;
+=======
+        let dest = super::parse_trunk_uri(&trunk.dest)
+            .map_err(|e| anyhow!("trunk '{trunk_name}' has invalid destination: {e}"))?;
+>>>>>>> deploy
         let callee = match callee.map(str::trim).filter(|value| !value.is_empty()) {
             Some(callee) => callee.to_string(),
             None => original
@@ -253,6 +258,17 @@ struct HttpResponsePayload {
     /// authenticated caller is kept. An unparseable value fails the call
     /// immediately with 500 Server Internal Error.
     pub caller: Option<String>,
+<<<<<<< HEAD
+=======
+    /// Network profile id to apply for this call. Applies to targets that
+    /// resolve no trunk (e.g. passive gateways returning pure-URI targets),
+    /// where it replaces the arrival trunk's profile; trunk targets keep
+    /// their own `trunk.profile`. An unknown id falls back to the default
+    /// profile at dial time, as an unknown trunk profile does. When any
+    /// trunk-less target is routed, the call dials sequentially (parallel
+    /// dialing carries no per-attempt hints).
+    pub network_profile_id: Option<String>,
+>>>>>>> deploy
 }
 
 #[async_trait]
@@ -461,10 +477,24 @@ impl CallRouter for HttpCallRouter {
                 let arrival_trunk = source_trunk
                     .as_deref()
                     .and_then(|name| self.data_context.get_trunk(name));
+<<<<<<< HEAD
+=======
+                // The response's network profile for trunk-less targets.
+                let response_profile = result
+                    .network_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+>>>>>>> deploy
                 let rtp_bind_ip = result.rtp_config.as_ref().and_then(|c| c.bind_ip).map(|ip| ip.to_string());
                 let rtp_external_ip =
                     result.rtp_config.as_ref().and_then(|c| c.external_ip).map(|ip| ip.to_string());
                 let mut attempts = Vec::new();
+<<<<<<< HEAD
+=======
+                let mut uri_attempt_count = 0usize;
+>>>>>>> deploy
                 if let Some(targets) = result.targets {
                     for target in targets {
                         let (uri, retry_policy) = match target {
@@ -502,9 +532,31 @@ impl CallRouter for HttpCallRouter {
                         let Ok(uri) = rsipstack::sip::Uri::try_from(uri) else {
                             continue;
                         };
+<<<<<<< HEAD
                         attempts.push(DialAttempt {
                             retry_policy,
                             hints: arrival_hints(arrival_trunk.as_ref()).map(Arc::new),
+=======
+                        // Trunk-less target: the response's profile replaces
+                        // the arrival trunk's — an explicit per-call choice.
+                        let mut hints = arrival_hints(arrival_trunk.as_ref());
+                        if let Some(profile_id) = response_profile.as_deref() {
+                            hints
+                                .get_or_insert_with(DialplanHints::default)
+                                .network_profile_id = Some(profile_id.to_string());
+                        }
+                        uri_attempt_count += 1;
+                        let hints = hints.map(Arc::new);
+                        attempts.push(DialAttempt {
+                            retry_policy,
+                            hints,
+                            // Trunk-less targets carry no per-attempt ring
+                            // timeout: arrival_hints excludes it (the arrival
+                            // trunk's ring time is call-wide, enforced by the
+                            // session), and the call-wide response field lands
+                            // in dialplan.max_ring_time below.
+                            max_ring_time: None,
+>>>>>>> deploy
                             ..Location {
                                 aor: uri,
                                 headers: custom_headers.clone(),
@@ -532,6 +584,7 @@ impl CallRouter for HttpCallRouter {
                     }
                 }
 
+<<<<<<< HEAD
                 // The sequential dialer times a trunk's attempt only within a
                 // sequence; a lone trunk target's ring time is the call's.
                 let single_ring_time = match attempts.as_slice() {
@@ -542,6 +595,28 @@ impl CallRouter for HttpCallRouter {
                     Some(HttpRouteStrategy::Parallel) => DialStrategy::Parallel(
                         attempts.into_iter().map(|attempt| attempt.location).collect(),
                     ),
+=======
+                // A single timed target can use the sequential dialer's attempt timer.
+                let has_single_attempt_timeout = matches!(
+                    attempts.as_slice(),
+                    [DialAttempt {
+                        max_ring_time: Some(_),
+                        ..
+                    }]
+                );
+                // A response profile reaches trunk-less targets only via
+                // per-attempt hints, which parallel dialing carries none of;
+                // dial such calls sequentially instead.
+                let profiled_uri_attempt = response_profile.is_some() && uri_attempt_count > 0;
+                let strategy = match result.strategy {
+                    Some(HttpRouteStrategy::Parallel)
+                        if !has_single_attempt_timeout && !profiled_uri_attempt =>
+                    {
+                        DialStrategy::Parallel(
+                            attempts.into_iter().map(|attempt| attempt.location).collect(),
+                        )
+                    }
+>>>>>>> deploy
                     _ => DialStrategy::Sequential(attempts),
                 };
 
@@ -568,8 +643,57 @@ impl CallRouter for HttpCallRouter {
                 if rtp_external_ip.is_some() {
                     dialplan.media.external_ip = rtp_external_ip;
                 }
+<<<<<<< HEAD
                 dialplan.caller_media_network =
                     crate::call::MediaNetworkConfig::from(&dialplan.media);
+=======
+                // Caller-leg network (toward the arrival carrier), mirroring
+                // the static matcher (call.rs): the arrival trunk's profile
+                // and explicit IPs override the global baseline, before the
+                // callee leg's hints / rtp_config above took effect.
+                dialplan.caller_media_network = {
+                    let mut caller_media = dialplan.media.clone();
+                    if let Some(trunk) = arrival_trunk.as_ref()
+                        && (trunk.profile.is_some()
+                            || trunk.external_ip.is_some()
+                            || trunk.bind_ip.is_some())
+                    {
+                        if let Some(id) = trunk.profile.as_deref() {
+                            // Same live view the dial-time profile resolution
+                            // uses; refreshed on every reload.
+                            if let Some((profiles, default_id, proxy)) =
+                                self.data_context.trunk_registrar().network_state()
+                                && let Some(profile) = profiles
+                                    .iter()
+                                    .find(|p| p.id == id)
+                                    .or_else(|| profiles.iter().find(|p| p.id == default_id))
+                                    .cloned()
+                            {
+                                let rtp_bind = self.rtp_config.load().bind_ip.clone();
+                                caller_media.external_ip = profile.external_ip.clone();
+                                caller_media.bind_ip = Some(
+                                    profile
+                                        .effective_bind_ip(&proxy.addr, rtp_bind.as_deref())
+                                        .to_string(),
+                                );
+                                if let Some(start) = profile.rtp_start_port {
+                                    caller_media.rtp_start_port = Some(start);
+                                }
+                                if let Some(end) = profile.rtp_end_port {
+                                    caller_media.rtp_end_port = Some(end);
+                                }
+                            }
+                        }
+                        if let Some(ip) = trunk.external_ip.clone() {
+                            caller_media.external_ip = Some(ip);
+                        }
+                        if let Some(ip) = trunk.bind_ip.clone() {
+                            caller_media.bind_ip = Some(ip);
+                        }
+                    }
+                    crate::call::MediaNetworkConfig::from(&caller_media)
+                };
+>>>>>>> deploy
 
                 if let Some(uri) = dialplan_caller {
                     dialplan = dialplan.with_caller(uri);

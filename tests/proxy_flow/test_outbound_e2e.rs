@@ -159,6 +159,10 @@ async fn test_outbound_enqueue_starts_queue_and_rings_agent() -> Result<()> {
         ctx,
         rustpbx::outbound::DialRequest {
             call_id: None,
+<<<<<<< HEAD
+=======
+            session_id: None,
+>>>>>>> deploy
             caller_id: Some("sip:outbound@127.0.0.1".to_string()),
             destination: format!("sip:bob@127.0.0.1:{}", bob.local_port()),
             trunk: None,

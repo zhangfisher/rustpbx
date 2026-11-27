@@ -30,14 +30,25 @@ use crate::{
     proxy::routing::{
         CacPolicy, CallIdMode, ConfigOrigin, DestConfig, MatchConditions, MediaMode, RewriteRules,
         RouteAction, RouteQueueConfig, RouteRule, TrunkConfig, TrunkDirection, VideoPolicy,
+        strip_sip_scheme,
     },
     proxy::trunk_registrar::TrunkRegistrar,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundTrunkCandidate {
+    pub name: String,
+    pub port: Option<u16>,
+}
+
 pub struct ProxyDataContext {
     config: RwLock<Arc<ProxyConfig>>,
     pub trunks: DashMap<String, TrunkConfig>,
+<<<<<<< HEAD
     pub acl_inbound_trunks: ArcSwap<JointPrefixMap<IpNet, Vec<String>>>,
+=======
+    pub acl_inbound_trunks: ArcSwap<JointPrefixMap<IpNet, Vec<InboundTrunkCandidate>>>,
+>>>>>>> deploy
     /// SIP NAT inspector whose trunk exception list is rebuilt on every
     /// trunk reload.
     nat_inspector: NatInspector,
@@ -75,6 +86,36 @@ pub struct GeneratedFileMetrics {
 }
 
 impl ProxyDataContext {
+    /// Session-id correlation header name for a trunk: the trunk-level
+    /// `session_id_header` override, falling back to the global
+    /// `[proxy].session_id_default_header`. `trunk` is the inbound
+    /// `TrunkContext` / outbound `OutboundTrunkContext` name; `None` (or an
+    /// unknown trunk) → global default only.
+    pub fn session_id_header_for(&self, trunk: Option<&str>) -> Option<String> {
+        trunk
+            .and_then(|name| {
+                self.trunks
+                    .get(name)
+                    .and_then(|t| t.session_id_header.clone())
+            })
+            .or_else(|| crate::call::session_id::settings().source_header.clone())
+    }
+
+    /// Same as [`Self::session_id_header_for`], resolved from the destination
+    /// (host:port) when no trunk name is available — direct-to-trunk dialing,
+    /// legacy REFER execution, or dynamic legs built without routing hints.
+    /// Only destinations that match a configured trunk destination are
+    /// considered; an unmatched (non-trunk) target never gets a correlation
+    /// header through this fallback.
+    pub fn session_id_header_for_destination(&self, host: &str, port: u16) -> Option<String> {
+        let trunks = self.trunks_snapshot();
+        let trunk = crate::proxy::routing::find_trunk_by_dest(&trunks, host, port)?;
+        trunk
+            .session_id_header
+            .clone()
+            .or_else(|| crate::call::session_id::settings().source_header.clone())
+    }
+
     pub async fn new(config: Arc<ProxyConfig>, db: Option<DatabaseConnection>) -> Result<Self> {
         let trunk_registrar = Arc::new(TrunkRegistrar::new());
 
@@ -129,6 +170,7 @@ impl ProxyDataContext {
         self.trunks.get(name).map(|v| v.value().clone())
     }
 
+<<<<<<< HEAD
     /// Resolve a source IP to the inbound trunk it belongs to, reusing the live
     /// `acl_inbound_trunks` trie (longest-prefix match) plus optional From/To
     /// user-prefix filtering.  This is the same resolution [`AclModule`] applies
@@ -140,15 +182,40 @@ impl ProxyDataContext {
     pub fn resolve_inbound_trunk_by_ip(
         &self,
         addr: &IpAddr,
+=======
+    /// Resolve a source IP (and optional source port) to the inbound trunk it
+    /// belongs to, reusing the live `acl_inbound_trunks` trie (longest-prefix
+    /// match) plus optional port and From/To user-prefix filtering. This is
+    /// the same resolution [`AclModule`] applies at transaction start; factored
+    /// out so diagnostics can invoke it without a live SIP request.
+    ///
+    /// Returns the matched trunk as a [`TrunkContext`] (id / name / did_numbers)
+    /// or `None` when no inbound trunk covers the source IP/port.
+    pub fn resolve_inbound_trunk_by_ip(
+        &self,
+        addr: &IpAddr,
+        source_port: Option<u16>,
+>>>>>>> deploy
         from_user: Option<&str>,
         to_user: Option<&str>,
     ) -> Option<crate::call::TrunkContext> {
         let inbound_trunks = self.acl_inbound_trunks.load();
         let source_network = ipnet::IpNet::from(*addr);
         let mut matched = None;
+<<<<<<< HEAD
         for trunks in inbound_trunks.cover_values(&source_network) {
             for name in trunks {
                 let Some(trunk) = self.get_trunk(name) else {
+=======
+        for candidates in inbound_trunks.cover_values(&source_network) {
+            for candidate in candidates {
+                if let Some(expected_port) = candidate.port
+                    && source_port != Some(expected_port)
+                {
+                    continue;
+                }
+                let Some(trunk) = self.get_trunk(&candidate.name) else {
+>>>>>>> deploy
                     continue;
                 };
                 if !trunk.matches_incoming_user_prefixes(from_user, to_user) {
@@ -156,7 +223,11 @@ impl ProxyDataContext {
                 }
                 matched = Some(crate::call::TrunkContext {
                     id: trunk.id,
+<<<<<<< HEAD
                     name: name.clone(),
+=======
+                    name: candidate.name.clone(),
+>>>>>>> deploy
                     did_numbers: trunk.did_numbers,
                 });
                 break;
@@ -309,10 +380,7 @@ impl ProxyDataContext {
     /// Returns `None` for hostnames (no DNS resolution during config reload).
     pub(crate) fn dest_to_ipnet(dest: &str) -> Option<IpNet> {
         let dest = dest.trim().trim_matches(|c| c == '<' || c == '>');
-        let dest = dest
-            .strip_prefix("sip:")
-            .or_else(|| dest.strip_prefix("sips:"))
-            .unwrap_or(dest);
+        let dest = strip_sip_scheme(dest).unwrap_or(dest);
         if dest.is_empty() {
             return None;
         }
@@ -439,7 +507,8 @@ impl ProxyDataContext {
         }
 
         let len = trunks.len();
-        let mut acl_inbound_trunks: JointPrefixMap<IpNet, Vec<String>> = JointPrefixMap::new();
+        let mut acl_inbound_trunks: JointPrefixMap<IpNet, Vec<InboundTrunkCandidate>> =
+            JointPrefixMap::new();
         let mut inbound_trunks = trunks
             .iter()
             .filter(|(_, trunk)| !matches!(trunk.direction, Some(TrunkDirection::Outbound)))
@@ -467,46 +536,60 @@ impl ProxyDataContext {
         });
 
         for (name, trunk) in inbound_trunks {
-            for host in &trunk.inbound_hosts {
-                let host = host.trim().trim_matches(|c| c == '<' || c == '>');
-                if host.is_empty() {
-                    continue;
-                }
+            if !trunk.inbound_hosts.is_empty() {
+                for host in &trunk.inbound_hosts {
+                    let host = host.trim().trim_matches(|c| c == '<' || c == '>');
+                    if host.is_empty() {
+                        continue;
+                    }
 
-                let network = if let Ok(network) = host.parse::<IpNet>() {
-                    Some(network.trunc())
-                } else if let Ok(socket) = host.parse::<SocketAddr>() {
-                    Some(IpNet::from(socket.ip()))
-                } else if let Ok(ip) = host.parse::<IpAddr>() {
-                    Some(IpNet::from(ip))
-                } else {
-                    None
-                };
+                    let parsed = if let Ok(network) = host.parse::<IpNet>() {
+                        Some((network.trunc(), None))
+                    } else if let Ok(socket) = host.parse::<SocketAddr>() {
+                        Some((IpNet::from(socket.ip()), Some(socket.port())))
+                    } else if let Ok(ip) = host.parse::<IpAddr>() {
+                        Some((IpNet::from(ip), None))
+                    } else {
+                        None
+                    };
 
-                let Some(network) = network else {
-                    warn!(trunk = %name, host, "inbound host is not an IP address or CIDR");
-                    continue;
-                };
-                let candidates = acl_inbound_trunks.entry(network).or_default();
-                if !candidates.contains(name) {
-                    candidates.push(name.clone());
-                }
-            }
-
-            // Also index the trunk's dest and backup_dest so that inbound
-            // traffic from those source IPs is recognised as trunk traffic
-            // even when inbound_hosts is not explicitly set.
-            if let Some(network) = Self::dest_to_ipnet(&trunk.dest) {
-                let candidates = acl_inbound_trunks.entry(network).or_default();
-                if !candidates.contains(name) {
-                    candidates.push(name.clone());
-                }
-            }
-            if let Some(ref backup) = trunk.backup_dest {
-                if let Some(network) = Self::dest_to_ipnet(backup) {
+                    let Some((network, port)) = parsed else {
+                        warn!(trunk = %name, host, "inbound host is not an IP address or CIDR");
+                        continue;
+                    };
+                    let candidate = InboundTrunkCandidate {
+                        name: name.clone(),
+                        port,
+                    };
                     let candidates = acl_inbound_trunks.entry(network).or_default();
-                    if !candidates.contains(name) {
-                        candidates.push(name.clone());
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            } else {
+                // Fallback when inbound_hosts is not set: index dest and
+                // backup_dest with wildcard port so dest-only inbound trunks
+                // keep working.
+                if let Some(network) = Self::dest_to_ipnet(&trunk.dest) {
+                    let candidate = InboundTrunkCandidate {
+                        name: name.clone(),
+                        port: None,
+                    };
+                    let candidates = acl_inbound_trunks.entry(network).or_default();
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+                if let Some(ref backup) = trunk.backup_dest
+                    && let Some(network) = Self::dest_to_ipnet(backup)
+                {
+                    let candidate = InboundTrunkCandidate {
+                        name: name.clone(),
+                        port: None,
+                    };
+                    let candidates = acl_inbound_trunks.entry(network).or_default();
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
                     }
                 }
             }
@@ -1249,6 +1332,7 @@ pub fn sbc_config_from_metadata(meta: &serde_json::Value) -> TrunkConfig {
                 _ => None,
             }
         }),
+        session_id_header: from_str(sbc.and_then(|s| s.get("session_id_header"))),
         health_check_enabled: from_bool(sbc.and_then(|s| s.get("health_check_enabled"))),
         health_check_per_ip: from_bool(sbc.and_then(|s| s.get("health_check_per_ip"))),
         health_check_interval_secs: sbc
@@ -1388,6 +1472,9 @@ pub fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
             trunk.send_p_asserted_identity = sbc.send_p_asserted_identity;
             if sbc.call_id_mode.is_some() {
                 trunk.call_id_mode = sbc.call_id_mode;
+            }
+            if sbc.session_id_header.is_some() {
+                trunk.session_id_header = sbc.session_id_header;
             }
             if sbc.health_check_enabled.is_some() {
                 trunk.health_check_enabled = sbc.health_check_enabled;
@@ -1977,7 +2064,9 @@ mod tests {
                 .acl_inbound_trunks
                 .load()
                 .cover_values(&source_network)
-                .any(|names| names.iter().any(|name| name == "database-inbound"))
+                .any(|candidates| candidates
+                    .iter()
+                    .any(|candidate| candidate.name == "database-inbound"))
         );
     }
 
@@ -2723,6 +2812,31 @@ file = "db://ivr/lf-step-ivr.generated.toml"
         }})).retry_policy.is_none());
     }
 
+<<<<<<< HEAD
+=======
+    /// Console/DB-managed trunks carry SBC overrides in `metadata.sbc`.
+    /// `session_id_header` must survive the model → TrunkConfig conversion —
+    /// otherwise per-trunk correlation headers silently fall back to the
+    /// global default (or disappear entirely).
+    #[test]
+    fn convert_trunk_merges_sbc_session_id_header() {
+        let model = sip_trunk::Model {
+            id: 7,
+            name: "g-system".to_string(),
+            sip_server: Some("sip:10.0.0.9:5060".to_string()),
+            metadata: Some(serde_json::json!({
+                "sbc": {"session_id_header": "X-GSession-ID"}
+            })),
+            ..Default::default()
+        };
+        let (_, trunk) = convert_trunk(model).expect("should convert");
+        assert_eq!(
+            trunk.session_id_header.as_deref(),
+            Some("X-GSession-ID")
+        );
+    }
+
+>>>>>>> deploy
     #[test]
     fn convert_trunk_no_ringback_without_sbc_metadata() {
         let model = sip_trunk::Model {
@@ -2803,8 +2917,17 @@ file = "db://ivr/lf-step-ivr.generated.toml"
 
     #[test]
     fn dest_to_ipnet_sips_with_port() {
+<<<<<<< HEAD
         let net = ProxyDataContext::dest_to_ipnet("sips:198.51.100.210:5061");
         assert_eq!(net, Some("198.51.100.210/32".parse().unwrap()));
+=======
+        for value in ["sips:198.51.100.210:5061", "SIPS:198.51.100.210:5061"] {
+            assert_eq!(
+                ProxyDataContext::dest_to_ipnet(value),
+                Some("198.51.100.210/32".parse().unwrap())
+            );
+        }
+>>>>>>> deploy
     }
 
     #[test]

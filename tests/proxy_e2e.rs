@@ -61,6 +61,12 @@ mod test_cluster_recursive_fork_guard_e2e;
 #[path = "proxy_e2e/test_hold_recording_e2e.rs"]
 mod test_hold_recording_e2e;
 
+<<<<<<< HEAD
+=======
+#[path = "proxy_e2e/test_transcode_hold_resume_e2e.rs"]
+mod test_transcode_hold_resume_e2e;
+
+>>>>>>> deploy
 #[path = "proxy_e2e/test_cluster_session_registry.rs"]
 mod test_cluster_session_registry;
 

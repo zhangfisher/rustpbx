@@ -2922,10 +2922,27 @@ async fn skill_group_empty_preresolve_still_injects_dial_kick() {
 
 #[tokio::test]
 async fn queue_hold_music_real_ingress_respects_global_and_explicit_audio() {
+<<<<<<< HEAD
     for global in [None, Some("sounds/wait.wav".to_string())] {
         for ingress in ["app", "skill-group", "agent", "named"] {
             let mut config = ProxyConfig::default();
             config.queue_hold_music = global.clone();
+=======
+    // (queue_hold_music, hold_music) — the wait audio prefers the queue-level
+    // key and otherwise falls back to holding music, never the agent ringback
+    // (product 2026-11-14: queued vs agent-ringing must be two sounds).
+    let cases: [(Option<&str>, Option<&str>); 4] = [
+        (None, None),
+        (Some("sounds/wait.wav"), None),
+        (None, Some("sounds/hold.wav")),
+        (Some("sounds/wait.wav"), Some("sounds/hold.wav")),
+    ];
+    for (queue_global, hold_global) in cases {
+        for ingress in ["app", "skill-group", "agent", "named"] {
+            let mut config = ProxyConfig::default();
+            config.queue_hold_music = queue_global.map(str::to_string);
+            config.hold_music = hold_global.map(str::to_string);
+>>>>>>> deploy
             config.queues.insert(
                 "explicit".into(),
                 RouteQueueConfig {
@@ -2982,6 +2999,7 @@ async fn queue_hold_music_real_ingress_respects_global_and_explicit_audio() {
                     .unwrap();
             }
             let pending = ctx.pending_queue.lock();
+<<<<<<< HEAD
             let hold = pending.as_ref().unwrap().plan.hold.as_ref().unwrap();
             let expected = if ingress == "named" {
                 crate::call::DEFAULT_QUEUE_HOLD_AUDIO
@@ -2998,6 +3016,30 @@ async fn queue_hold_music_real_ingress_respects_global_and_explicit_audio() {
             if ingress == "named" {
                 assert!(!hold.loop_playback);
             }
+=======
+            let plan = &pending.as_ref().unwrap().plan;
+            if ingress == "named" {
+                // An explicit per-queue `[queues.<name>.hold]` always wins,
+                // even when its file is the built-in ringback.
+                let hold = plan.hold.as_ref().expect("named queue keeps its hold");
+                assert_eq!(
+                    hold.audio_file.as_deref(),
+                    Some(crate::call::DEFAULT_QUEUE_HOLD_AUDIO)
+                );
+                assert!(!hold.loop_playback);
+                continue;
+            }
+            // queue_hold_music > built-in waiting loop; `hold_music` is a
+            // separate knob (real holds) and no longer leaks into the queue.
+            let expected = Some(
+                queue_global.unwrap_or(crate::call::DEFAULT_QUEUE_WAIT_AUDIO),
+            );
+            assert_eq!(
+                plan.hold.as_ref().and_then(|h| h.audio_file.as_deref()),
+                expected,
+                "ingress={ingress}"
+            );
+>>>>>>> deploy
         }
     }
 }
@@ -3621,6 +3663,7 @@ async fn hold_unhold_flips_recording_capture_routes() {
     session.media.caller_offer = Some(recording_test_offer());
 
     // Wire real legs whose taps carry the call's recorder sender -- the same
+<<<<<<< HEAD
     // wiring the production leg-creation paths perform.
     let mut recording = RecordingSession::default();
     let sender = recording.setup_recorder_task().unwrap();
@@ -3637,6 +3680,42 @@ async fn hold_unhold_flips_recording_capture_routes() {
         }
         session.legs.set_media_leg(&LegId::from(id), leg);
     }
+=======
+    // wiring the production leg-creation paths perform -- and install them on
+    // both the bridge and session registry so MediaBridge::unbridge() talks to
+    // the same live egress pipelines.
+    let mut recording = RecordingSession::default();
+    let sender = recording.setup_recorder_task().unwrap();
+    let a = crate::media::leg::LegInner::new(
+        "caller",
+        &crate::media::leg::LegConfig::rtp_pcmu(),
+        Some(sender.clone()),
+    )
+    .unwrap();
+    let b = crate::media::leg::LegInner::new(
+        "callee",
+        &crate::media::leg::LegConfig::rtp_pcmu(),
+        Some(sender.clone()),
+    )
+    .unwrap();
+    // Production creation sites start the callee tap fully off.
+    b.ingress_tap().set_capture_route(None, None);
+    let offer = a.create_offer().await.expect("offer");
+    let answer = b.answer(&offer).await.expect("answer");
+    a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer)
+        .await
+        .expect("apply answer");
+    let mut mb = crate::media::media_bridge::MediaBridge::new("hold-rec-routes");
+    mb.replace_leg(crate::media::media_bridge::LegSide::A, a.clone())
+        .await;
+    mb.replace_leg(crate::media::media_bridge::LegSide::B, b.clone())
+        .await;
+    mb.accept(crate::media::media_bridge::LegSide::A).await;
+    mb.accept(crate::media::media_bridge::LegSide::B).await;
+    session.media.bridge = Some(mb);
+    session.legs.set_media_leg(&LegId::from("caller"), a);
+    session.legs.set_media_leg(&LegId::from("callee"), b);
+>>>>>>> deploy
 
     let route = |session: &SipSession, leg: &str| {
         session
@@ -4568,6 +4647,126 @@ async fn voip_bridge_connect_without_timeout_ms_must_be_bounded() {
     let _ = ping;
 }
 
+<<<<<<< HEAD
+=======
+#[tokio::test]
+async fn voip_bridge_preserves_duration_of_mixed_g729_speech_and_sid() {
+    use crate::media::leg::{LegConfig, LegInner};
+    use crate::media::negotiate::MediaNegotiator;
+    use audio_codec::CodecType;
+    use futures::StreamExt;
+    use rustrtc::rtp::{RtpHeader, RtpPacket};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio_tungstenite::tungstenite::Message;
+
+    const PCM_20MS_BYTES: usize = 640;
+    let rtp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let offer = crate::proxy::tests::test_helpers::build_sdp(
+        "127.0.0.1",
+        rtp.local_addr().unwrap().port(),
+        &[(18, "G729/8000")],
+    );
+    let config = LegConfig {
+        codecs: MediaNegotiator::build_codec_list_from_offer(&offer, &[]),
+        bind_ips: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+        enable_latching: false,
+        ..LegConfig::rtp_pcmu()
+    };
+    let peer = LegInner::new("caller", &config, None).unwrap();
+    peer.answer(&offer).await.unwrap();
+    rtp.connect(peer.advertised_addr().unwrap()).await.unwrap();
+
+    let mut session = build_session(build_dialplan_with_mode(MediaProxyMode::Auto)).await;
+    let caller = LegId::from("caller");
+    session.media.caller_offer = Some(offer);
+    peer.accept();
+    session.legs.set_media_leg(&caller, peer);
+    session.update_leg_state(&caller, LegState::Connected);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let accept = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        tokio_tungstenite::accept_async(socket).await.unwrap()
+    });
+    session
+        .connect_bridge(
+            caller,
+            endpoint,
+            HashMap::new(),
+            16_000,
+            "pcm".into(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ws = accept.await.unwrap();
+
+    let pcm: Vec<i16> = (0..160)
+        .map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / 8000.0).sin() * 12_000.0) as i16)
+        .collect();
+    let speech = audio_codec::create_encoder(CodecType::G729).encode(&pcm);
+    assert_eq!(speech.len(), 20);
+    let send_rtp = async |seq, data: &[u8]| {
+        let header = RtpHeader::new(18, seq, u32::from(seq) * 80, 1234);
+        let packet = RtpPacket::new(header, data.to_vec());
+        rtp.send(&packet.marshal().unwrap()).await.unwrap();
+    };
+
+    // Wait for live audio after the reverse loop drains the startup backlog.
+    // Short speech packets identify any warm-up audio still in flight.
+    let mut seq = 1;
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    let first = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                frame = ws.next() => break frame.unwrap().unwrap(),
+                _ = interval.tick() => {
+                    send_rtp(seq, &speech[..10]).await;
+                    seq += 1;
+                }
+            }
+        }
+    })
+    .await
+    .expect("bridge did not forward live G.729 RTP");
+    assert!(matches!(first, Message::Binary(pcm) if pcm.len() == PCM_20MS_BYTES / 2));
+
+    let mut mixed = speech;
+    mixed.extend_from_slice(&[0x12, 0x34]);
+    send_rtp(seq, &mixed).await;
+    let mixed_pcm = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Message::Binary(pcm) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected binary PCM");
+            };
+            if pcm.len() != PCM_20MS_BYTES / 2 {
+                break pcm;
+            }
+        }
+    })
+    .await
+    .expect("bridge did not forward the mixed G.729 packet");
+    assert_eq!(mixed_pcm.len(), PCM_20MS_BYTES * 3 / 2);
+    let (speech, sid_silence) = mixed_pcm.split_at(PCM_20MS_BYTES);
+    assert!(speech.iter().any(|&byte| byte != 0));
+    assert!(sid_silence.iter().all(|&byte| byte == 0));
+
+    let next = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("bridge did not send silence after the SID");
+    assert!(matches!(
+        next,
+        Some(Ok(Message::Binary(pcm)))
+            if pcm.len() == PCM_20MS_BYTES && pcm.iter().all(|&byte| byte == 0)
+    ));
+    session.cancel_token.cancel();
+}
+
+>>>>>>> deploy
 // ─── transfer_in_progress must clear when the transferred leg fails ──────────
 //
 // Production-risk audit 2026-09-18: `meta.transfer_in_progress` suppresses the
@@ -5744,8 +5943,13 @@ async fn test_resolve_hold_music_priority_chain() {
     let session = build_session(dialplan).await;
     assert_eq!(
         expect_hold_music_file(session.resolve_hold_music(&[])),
+<<<<<<< HEAD
         crate::call::DEFAULT_QUEUE_HOLD_AUDIO,
         "empty chain must fall back to the built-in default hold audio"
+=======
+        crate::call::DEFAULT_HOLD_AUDIO,
+        "empty chain must fall back to the built-in hold music (not the agent ringback)"
+>>>>>>> deploy
     );
 
     // 3. [proxy].hold_music config.

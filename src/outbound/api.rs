@@ -113,6 +113,10 @@ pub async fn execute_dial_core(
 
     let originate_req = OriginateRequest {
         call_id: call_id.clone(),
+<<<<<<< HEAD
+=======
+        session_id: req.session_id.clone(),
+>>>>>>> deploy
         destination,
         caller_id,
         timeout_secs: Some(ring_timeout as u32),

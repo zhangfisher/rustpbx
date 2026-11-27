@@ -166,12 +166,17 @@ pub enum TestUaEvent {
     CallUpdated(DialogId, rsipstack::sip::Method, Option<String>),
     /// Refer received with target URI
     Referred(DialogId, String),
+    /// In-dialog REFER subscription NOTIFY received: (dialog, sipfrag status)
+    ReferNotify(DialogId, u16),
     /// SIP INFO with DTMF (application/dtmf-relay) received on this dialog
     DtmfInfo(DialogId, String),
     /// SIP INFO (non-DTMF) received: (dialog_id, content_type, body)
     InfoReceived(DialogId, String, Vec<u8>),
+<<<<<<< HEAD
     /// REFER progress: dialog, sipfrag body, Subscription-State.
     ReferNotify(DialogId, String, String),
+=======
+>>>>>>> deploy
     /// Per-consult state sync marker (cc transfer flows observe this).
     ConsultStateUpdated(DialogId),
 }
@@ -1133,6 +1138,37 @@ impl TestUa {
         Ok(())
     }
 
+    /// Send an in-dialog REFER subscription NOTIFY (RFC 3515) with a custom
+    /// Event header value — baresip stamps `refer;id=<cseq>`, the optional
+    /// parameter form the server must accept.
+    pub async fn send_refer_notify(
+        &self,
+        dialog_id: &DialogId,
+        status: u16,
+        event_value: &str,
+    ) -> Result<()> {
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .ok_or_else(|| anyhow!("TestUa not started"))?;
+        let headers = vec![
+            rsipstack::sip::Header::Event(event_value.into()),
+            rsipstack::sip::Header::SubscriptionState("terminated;reason=noresource".into()),
+            rsipstack::sip::Header::ContentType("message/sipfrag".into()),
+        ];
+        let body = format!("SIP/2.0 {status} OK\r\n").into_bytes();
+        match dialog_layer.get_dialog(dialog_id) {
+            Some(Dialog::Invite(dialog)) => {
+                dialog
+                    .notify(Some(headers), Some(body))
+                    .await
+                    .map_err(|e| e.into_anyhow())?;
+            }
+            _ => return Err(anyhow!("Dialog does not support NOTIFY")),
+        }
+        Ok(())
+    }
+
     /// Send a SIP INFO with an arbitrary content type and body.
     /// Returns instantly (fire-and-forget on the dialog).
     pub async fn send_info(
@@ -1211,6 +1247,7 @@ impl TestUa {
         }
     }
 
+<<<<<<< HEAD
     /// Process dialog events and return collected events
     /// Drain the events buffered by the background pump (fork semantics:
     /// events accumulate between calls and are never lost).
@@ -1219,6 +1256,119 @@ impl TestUa {
         Ok(events)
     }
 
+=======
+    /// Execute a received REFER as the standard transferee: dial the
+    /// Refer-To target carrying the verbatim `Replaces` header (from the
+    /// Refer-To query) so the far side treats the new INVITE as a dialog
+    /// replacement. Returns the replacement dialog id.
+    pub async fn execute_referred(
+        &self,
+        refer_to: &str,
+        sdp_offer: Option<String>,
+    ) -> Result<DialogId> {
+        // Split the Refer-To into the target URI and the Replaces query.
+        let (target, query) = match refer_to.split_once('?') {
+            Some((t, q)) => (t.to_string(), q.to_string()),
+            None => (refer_to.to_string(), String::new()),
+        };
+        let replaces_raw = query
+            .split('&')
+            .find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                k.eq_ignore_ascii_case("replaces").then(|| v.to_string())
+            })
+            .ok_or_else(|| anyhow!("Refer-To carries no Replaces parameter"))?;
+        // The Refer-To query is URL-encoded per the REFER construction — the
+        // transferee decodes it before using the value as a header.
+        let replaces = urlencoding::decode(&replaces_raw)
+            .map(|v| v.to_string())
+            .unwrap_or(replaces_raw);
+
+        // The target URI may be a full contact (sip:user@host:port); extract
+        // the user for the routing-shaped callee used by make_call.
+        let callee_user = target
+            .split(':')
+            .nth(1)
+            .and_then(|rest| rest.split('@').next().map(|u| u.to_string()))
+            .or_else(|| target.split('@').next().map(|u| u.to_string()))
+            .ok_or_else(|| anyhow!("Refer-To target has no user"))?;
+
+        // Dial the target with the Replaces header on the INVITE.
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .ok_or_else(|| anyhow!("TestUa not started"))?;
+        let contact = self
+            .contact_uri
+            .as_ref()
+            .ok_or_else(|| anyhow!("Contact URI not available"))?;
+        let credential = Credential {
+            username: self.config.username.clone(),
+            auth_username: None,
+            password: self.config.password.clone(),
+            realm: Some(self.config.realm.clone()),
+        };
+        let callee_uri = format!(
+            "sip:{}@{}:{}",
+            callee_user,
+            self.config.proxy_addr.ip(),
+            self.config.proxy_addr.port()
+        )
+        .try_into()
+        .map_err(|e| anyhow!("Invalid callee URI: {:?}", e))?;
+        let proxy_uri: rsipstack::sip::Uri = format!(
+            "sip:{}:{};lr",
+            self.config.proxy_addr.ip(),
+            self.config.proxy_addr.port()
+        )
+        .try_into()
+        .map_err(|e| anyhow!("Invalid proxy URI: {:?}", e))?;
+        let mut extra_headers = vec![rsipstack::sip::Header::from(
+            rsipstack::sip::typed::Route::from(proxy_uri),
+        )];
+        extra_headers.push(rsipstack::sip::Header::Other(
+            "Replaces".into(),
+            replaces,
+        ));
+        let (content_type, offer) = match sdp_offer {
+            Some(sdp) => (Some("application/sdp".to_string()), Some(sdp.into_bytes())),
+            None => (None, None),
+        };
+        let invite_option = InviteOption {
+            callee: callee_uri,
+            caller: contact.clone(),
+            content_type,
+            offer,
+            contact: contact.clone(),
+            credential: Some(credential),
+            headers: Some(extra_headers),
+            ..Default::default()
+        };
+        let state_sender = self.state_sender.clone().unwrap_or_else(|| {
+            let (sender, _) = unbounded_channel();
+            sender
+        });
+        let (dialog, resp) = dialog_layer
+            .do_invite(invite_option, state_sender)
+            .await
+            .map_err(|e| e.into_anyhow())?;
+        let resp = resp.ok_or_else(|| anyhow!("No response"))?;
+        if resp.status_code == rsipstack::sip::StatusCode::OK {
+            Ok(dialog.id())
+        } else {
+            Err(anyhow!("replacement call failed: {}", resp.status_code))
+        }
+    }
+
+    /// Process dialog events and return collected events
+    /// Drain the events buffered by the background pump (fork semantics:
+    /// events accumulate between calls and are never lost).
+    pub async fn process_dialog_events(&self) -> Result<Vec<TestUaEvent>> {
+        let events = std::mem::take(&mut *self.pending_events.lock().await);
+        Ok(events)
+    }
+
+>>>>>>> deploy
     /// Background-pump event translation: perform the in-band replies the
     /// harness owes the peer (200 for re-INVITE / NOTIFY / INFO, ...), buffer
     /// the resulting events. Runs on the pump task spawned in `start`.
@@ -1321,8 +1471,38 @@ impl TestUa {
                             tx_handle.reply(rsipstack::sip::StatusCode::OK).await.ok();
                         }
                     }
-                    DialogState::Notify(id, _request, tx_handle) => {
+                    DialogState::Notify(id, request, tx_handle) => {
                         debug!("TestUa: Received Notify state for {}", id);
+                        // Report REFER progress NOTIFY (RFC 3515 implicit
+                        // subscription). The Event header may carry an `id`
+                        // parameter (`refer;id=40999`) — compare the package
+                        // token only.
+                        let is_refer = request.headers.iter().any(|h| {
+                            if let rsipstack::sip::Header::Event(event) = h {
+                                event
+                                    .value()
+                                    .split(';')
+                                    .next()
+                                    .map(|token| token.trim().eq_ignore_ascii_case("refer"))
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        });
+                        if is_refer {
+                            let body = String::from_utf8_lossy(request.body());
+                            let status = body
+                                .lines()
+                                .next()
+                                .and_then(|line| {
+                                    let mut parts = line.split_whitespace();
+                                    (parts.next() == Some("SIP/2.0"))
+                                        .then(|| parts.next()?.parse::<u16>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            events.push(TestUaEvent::ReferNotify(id.clone(), status));
+                        }
                         // Reply 200 OK to NOTIFY so the sender can proceed
                         tx_handle.reply(rsipstack::sip::StatusCode::OK).await.ok();
                     }

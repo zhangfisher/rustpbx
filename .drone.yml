@@ -1,0 +1,31 @@
+kind: pipeline
+type: docker
+name: default
+trigger:
+  ref:
+    - refs/tags/pre-v*
+steps:  
+    # 步骤名称
+  - name: 构建 
+    # 镜像名称
+    image: ubuntu
+    # 流水线命令
+    commands:
+      # 升级版本号
+      - ./autopub version
+      # 执行构建命令
+      - ./autopub build
+      # 发布到公司发布服务器
+      - ./autopub publish
+      # 发送Ding给我
+      - ./autopub report
+  # 当镜像没有安装Git时需要以上步骤来执行Git提交
+  - name: git-push
+    image: 192.168.116.219:5000/git-tag-push:latest
+    settings:
+      branch: master
+      # 修改为您的仓库地址
+      remote: ssh://git@192.168.38.165:2222/wxzhang/autopub.git
+      force: false
+      commit: true  
+      auto_tag: true  

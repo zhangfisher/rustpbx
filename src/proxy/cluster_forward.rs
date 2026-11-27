@@ -55,6 +55,119 @@ pub async fn forward_json(
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Cross-node REFER-Replaces takeover: ask every peer for the transfer
+/// TARGET's real dialog (the dialog the target UA actually holds).
+///
+/// When the replaced session's target leg is a cluster hop
+/// (`TransferTargetDialog::remote_registered`), the hop dialog this node
+/// sees is NOT what the target UA holds — the peer node's cluster child
+/// owns the true target-facing dialog and must stamp the RFC 3891 Replaces
+/// with it. Each peer scans its own sessions (`QueryTransferTargetDialog`
+/// filtered to the same root session id and to non-hop legs) and either
+/// answers 200 with the dialog or 404. First winning answer wins; all
+/// peers failing (or no peers) returns `None` and the caller falls back to
+/// the local hop-dialog stamp (the cascade room fallback still completes
+/// the transfer).
+/// Peer-side acceptance rule for a scanned dialog answer (shared by the
+/// terminal `cluster/query_transfer_target_dialog` handler and the asking
+/// side): a HOP dialog would loop the stamp back to its own node, and a
+/// different logical call must never answer for this one.
+pub fn accepts_peer_transfer_target_dialog(
+    info: &crate::call::domain::TransferTargetDialog,
+    root_session_id: &str,
+) -> bool {
+    // endpoint_matched: a callee-fallback answer names whichever leg the
+    // reporting session happens to have (production 2026-11-15: the queue
+    // call on the same logical root answered with the TRANSFEROR's dialog
+    // for a query about the transfer target).
+    info.endpoint_matched
+        && !info.remote_registered
+        && (root_session_id.is_empty() || info.root_session_id == root_session_id)
+}
+
+/// Choose the Replaces stamp source for the REFER-Replaces takeover.
+///
+/// - Same-node target (`remote_registered == false`): the local answer is
+///   the dialog the target UA holds — use it verbatim.
+/// - Cluster hop (`remote_registered == true`): the local answer is the
+///   call↔peer HOP dialog, which can never match at the target UA — only a
+///   cross-node peer answer (the real target-facing dialog) qualifies; with
+///   no peer answer, fall back to the local hop stamp (the relayed REFER
+///   watchdog / room cascade still completes the transfer).
+/// - No local resolution at all: `None` (the caller stamps the REFER's
+///   original Replaces verbatim).
+pub fn resolve_transfer_target_stamp(
+    local: Option<crate::call::domain::TransferTargetDialog>,
+    peer: Option<crate::call::domain::TransferTargetDialog>,
+) -> Option<crate::call::domain::TransferTargetDialog> {
+    match &local {
+        Some(info) if info.remote_registered => peer.or(local),
+        _ => local,
+    }
+}
+
+pub async fn query_transfer_target_dialog_on_peers(
+    client: &reqwest::Client,
+    peers: &[ClusterPeer],
+    ami_path: &str,
+    root_session_id: &str,
+    target_user: &str,
+    self_ident: Option<&str>,
+) -> Option<crate::call::domain::TransferTargetDialog> {
+    // `self_ident` is this node's registry id (`addr:sip_port`); a peer entry
+    // pointing back at THIS node would answer from the local terminal
+    // handler — whose session pool includes the replaced call's OWN sessions
+    // (poison: the queue call answers with the transferor's dialog).
+    let peers: Vec<&ClusterPeer> = peers
+        .iter()
+        .filter(|p| {
+            let node_id = format!("{}:{}", p.addr, p.sip_port);
+            self_ident.map(|s| s != node_id).unwrap_or(true)
+        })
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+    let body = serde_json::json!({
+        "root_session_id": root_session_id,
+        "target_user": target_user,
+    });
+    for peer in peers {
+        let url = format!(
+            "{}/cluster/query_transfer_target_dialog",
+            peer_ami_base(peer, ami_path)
+        );
+        let Some((status, value)) = forward_json(
+            client,
+            &url,
+            reqwest::Method::POST,
+            Some(&body),
+        )
+        .await
+        else {
+            continue;
+        };
+        if !status.is_success() {
+            continue;
+        }
+        let dialog = serde_json::from_value::<crate::call::domain::TransferTargetDialog>(
+            value.get("dialog").cloned().unwrap_or(serde_json::Value::Null),
+        )
+        .ok();
+        if let Some(dialog) = dialog {
+            // A peer must never answer with a hop dialog of its own (that
+            // would loop the stamp), nor with another call's dialog.
+            if accepts_peer_transfer_target_dialog(&dialog, root_session_id) {
+                return Some(dialog);
+            }
+        }
+    }
+    None
+}
+
+>>>>>>> deploy
 /// Dispatch a call command cluster-wide.
 ///
 /// Forward raw in-dialog SIP (BYE/INFO/…) to the dialog owner when this node
@@ -346,6 +459,92 @@ pub async fn routed_op_on_owner(
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Outcome of a streaming (SSE) owner-routed forward.
+#[derive(Debug)]
+pub enum OwnerStreamOutcome {
+    /// This node hosts the session (or no peers are configured) — the caller
+    /// applies its local handler.
+    ApplyLocally,
+    /// The owner node answered — pipe the response (status + byte stream)
+    /// through to the client unchanged.
+    Streaming(reqwest::Response),
+    /// The registry has no record of the call. Callers fall through to their
+    /// local handler (which answers 404 with its own semantics).
+    UnknownCall,
+    /// The registry backend failed — retryable, never a misleading 404.
+    RegistryUnavailable(String),
+    /// The owner was resolved but no peer matched its node id.
+    OwnerUnreachable,
+}
+
+/// Locate the session's owner and proxy a long-lived GET stream (SSE) from
+/// there — the transcript event tap lives on the node hosting the session.
+///
+/// Same owner-resolution contract as [`routed_op_on_owner`], with two stream
+/// specific differences: the response is piped through as a byte stream (no
+/// buffering, no forward timeout), and there is deliberately NO fan-out
+/// fallback — a stream must come from THE owner; probing every peer would
+/// open empty streams on non-owner nodes. Loop safety: the forwarded request
+/// carries `forwarded_header`, and the peer's handler MUST treat its
+/// presence as "apply locally" (terminal, never re-resolves) — single hop by
+/// construction.
+pub async fn proxy_stream_on_owner(
+    registry: &SessionRegistryRef,
+    peers: &[ClusterPeer],
+    self_node_id: Option<&str>,
+    base_path: &str,
+    client: &reqwest::Client,
+    call_id: &str,
+    relative_path: &str,
+    forwarded_header: (&str, String),
+    authorization: Option<String>,
+) -> OwnerStreamOutcome {
+    if peers.is_empty() {
+        return OwnerStreamOutcome::UnknownCall;
+    }
+    // The client's call_id is passed through verbatim — the owner's handler
+    // applies the same resolution/filter semantics as the local one.
+
+    match locate_owner(registry, call_id).await {
+        OwnerLocation::Unavailable(e) => OwnerStreamOutcome::RegistryUnavailable(e),
+        OwnerLocation::Unknown => OwnerStreamOutcome::UnknownCall,
+        OwnerLocation::Found(owner) => {
+            // Invariant: never HTTP ourselves — apply locally instead.
+            if self_node_id.is_some_and(|self_id| self_id == owner) {
+                return OwnerStreamOutcome::ApplyLocally;
+            }
+            let Some(peer) = peer_for_node_id(peers, &owner) else {
+                return OwnerStreamOutcome::OwnerUnreachable;
+            };
+            let url = format!(
+                "{}/{}",
+                peer_ami_base(peer, base_path),
+                relative_path
+            );
+            let mut req = client.get(&url);
+            if let Some(auth) = authorization {
+                req = req.header(reqwest::header::AUTHORIZATION, auth);
+            }
+            req = req.header(forwarded_header.0, forwarded_header.1);
+            match req.send().await {
+                Ok(resp) => OwnerStreamOutcome::Streaming(resp),
+                Err(error) => {
+                    tracing::warn!(
+                        %call_id,
+                        owner = %owner,
+                        %error,
+                        "streaming forward to owner failed"
+                    );
+                    OwnerStreamOutcome::OwnerUnreachable
+                }
+            }
+        }
+    }
+}
+
+>>>>>>> deploy
 /// ONE bounded fan-out round: every peer receives exactly one request
 /// (concurrently); the first non-404 response wins.  Loop-safe by
 /// construction — the terminal `cluster/*` endpoints apply locally and never
@@ -510,6 +709,264 @@ mod tests {
         (peer("127.0.0.1", port, port), rx, hits)
     }
 
+<<<<<<< HEAD
+=======
+
+    // ── REFER-Replaces cross-node stamp resolution (方案 B) ───────────────
+
+    fn target_dialog(
+        call_id: &str,
+        local_tag: &str,
+        remote_tag: &str,
+        remote_registered: bool,
+        root: &str,
+    ) -> crate::call::domain::TransferTargetDialog {
+        crate::call::domain::TransferTargetDialog {
+            call_id: call_id.to_string(),
+            local_tag: local_tag.to_string(),
+            remote_tag: remote_tag.to_string(),
+            remote_registered,
+            root_session_id: root.to_string(),
+            endpoint_matched: true,
+        }
+    }
+
+    /// The poison answer shape: a callee-fallback reply from an unrelated
+    /// session on the same logical root (production 2026-11-15: the queue
+    /// call answered with the TRANSFEROR's dialog for a query about the
+    /// transfer target).
+    fn fallback_dialog(root: &str) -> crate::call::domain::TransferTargetDialog {
+        let mut d = target_dialog("transferor-leg@h", "QL", "QR", false, root);
+        d.endpoint_matched = false;
+        d
+    }
+
+    /// Same-node targets keep the local dialog; cluster hops only accept a
+    /// cross-node answer; every failure falls back to the local (degraded)
+    /// stamp so the cascade room fallback still completes the transfer.
+    #[test]
+    fn transfer_target_stamp_resolution_matrix() {
+        let local_same_node = Some(target_dialog("aa@h", "L", "R", false, "root-1"));
+        let local_hop = Some(target_dialog("hop@h", "HL", "HR", true, "root-1"));
+        let peer_real = Some(target_dialog("real@h", "PL", "PR", false, "root-1"));
+
+        // Same-node: local dialog used verbatim, peer (if any) ignored.
+        assert_eq!(
+            resolve_transfer_target_stamp(local_same_node.clone(), peer_real.clone()),
+            local_same_node
+        );
+        assert_eq!(
+            resolve_transfer_target_stamp(local_same_node.clone(), None),
+            local_same_node
+        );
+
+        // Cross-node hop + peer answer: the REAL target-facing dialog wins.
+        assert_eq!(
+            resolve_transfer_target_stamp(local_hop.clone(), peer_real.clone()),
+            peer_real
+        );
+
+        // Cross-node hop + query failure: degraded local stamp (cascade
+        // fallback), never silently dropped.
+        assert_eq!(
+            resolve_transfer_target_stamp(local_hop.clone(), None),
+            local_hop
+        );
+
+        // No local resolution: None → caller stamps the REFER's Replaces
+        // verbatim.
+        assert_eq!(resolve_transfer_target_stamp(None, peer_real), None);
+        assert_eq!(resolve_transfer_target_stamp(None, None), None);
+    }
+
+    /// Peer answers with hop dialogs or other calls' dialogs are rejected —
+    /// both at the asking side and at the terminal handler.
+    #[test]
+    fn peer_transfer_target_acceptance_filters_hops_and_foreign_roots() {
+        let real = target_dialog("real@h", "PL", "PR", false, "root-1");
+        assert!(accepts_peer_transfer_target_dialog(&real, "root-1"));
+        // Root configured: foreign logical calls never answer.
+        assert!(!accepts_peer_transfer_target_dialog(&real, "root-2"));
+        // Root unknown (empty): accept the real dialog (single-call peer or
+        // legacy peer without root bookkeeping).
+        assert!(accepts_peer_transfer_target_dialog(&real, ""));
+
+        // A hop dialog would loop the stamp — never accepted.
+        let hop = target_dialog("hop@h", "HL", "HR", true, "root-1");
+        assert!(!accepts_peer_transfer_target_dialog(&hop, "root-1"));
+        assert!(!accepts_peer_transfer_target_dialog(&hop, ""));
+
+        // A callee-fallback answer from an unrelated session is poison —
+        // never accepted, whatever the root says.
+        let poison = fallback_dialog("root-1");
+        assert!(!accepts_peer_transfer_target_dialog(&poison, "root-1"));
+        assert!(!accepts_peer_transfer_target_dialog(&poison, ""));
+    }
+
+    #[derive(Clone)]
+    enum PeerAnswer {
+        Dialog(crate::call::domain::TransferTargetDialog),
+        NotFound,
+    }
+
+    /// Spin a peer AMI server answering the terminal
+    /// `cluster/query_transfer_target_dialog` endpoint. Captures the request
+    /// body for assertions.
+    async fn spawn_target_query_peer(answer: PeerAnswer) -> ClusterPeer {
+        use axum::{Json, Router, extract::State, routing::post};
+        type Shared = (
+            tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+            PeerAnswer,
+        );
+        async fn answer_fn(
+            State(state): State<Shared>,
+            Json(body): Json<serde_json::Value>,
+        ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+            let (tx, answer) = state;
+            let _ = tx.send(body);
+            match answer {
+                PeerAnswer::Dialog(ref d) => (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::json!({ "dialog": d })),
+                ),
+                PeerAnswer::NotFound => (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "message": "no dialog" })),
+                ),
+            }
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let app: Router = Router::new()
+            .route(
+                "/cluster/query_transfer_target_dialog",
+                post(answer_fn),
+            )
+            .with_state((tx, answer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        peer("127.0.0.1", port, port)
+    }
+
+    #[tokio::test]
+    async fn peer_query_returns_the_real_target_dialog() {
+        let real = target_dialog("real-call@h", "PL", "PR", false, "root-1");
+        let p = spawn_target_query_peer(PeerAnswer::Dialog(real.clone())).await;
+        let client = reqwest::Client::new();
+        let got = query_transfer_target_dialog_on_peers(
+            &client,
+            &[p],
+            "",
+            "root-1",
+            "1004",
+            None
+        )
+        .await;
+        assert_eq!(got, Some(real));
+
+        // Self-ident filtering: a peer entry pointing back at THIS node is
+        // skipped — self-answers from the local terminal handler are poison
+        // (no HTTP: no mock server needed for the self peer).
+        let got = query_transfer_target_dialog_on_peers(
+            &client,
+            &[peer("10.0.0.7", 5060, 18081)],
+            "",
+            "root-1",
+            "1004",
+            Some("10.0.0.7:5060"),
+        )
+        .await;
+        assert_eq!(got, None, "self peer must be skipped without any HTTP");
+    }
+
+    #[tokio::test]
+    async fn peer_query_rejects_hop_and_foreign_and_404_answers() {
+        let client = reqwest::Client::new();
+        // Hop answer: rejected → None (stamp falls back to the local hop).
+        let hop = spawn_target_query_peer(PeerAnswer::Dialog(target_dialog(
+            "hop@h", "HL", "HR", true, "root-1",
+        )))
+        .await;
+        assert_eq!(
+            query_transfer_target_dialog_on_peers(
+                &client,
+                &[hop],
+                "/ami",
+                "root-1",
+                "1004",
+                None
+            )
+            .await,
+            None
+        );
+        // Callee-fallback (non endpoint-matched) answer: poison — None.
+        let fallback = spawn_target_query_peer(PeerAnswer::Dialog(fallback_dialog("root-1"))).await;
+        assert_eq!(
+            query_transfer_target_dialog_on_peers(
+                &client,
+                &[fallback],
+                "",
+                "root-1",
+                "1004",
+                None
+            )
+            .await,
+            None
+        );
+        // 404 (no local dialog): None.
+        let missing = spawn_target_query_peer(PeerAnswer::NotFound).await;
+        assert_eq!(
+            query_transfer_target_dialog_on_peers(
+                &client,
+                &[missing],
+                "/ami",
+                "root-1",
+                "1004",
+                None
+            )
+            .await,
+            None
+        );
+        // No peers: None without any HTTP.
+        assert_eq!(
+            query_transfer_target_dialog_on_peers(
+                &client,
+                &[],
+                "/ami",
+                "root-1",
+                "1004",
+                None
+            )
+            .await,
+            None
+        );
+    }
+
+    /// The wire shape the terminal handler speaks: TransferTargetDialog
+    /// round-trips through the JSON envelope `{"dialog": …}`.
+    #[test]
+    fn transfer_target_dialog_json_roundtrip() {
+        let d = target_dialog("real-call@h", "PL", "PR", false, "root-1");
+        let v = serde_json::json!({ "dialog": d });
+        let back: crate::call::domain::TransferTargetDialog =
+            serde_json::from_value(v.get("dialog").cloned().unwrap()).unwrap();
+        assert_eq!(back, d);
+        // Legacy-tolerant: a peer without root bookkeeping (missing field)
+        // still parses.
+        let minimal = serde_json::json!({
+            "call_id": "x@h", "local_tag": "L", "remote_tag": "R",
+            "remote_registered": false,
+        });
+        let back: crate::call::domain::TransferTargetDialog =
+            serde_json::from_value(minimal).unwrap();
+        assert_eq!(back.root_session_id, "");
+        assert!(!back.remote_registered);
+        assert!(!back.endpoint_matched, "missing flag defaults to fallback shape");
+    }
+
+>>>>>>> deploy
     #[test]
     fn peer_for_node_id_matches_addr_port_form() {
         let peers = vec![peer("10.0.0.2", 5060, 8081), peer("10.0.0.3", 5060, 8082)];
@@ -524,6 +981,151 @@ mod tests {
         assert!(peer_for_node_id(&peers, "10.9.9.9:5060").is_none());
     }
 
+<<<<<<< HEAD
+=======
+    /// `proxy_stream_on_owner` pipes the owner's SSE-like response through:
+    /// single-cast to the owning peer with the forwarded-marker and
+    /// Authorization headers preserved, body streamed (not buffered).
+    /// Self-owned applies locally; an unknown call and a registry outage
+    /// surface as their own outcomes.
+    #[tokio::test]
+    async fn proxy_stream_forwards_from_owning_peer() {
+        use crate::call::runtime::{MemorySessionRegistry, SessionInfo, SessionRegistry};
+        use axum::{Router, extract::State, routing::get};
+
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Option<String>, Option<String>)>();
+        type HeaderCapture = tokio::sync::mpsc::UnboundedSender<(Option<String>, Option<String>)>;
+        async fn stream_handler(
+            State(tx): State<HeaderCapture>,
+            headers: axum::http::HeaderMap,
+        ) -> axum::response::Response {
+            let _ = tx.send((
+                headers
+                    .get("x-rwi-transcript-forwarded")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string()),
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.to_string()),
+            ));
+            axum::response::Response::builder()
+                .status(200)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(axum::body::Body::from("event: segment\ndata: {}\n\n"))
+                .unwrap()
+        }
+        let app: Router = Router::new()
+            .route("/api/cc/calls/c-1/transcript", get(stream_handler))
+            .with_state(tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let peers = vec![peer("127.0.0.1", 5060, port)];
+        let registry: crate::call::runtime::SessionRegistryRef = MemorySessionRegistry::new(
+            "127.0.0.1:5060",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(3600),
+        );
+        registry
+            .register(&SessionInfo::new("c-1", "127.0.0.1:5060"))
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        // 1. Owner is the peer → Streaming: headers captured, body piped.
+        match proxy_stream_on_owner(
+            &registry,
+            &peers,
+            Some("10.9.9.9:5060"),
+            "/api",
+            &client,
+            "c-1",
+            "cc/calls/c-1/transcript",
+            ("x-rwi-transcript-forwarded", "self-node".to_string()),
+            Some("Bearer tok".to_string()),
+        )
+        .await
+        {
+            OwnerStreamOutcome::Streaming(resp) => {
+                assert_eq!(resp.status(), 200);
+                assert_eq!(
+                    resp.headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("text/event-stream")
+                );
+                let body = resp.text().await.unwrap();
+                assert!(body.contains("event: segment"), "stream body piped: {body}");
+            }
+            other => panic!("expected Streaming, got {other:?}"),
+        }
+        let (marker, auth) = rx.recv().await.unwrap();
+        assert_eq!(marker.as_deref(), Some("self-node"), "forwarded marker sent");
+        assert_eq!(auth.as_deref(), Some("Bearer tok"), "authorization forwarded");
+
+        // 2. This node owns the session → ApplyLocally, no HTTP round trip.
+        match proxy_stream_on_owner(
+            &registry,
+            &peers,
+            Some("127.0.0.1:5060"),
+            "/api",
+            &client,
+            "c-1",
+            "cc/calls/c-1/transcript",
+            ("x-rwi-transcript-forwarded", "self-node".to_string()),
+            None,
+        )
+        .await
+        {
+            OwnerStreamOutcome::ApplyLocally => {}
+            other => panic!("expected ApplyLocally, got {other:?}"),
+        }
+
+        // 3. Unknown call (no registry row) → UnknownCall, no HTTP.
+        match proxy_stream_on_owner(
+            &registry,
+            &peers,
+            Some("127.0.0.1:5060"),
+            "/api",
+            &client,
+            "missing-call",
+            "cc/calls/missing-call/transcript",
+            ("x-rwi-transcript-forwarded", "self-node".to_string()),
+            None,
+        )
+        .await
+        {
+            OwnerStreamOutcome::UnknownCall => {}
+            other => panic!("expected UnknownCall, got {other:?}"),
+        }
+
+        // 4. Registry outage → RegistryUnavailable (retryable, never 404).
+        let down = MockRegistry::new(MockPlan::Down);
+        match proxy_stream_on_owner(
+            &down,
+            &peers,
+            Some("127.0.0.1:5060"),
+            "/api",
+            &client,
+            "c-1",
+            "cc/calls/c-1/transcript",
+            ("x-rwi-transcript-forwarded", "self-node".to_string()),
+            None,
+        )
+        .await
+        {
+            OwnerStreamOutcome::RegistryUnavailable(_) => {}
+            other => panic!("expected RegistryUnavailable, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "outage path must not hit the peer");
+    }
+
+>>>>>>> deploy
     /// `routed_op_on_owner` must POST the op body to the peer owning the
     /// canonical session even when a dialog alias uses the same ID. Exercise
     /// both registration orders and ensure alias cleanup preserves the owner.

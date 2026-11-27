@@ -94,9 +94,39 @@ impl SipSession {
             let bridge = crate::call::runtime::ConferenceMediaBridge::new(
                 self.server.conference_server.manager_raw().clone(),
             );
+<<<<<<< HEAD
             return bridge.start_bridge_full_duplex(
                 conf_id, leg_id, tx, Box::new(MediaBridgeLegAudioReceiver::new(audio)),
                 self.leg_negotiated_codec(leg_id),
+=======
+            // Hold gate: the room leg's hold music flows through the
+            // bridge's forward loop (the mixer feed is substituted in place),
+            // so a held room leg never depends on leg-level hold sources or
+            // on the room staying alive.
+            let hold_gate = match self.resolve_hold_music(&[]) {
+                Some(crate::call::domain::MediaSource::File { path })
+                | Some(crate::call::domain::MediaSource::Url { url: path }) => {
+                    let resolved = if path.starts_with("http://") || path.starts_with("https://") {
+                        path.clone()
+                    } else {
+                        Self::resolve_audio_file_path(&path)
+                    };
+                    // The forward loop paces hold music at the ENCODER's PCM
+                    // rate (G.722: 16 kHz, RTP clock is 8 kHz), so the WAV
+                    // must be pre-resampled to that rate — not the clock rate,
+                    // which played G.722 hold music at double pitch.
+                    crate::call::runtime::hold_gate_from_wav(
+                        &resolved,
+                        self.leg_negotiated_codec(leg_id).samplerate(),
+                    )
+                }
+                _ => None,
+            };
+            return bridge.start_bridge_full_duplex(
+                conf_id, leg_id, tx, Box::new(MediaBridgeLegAudioReceiver::new(audio)),
+                self.leg_negotiated_codec(leg_id),
+                hold_gate,
+>>>>>>> deploy
             ).await;
         }
         Err(anyhow!("Missing media endpoint for {}", local_leg))
@@ -113,6 +143,30 @@ impl SipSession {
                 .unwrap_or(leg_id.as_str()),
         );
         let leg_id = &local_leg;
+<<<<<<< HEAD
+=======
+        // Prefer the leg's LIVE negotiated profile: that is the codec the
+        // RTP path actually decodes/encodes with (and whose payload type the
+        // leg's egress sender stamps). The stored SDP answer can list a
+        // different codec order — building the room encoder from it made the
+        // bridge emit one codec's bytes under another codec's payload type
+        // after a re-negotiation (audible wideband noise, production
+        // 2026-11-14: transfer-room hold/resume).
+        if let Some(codec) = self
+            .legs
+            .media_leg(leg_id)
+            .and_then(|leg| leg.negotiated())
+            .and_then(|profile| profile.audio)
+            .map(|audio| audio.codec)
+        {
+            debug!(session_id = %self.id,
+                leg_id = %leg_id,
+                codec = ?codec,
+                "Resolved per-leg codec from the live media profile"
+            );
+            return codec;
+        }
+>>>>>>> deploy
         let sdp = self.legs.get_answer(leg_id).or_else(|| {
             if leg_id.as_str() == "caller" {
                 self.media.answer.as_deref()
@@ -302,12 +356,23 @@ impl crate::call::runtime::conference_media_bridge::AudioReceiver for MediaBridg
                 if frame.silence {
                     continue;
                 }
+<<<<<<< HEAD
                 return Some(
                     crate::call::runtime::conference_media_bridge::PcmAudioFrame::new(
                         frame.frame.samples,
                         frame.frame.sample_rate,
                     ),
                 );
+=======
+                // Preserve the tap's timeline so the mixer can place this
+                // frame by time (R3: gaps/packetisation must not shift audio).
+                let mut pcm = crate::call::runtime::conference_media_bridge::PcmAudioFrame::new(
+                    frame.frame.samples,
+                    frame.frame.sample_rate,
+                );
+                pcm.timestamp = frame.frame.timestamp;
+                return Some(pcm);
+>>>>>>> deploy
             }
         })
     }

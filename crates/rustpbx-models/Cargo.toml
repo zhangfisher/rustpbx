@@ -10,7 +10,11 @@ repository = "https://github.com/restsend/rustpbx"
 anyhow = "1"
 async-trait = "0.1.88"
 chrono = { version = "0.4", features = ["serde"] }
+<<<<<<< HEAD
 rsipstack = "0.8.2"
+=======
+rsipstack = "0.8.8"
+>>>>>>> deploy
 sea-orm = { version = "2", features = [
     "runtime-tokio-rustls",
     "sqlx-sqlite",

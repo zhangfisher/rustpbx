@@ -14,6 +14,19 @@
 //! [`LegInner::set_egress_source`] routes [`EgressSource::RewriteRelay`] to the
 //! PC's rewrite bridge (transport-level, ICE exclusively owned) and all other
 //! sources to the always-alive [`EgressPipeline`].
+<<<<<<< HEAD
+=======
+//!
+//! ## Outbound timeline
+//!
+//! Each of a leg's senders owns one `rustrtc::rtp_timeline::OutboundTimeline`
+//! for its SSRC. Relayed peer packets are mapped onto it with a fixed offset
+//! (anchored again on a new peer, SSRC or jump); generated packets (the paced
+//! pipeline) advance by one `ptime` interval. The sender preserves the start
+//! timestamp of telephone events interleaved with generated audio. A relay
+//! source arms the peer's rewrite bridge into this leg, and any other source
+//! removes it, so the timeline sees one writer at a time.
+>>>>>>> deploy
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -41,7 +54,11 @@ use crate::ingress_tap::{DtmfEvent, IngressTap, TapStats};
 use crate::leg_id::LegId;
 use crate::leg_stats::{LegRtcpStats, SrTimeTracker, spawn_rtcp_listener};
 use crate::media_recorder::RecorderSender;
+<<<<<<< HEAD
 use crate::negotiate::{self, CodecInfo, NegotiatedLegProfile, TransportMode};
+=======
+use crate::negotiate::{self, CodecInfo, NegotiatedLegProfile, TransportMode, normalize_mux_for_full_ice};
+>>>>>>> deploy
 
 /// Outcome of a [`PlaybackHandle`]'s play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,12 +213,15 @@ pub struct LegInner {
     /// Egress pipeline — always alive; the source is switched via the command
     /// channel. For [`EgressSource::RewriteRelay`] the pacing loop parks.
     egress: EgressPipeline,
+<<<<<<< HEAD
     /// Whether the current egress source is [`EgressSource::RewriteRelay`].
     /// Tracked so the Leg knows when to tear down/rebuild the PC's rewrite
     /// bridge on mode switches (EgressSource is not Clone). Shared with the
     /// outbound clock sync observer so rewrite packets update the paced
     /// sender's RTCP/seq state while relay owns the wire.
     was_relay: Arc<AtomicBool>,
+=======
+>>>>>>> deploy
     negotiated: Mutex<Option<NegotiatedLegProfile>>,
     /// Audio address this leg advertised in its local SDP (session/media `c=`
     /// + audio m-line port), captured when the local description commits —
@@ -230,6 +250,12 @@ pub struct LegInner {
     /// `Drop` and before re-spawning, so stale arming tasks never pile up
     /// across negotiation churn / leg replacement.
     relay_arm_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+<<<<<<< HEAD
+=======
+    /// The peer whose rewrite bridge currently relays packets onto this leg's
+    /// wire (`None` when paced). Ensures this leg's wire has one writer at a time.
+    relay_from: Mutex<Option<PeerConnection>>,
+>>>>>>> deploy
     /// Max wait for a WebRTC peer's ICE+DTLS before degrading the relay to
     /// transcoding (from config; falls back to `WEBRTC_RELAY_READY_TIMEOUT`).
     relay_ready_timeout: Option<std::time::Duration>,
@@ -434,7 +460,11 @@ impl LegInner {
         // scheduling jitter). Depth 8 (160 ms) was too shallow: when
         // `try_send` failed, older code still advanced RTP ts/seq → wire holes
         // → Chrome PLC pops on app/IVR (p2p RewriteRelay parks egress). 64 ≈
+<<<<<<< HEAD
         // 1.28 s headroom; egress also rolls back timeline on WouldBlock.
+=======
+        // 1.28 s headroom; rustrtc assigns numbering only after dequeue.
+>>>>>>> deploy
         // (500 was ~95 KB/leg × 1600 ≈ 150 MB reserved — too large.)
         let (sender, track, _feedback) = sample_track(MediaKind::Audio, 64);
         let params = RtpCodecParameters {
@@ -522,6 +552,7 @@ impl LegInner {
             }
         }
 
+<<<<<<< HEAD
         let was_relay = Arc::new(AtomicBool::new(false));
         // Keep paced-sender RTCP SR / next-seq coherent while rewrite owns the
         // shared outbound SSRC. Hold the audio sender as a WEAK ref so
@@ -535,12 +566,17 @@ impl LegInner {
             relay_active: was_relay.clone(),
         }));
 
+=======
+>>>>>>> deploy
         Ok(Arc::new(LegInner {
             id: LegId::from(label),
             pc,
             tap,
             egress,
+<<<<<<< HEAD
             was_relay,
+=======
+>>>>>>> deploy
             negotiated: Mutex::new(None),
             advertised_addr: Mutex::new(None),
             peer_advertised_addr: Mutex::new(None),
@@ -549,6 +585,10 @@ impl LegInner {
             observer_attached: Arc::new(AtomicBool::new(false)),
             observer_task: Mutex::new(None),
             relay_arm_task: Mutex::new(None),
+<<<<<<< HEAD
+=======
+            relay_from: Mutex::new(None),
+>>>>>>> deploy
             relay_ready_timeout,
             rtcp_stats,
             ingress_stall_tx: broadcast::channel(8).0,
@@ -690,6 +730,24 @@ impl LegInner {
         self.negotiated.lock().clone()
     }
 
+<<<<<<< HEAD
+=======
+    /// Audio `(payload_type -> CodecType)` map from this leg's SDP offer.
+    /// Available as soon as an offer is created or received (before answer).
+    pub fn offered_audio_pt_map(&self) -> std::collections::BTreeMap<u8, CodecType> {
+        let Some(offer) = self.offer_description() else {
+            return std::collections::BTreeMap::new();
+        };
+        offer
+            .media_sections
+            .iter()
+            .filter(|section| section.kind == rustrtc::MediaKind::Audio)
+            .flat_map(negotiate::MediaNegotiator::parse_rtp_map_from_section)
+            .filter_map(|(pt, (codec, _, _))| codec.is_audio().then_some((pt, codec)))
+            .collect()
+    }
+
+>>>>>>> deploy
     /// Build a local description for hold/resume without re-offering unused audio codecs.
     pub fn negotiated_local_sdp(&self) -> Option<SessionDescription> {
         let mut local = self.pc.local_description()?;
@@ -866,7 +924,14 @@ impl LegInner {
             video_mline = ?video_mline,
             "leg SDP applied",
         );
+<<<<<<< HEAD
         let desc = SessionDescription::parse(sdp_type, remote)?;
+=======
+        // RFC 9429 §9.3 shim: legacy full-ICE offers without `a=rtcp-mux`
+        // are normalized before validation (see negotiate::normalize_mux_for_full_ice).
+        let remote = normalize_mux_for_full_ice(remote);
+        let desc = SessionDescription::parse(sdp_type, &remote)?;
+>>>>>>> deploy
         if let Some(addr) = advertised_audio_addr(&desc) {
             *self.peer_advertised_addr.lock() = Some(addr);
         }
@@ -883,8 +948,12 @@ impl LegInner {
         // direct UDP like plain RTP and their SRTP packets keep the clear
         // RTP header, so latching works identically there. WebRTC legs
         // resolve their address via ICE and are excluded.
+<<<<<<< HEAD
         if (TransportMode::of(self.pc.config()) == TransportMode::Rtp
             || TransportMode::of(self.pc.config()) == TransportMode::Srtp)
+=======
+        if TransportMode::of(self.pc.config()) != TransportMode::WebRtc
+>>>>>>> deploy
             && self.pc.config().enable_latching
         {
             for transceiver in self.pc.get_transceivers() {
@@ -897,7 +966,11 @@ impl LegInner {
         }
 
         if sdp_type != SdpType::Offer {
+<<<<<<< HEAD
             self.sync_answer_profile(remote, remote).await?;
+=======
+            self.sync_answer_profile(&remote, &remote).await?;
+>>>>>>> deploy
         }
         Ok(())
     }
@@ -910,12 +983,38 @@ impl LegInner {
         Ok(self.pc.create_answer().await?)
     }
 
+<<<<<<< HEAD
     async fn sync_answer_profile(&self, answer: &str, remote: &str) -> Result<()> {
         let profile = negotiate::MediaNegotiator::extract_leg_profile(answer);
 
         self.sync_negotiated_profile(&profile).await?;
 
         let remote_dtmf_pts: Vec<u8> = negotiate::MediaNegotiator::extract_dtmf_codecs(remote)
+=======
+    fn offer_description(&self) -> Option<SessionDescription> {
+        self.pc
+            .local_description()
+            .filter(|description| description.sdp_type == SdpType::Offer)
+            .or_else(|| {
+                self.pc
+                    .remote_description()
+                    .filter(|description| description.sdp_type == SdpType::Offer)
+            })
+    }
+
+    /// Sync the sender's codec/PT to the negotiated answer. The profile is
+    /// extracted from the answer SDP: the local answer we just produced
+    /// (as UAS), or the remote answer we applied (as UAC).
+    async fn sync_answer_profile(&self, answer: &str, remote: &str) -> Result<()> {
+        let profile = negotiate::MediaNegotiator::extract_leg_profile_with_offer(
+            answer,
+            self.offer_description().as_ref(),
+        );
+
+        self.sync_negotiated_profile(&profile).await?;
+
+        let remote_dtmf_pts: Vec<u8> = negotiate::MediaNegotiator::extract_dtmf_codecs(&remote)
+>>>>>>> deploy
             .iter()
             .map(|c| c.payload_type)
             .collect();
@@ -1185,7 +1284,14 @@ impl LegInner {
     /// re-INVITEs. Keeps `MediaBridge::bridge()` and egress in sync with the
     /// SDP returned to the remote peer.
     pub async fn apply_profile_from_sdp(&self, sdp: &str) -> Result<()> {
+<<<<<<< HEAD
         let profile = negotiate::MediaNegotiator::extract_leg_profile(sdp);
+=======
+        let profile = negotiate::MediaNegotiator::extract_leg_profile_with_offer(
+            sdp,
+            self.offer_description().as_ref(),
+        );
+>>>>>>> deploy
         self.sync_negotiated_profile(&profile).await
     }
 
@@ -1199,7 +1305,11 @@ impl LegInner {
     /// Whether the leg's egress source is the fast-path relay (vs the paced
     /// egress pipeline: silence / media / transcode).
     pub fn egress_is_relay(&self) -> bool {
+<<<<<<< HEAD
         self.was_relay.load(Ordering::SeqCst)
+=======
+        self.relay_from.lock().is_some()
+>>>>>>> deploy
     }
 
     /// Switch the egress source. [`EgressSource::RewriteRelay`] is routed to
@@ -1217,6 +1327,7 @@ impl LegInner {
             session_id = %self.pc.config().label.as_deref().unwrap_or_default(),
             leg = %self.id, source = kind, "leg egress source switch"
         );
+<<<<<<< HEAD
         let is_relay = matches!(&source, EgressSource::RewriteRelay { .. });
         if let Some(previous) = self.relay_arm_task.lock().take() {
             previous.abort();
@@ -1230,6 +1341,34 @@ impl LegInner {
                 options,
                 rules,
                 video_payload_types,
+=======
+        if let Some(previous) = self.relay_arm_task.lock().take() {
+            previous.abort();
+        }
+        // Release the relay when changing its peer or switching to paced
+        // output. A same-peer rearm keeps the old route until the replacement
+        // transports are ready. Clones share their PeerConnection's config.
+        {
+            let mut relay_from = self.relay_from.lock();
+            if let Some(peer) = relay_from.take()
+                && !matches!(&source, EgressSource::RewriteRelay { peer_pc, .. }
+                    if std::ptr::eq(peer.config(), peer_pc.config()))
+            {
+                peer.clear_rtp_rewrite_bridge_into(&self.pc);
+            }
+            if let EgressSource::RewriteRelay { peer_pc, .. } = &source {
+                *relay_from = Some(peer_pc.clone());
+            }
+        }
+
+        match source {
+            // Switching TO RewriteRelay: arm the peer's rewrite bridge onto
+            // this leg's wire (the peer's ingress relayed to this PC).
+            EgressSource::RewriteRelay {
+                peer_pc,
+                options,
+                routes,
+>>>>>>> deploy
                 on_arm_failed,
             } => {
                 // The rewrite bridge needs the exact per-kind sender
@@ -1245,6 +1384,19 @@ impl LegInner {
                 // defer the arming to a background task and return
                 // immediately. RTP-mode transports are created during SDP
                 // application and are ready synchronously.
+<<<<<<< HEAD
+=======
+                // Park and clear paced output before enabling the direct relay.
+                self.egress
+                    .set_source(EgressSource::RewriteRelay {
+                        peer_pc: peer_pc.clone(),
+                        options,
+                        routes: routes.clone(),
+                        on_arm_failed: on_arm_failed.clone(),
+                    })
+                    .await?;
+                let timelines = own_timelines(&self.pc);
+>>>>>>> deploy
                 let has_webrtc_peer = TransportMode::of(self.pc.config()) == TransportMode::WebRtc
                     || TransportMode::of(peer_pc.config()) == TransportMode::WebRtc;
                 let ready_timeout = self
@@ -1252,21 +1404,32 @@ impl LegInner {
                     .unwrap_or(WEBRTC_RELAY_READY_TIMEOUT);
                 if has_webrtc_peer {
                     let pc = self.pc.clone();
+<<<<<<< HEAD
                     let peer = peer_pc.clone();
                     let options = options.clone();
                     let rules = rules.clone();
                     let video_payload_types = video_payload_types.clone();
                     let on_arm_failed = on_arm_failed.clone();
+=======
+>>>>>>> deploy
                     let leg_id = self.id.clone();
                     let handle = tokio::spawn(async move {
                         if let Err(error) = wait_and_arm_rewrite_relay(
                             &leg_id,
                             ready_timeout,
+<<<<<<< HEAD
                             &pc,
                             &peer,
                             options,
                             &rules,
                             &video_payload_types,
+=======
+                            &peer_pc,
+                            &pc,
+                            options,
+                            &routes,
+                            timelines,
+>>>>>>> deploy
                         )
                         .await
                         {
@@ -1284,6 +1447,7 @@ impl LegInner {
                     wait_and_arm_rewrite_relay(
                         &self.id,
                         ready_timeout,
+<<<<<<< HEAD
                         &self.pc,
                         peer_pc,
                         *options,
@@ -1325,6 +1489,25 @@ impl LegInner {
         // Forward to the pipeline. For RewriteRelay the pacing loop parks
         // (tick skipped); for everything else it produces frames.
         self.egress.set_source(source).await
+=======
+                        &peer_pc,
+                        &self.pc,
+                        options,
+                        &routes,
+                        timelines,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            // Paced source: the relay into this leg was removed above (the
+            // peer's packets go back to its own receivers, e.g. for
+            // transcoding), and the paced output continues this leg's
+            // outbound timeline. This leg's audio relayed to the peer is the
+            // peer's source, left alone: the peer keeps hearing this leg.
+            source => self.egress.set_source(source).await,
+        }
+>>>>>>> deploy
     }
 
     /// Subscribe to decoded ingress audio without depending on bridge slots.
@@ -1561,6 +1744,12 @@ impl LegInner {
         if let Some(handle) = self.relay_arm_task.lock().take() {
             handle.abort();
         }
+<<<<<<< HEAD
+=======
+        if let Some(peer) = self.relay_from.lock().take() {
+            peer.clear_rtp_rewrite_bridge_into(&self.pc);
+        }
+>>>>>>> deploy
         for handle in self.rtcp_listener_tasks.lock().drain(..) {
             handle.abort();
         }
@@ -1594,6 +1783,7 @@ fn rtp_transport_for_kind(
         .and_then(|sender| sender.transport())
 }
 
+<<<<<<< HEAD
 fn audio_rtp_sender(pc: &PeerConnection) -> Option<Arc<rustrtc::peer_connection::RtpSender>> {
     pc.get_transceivers()
         .into_iter()
@@ -1657,6 +1847,17 @@ impl rustrtc::peer_connection::RtpObserver for OutboundClockSync {
             packet.payload.len() as u32,
         );
     }
+=======
+/// A leg's outbound timelines (one per sender SSRC), handed to the relay
+/// writing into it so relayed packets continue the same sequence/timestamp
+/// space as the leg's own output.
+fn own_timelines(pc: &PeerConnection) -> Vec<Arc<rustrtc::rtp_timeline::OutboundTimeline>> {
+    pc.get_transceivers()
+        .into_iter()
+        .filter_map(|transceiver| transceiver.sender())
+        .map(|sender| sender.timeline())
+        .collect()
+>>>>>>> deploy
 }
 
 /// Default max wait for a WebRTC peer's ICE+DTLS before degrading the fast-path
@@ -1696,8 +1897,13 @@ async fn wait_and_arm_rewrite_relay(
     source_pc: &PeerConnection,
     destination_pc: &PeerConnection,
     options: rustrtc::RtpRewriteBridgeOptions,
+<<<<<<< HEAD
     rules: &[rustrtc::RtpRewriteRule],
     video_payload_types: &[u8],
+=======
+    routes: &[(rustrtc::MediaKind, Vec<rustrtc::RtpRewriteRule>)],
+    timelines: Vec<Arc<rustrtc::rtp_timeline::OutboundTimeline>>,
+>>>>>>> deploy
 ) -> Result<()> {
     let arm_started = std::time::Instant::now();
     let webrtc_pc = if TransportMode::of(source_pc.config()) == TransportMode::WebRtc {
@@ -1726,6 +1932,7 @@ async fn wait_and_arm_rewrite_relay(
         );
     }
 
+<<<<<<< HEAD
     let audio_source = wait_rtp_transport(source_pc, rustrtc::MediaKind::Audio, "source").await?;
     let audio_target =
         wait_rtp_transport(destination_pc, rustrtc::MediaKind::Audio, "destination").await?;
@@ -1794,12 +2001,31 @@ async fn wait_and_arm_rewrite_relay(
         );
         audio_source.bridge_rewrite_rules_to(audio_target, options, audio_rules);
         video_source.bridge_rewrite_rules_to(video_target, options, video_rules);
+=======
+    // Resolve every route's source/target transports before clearing the old
+    // bridges so a missing late WebRTC video transport never tears down audio.
+    let mut resolved = Vec::with_capacity(routes.len());
+    for (kind, rules) in routes {
+        let source = wait_rtp_transport(source_pc, *kind, "source").await?;
+        let target = wait_rtp_transport(destination_pc, *kind, "destination").await?;
+        resolved.push((*kind, source, target, rules.clone()));
+    }
+
+    source_pc.clear_rtp_rewrite_bridge();
+
+    for (kind, source, target, rules) in resolved {
+        source.bridge_media_rewrite_rules(kind, target, options, rules, timelines.clone());
+>>>>>>> deploy
     }
 
     debug!(
         session_id = %source_pc.config().label.as_deref().unwrap_or_default(),
         leg = %leg,
+<<<<<<< HEAD
         video = true,
+=======
+        routes = routes.len(),
+>>>>>>> deploy
         arm_ms = arm_started.elapsed().as_millis() as u64,
         "fast-path relay armed"
     );
@@ -2155,14 +2381,26 @@ mod tests {
         set_test_sender_transport(source.pc(), rustrtc::MediaKind::Audio, source_audio.clone());
         set_test_sender_transport(target.pc(), rustrtc::MediaKind::Audio, target_audio.clone());
 
+<<<<<<< HEAD
+=======
+        let av_routes = [
+            (rustrtc::MediaKind::Audio, Vec::new()),
+            (rustrtc::MediaKind::Video, Vec::new()),
+        ];
+>>>>>>> deploy
         let missing_video = wait_and_arm_rewrite_relay(
             &LegId::from("test-leg"),
             Duration::from_secs(5),
             source.pc(),
             target.pc(),
             Default::default(),
+<<<<<<< HEAD
             &[],
             &[96],
+=======
+            &av_routes,
+            Vec::new(),
+>>>>>>> deploy
         )
         .await;
         assert!(missing_video.is_err(), "video transports must be required");
@@ -2176,8 +2414,13 @@ mod tests {
             source.pc(),
             target.pc(),
             Default::default(),
+<<<<<<< HEAD
             &[],
             &[96],
+=======
+            &av_routes,
+            Vec::new(),
+>>>>>>> deploy
         )
         .await;
         assert!(
@@ -2194,8 +2437,13 @@ mod tests {
             source.pc(),
             target.pc(),
             Default::default(),
+<<<<<<< HEAD
             &[],
             &[96],
+=======
+            &av_routes,
+            Vec::new(),
+>>>>>>> deploy
         )
         .await
         .expect("relay should arm once all transports are ready");
@@ -2460,8 +2708,13 @@ mod tests {
         ).unwrap()), true, None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await;
         a.egress.set_source(EgressSource::RewriteRelay {
+<<<<<<< HEAD
             peer_pc: a.pc().clone(), options: Default::default(), rules: Vec::new(),
             video_payload_types: Vec::new(), on_arm_failed: None,
+=======
+            peer_pc: a.pc().clone(), options: Default::default(), routes: Vec::new(),
+            on_arm_failed: None,
+>>>>>>> deploy
         }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         let direct = serde_json::to_value(a.quality_report("A")).unwrap()["pcmEgress"].clone();
@@ -2474,8 +2727,13 @@ mod tests {
         let count = rows.len();
         drop(rows);
         a.egress.set_source(EgressSource::RewriteRelay {
+<<<<<<< HEAD
             peer_pc: a.pc().clone(), options: Default::default(), rules: Vec::new(),
             video_payload_types: Vec::new(), on_arm_failed: None,
+=======
+            peer_pc: a.pc().clone(), options: Default::default(), routes: Vec::new(),
+            on_arm_failed: None,
+>>>>>>> deploy
         }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(captured.lock().len(), count, "finishing again without PCM must not duplicate logs");
@@ -2516,8 +2774,15 @@ mod tests {
         let answer = relay_b.answer(&offer).await.unwrap();
         relay_a.apply_remote_sdp(&answer, rustrtc::SdpType::Answer).await.unwrap();
         relay_a.set_egress_source(EgressSource::RewriteRelay {
+<<<<<<< HEAD
             peer_pc: relay_b.pc().clone(), options: Default::default(), rules: Vec::new(),
             video_payload_types: Vec::new(), on_arm_failed: None,
+=======
+            peer_pc: relay_b.pc().clone(),
+            options: Default::default(),
+            routes: vec![(rustrtc::MediaKind::Audio, Vec::new())],
+            on_arm_failed: None,
+>>>>>>> deploy
         }).await.unwrap();
         let rows = relay_logs.lock();
         for message in ["leg egress source switch", "fast-path relay armed"] {
@@ -2796,6 +3061,10 @@ mod tests {
             m=audio 4000 UDP/TLS/RTP/SAVPF 111\r\n\
             a=rtpmap:111 opus/48000/2\r\n\
             a=mid:0\r\n\
+<<<<<<< HEAD
+=======
+            a=rtcp-mux\r\n\
+>>>>>>> deploy
             a=sendrecv\r\n\
             a=rtcp-mux\r\n\
             a=setup:actpass\r\n\
@@ -2806,6 +3075,10 @@ mod tests {
             a=rtpmap:96 H264/90000\r\n\
             a=rtpmap:98 VP8/90000\r\n\
             a=mid:1\r\n\
+<<<<<<< HEAD
+=======
+            a=rtcp-mux\r\n\
+>>>>>>> deploy
             a=sendrecv\r\n\
             a=rtcp-mux\r\n\
             a=setup:actpass\r\n\
@@ -3052,6 +3325,12 @@ mod p24_uac_test {
         let leg = LegInner::new("plain-rtp-av", &cfg, None).expect("leg");
         let offer = leg.create_offer().await.expect("offer");
         println!("plain RTP A/V offer:\n{offer}");
+<<<<<<< HEAD
+=======
+        // Upstream 0.6.x's `sip()` prefab (Balanced + Negotiate) keeps the
+        // strict-SIP compat points: no bundle-only m-lines, an RTCP port per
+        // m-line (RFC 5761 §5.1.1), no datachannel section.
+>>>>>>> deploy
         assert!(
             !offer.contains("a=bundle-only"),
             "a peer without BUNDLE rejects bundle-only m-lines:\n{offer}"
@@ -3065,6 +3344,22 @@ mod p24_uac_test {
             !offer.contains("m=application"),
             "m=application causes 488 on strict SIP phones:\n{offer}"
         );
+<<<<<<< HEAD
+=======
+        assert!(
+            !offer.contains("a=group:BUNDLE"),
+            "plain SIP offers must not propose BUNDLE:\n{offer}"
+        );
+        assert!(
+            !offer.contains("a=mid:"),
+            "plain SIP offers without BUNDLE must not emit a=mid:\n{offer}"
+        );
+        assert_eq!(
+            offer.lines().filter(|l| l.starts_with("a=rtcp:")).count(),
+            2,
+            "each m-line advertises its RTCP port (Negotiate):\n{offer}"
+        );
+>>>>>>> deploy
         let audio_port = offer
             .lines()
             .find(|l| l.starts_with("m=audio "))
@@ -3220,7 +3515,11 @@ mod ice_lite_tests {
             call_id: None,
             root_session_id: None,
             transport: TransportMode::WebRtc,
+<<<<<<< HEAD
             enable_ice_lite: true,
+=======
+            /* ice-lite rides connectivity */ enable_ice_lite: true,
+>>>>>>> deploy
             ..LegConfig::rtp_pcmu()
         };
         let rtc = build_rtc_config(&cfg);
@@ -3239,7 +3538,11 @@ mod ice_lite_tests {
             call_id: None,
             root_session_id: None,
             transport: TransportMode::Srtp,
+<<<<<<< HEAD
             enable_ice_lite: true,
+=======
+            /* ice-lite rides connectivity */ enable_ice_lite: true,
+>>>>>>> deploy
             ..LegConfig::rtp_pcmu()
         });
         assert_eq!(
@@ -3260,4 +3563,78 @@ mod ice_lite_tests {
         let pc = track.get_peer_connection().await.expect("pc");
         assert_eq!(pc.config().connectivity, Connectivity::Ice);
     }
+<<<<<<< HEAD
+=======
+
+    #[tokio::test]
+    async fn offered_audio_pt_map_works_before_and_after_negotiation() {
+        let mut cfg = LegConfig::rtp_pcmu();
+        cfg.codecs = vec![
+            CodecInfo {
+                payload_type: 106,
+                codec: CodecType::Opus,
+                clock_rate: 48_000,
+                channels: 2,
+                fmtp: None,
+            },
+            CodecInfo {
+                payload_type: 18,
+                codec: CodecType::G729,
+                clock_rate: 8000,
+                channels: 1,
+                fmtp: None,
+            },
+            CodecInfo {
+                payload_type: 0,
+                codec: CodecType::PCMU,
+                clock_rate: 8000,
+                channels: 1,
+                fmtp: None,
+            },
+            CodecInfo {
+                payload_type: 102,
+                codec: CodecType::TelephoneEvent,
+                clock_rate: 8000,
+                channels: 1,
+                fmtp: Some("0-16".to_string()),
+            },
+        ];
+        let leg = LegInner::new("uac", &cfg, None).expect("leg");
+        let _offer = leg.create_offer().await.expect("create_offer");
+
+        // Before answer arrives: negotiated() is still None, but offered_audio_pt_map()
+        // already knows all offered audio PTs (including dynamic Opus 106) and excludes DTMF.
+        assert!(leg.negotiated().is_none());
+        let pre_answer = leg.offered_audio_pt_map();
+        assert_eq!(pre_answer.get(&106), Some(&CodecType::Opus));
+        assert_eq!(pre_answer.get(&18), Some(&CodecType::G729));
+        assert_eq!(pre_answer.get(&0), Some(&CodecType::PCMU));
+        assert_eq!(pre_answer.get(&102), None);
+
+        // After answer narrows to G.729 (PT 18) only: offered_audio_pt_map() still
+        // returns the full offer PT map.
+        let answer_sdp = "v=0\r\n\
+            o=- 2 2 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 26186 RTP/AVP 18 102\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:102 telephone-event/8000\r\n\
+            a=sendrecv\r\n";
+        leg.apply_remote_sdp(answer_sdp, SdpType::Answer)
+            .await
+            .expect("apply_remote_sdp");
+        assert_eq!(
+            leg.negotiated().unwrap().audio.unwrap().codec,
+            CodecType::G729
+        );
+        let post_answer = leg.offered_audio_pt_map();
+        assert_eq!(post_answer.get(&18), Some(&CodecType::G729));
+        assert_eq!(post_answer.get(&0), Some(&CodecType::PCMU));
+        assert_eq!(post_answer.get(&106), Some(&CodecType::Opus));
+        assert_eq!(post_answer.get(&102), None);
+        leg.stop();
+    }
+>>>>>>> deploy
 }

@@ -65,7 +65,11 @@ impl TryFrom<RawConfig> for QualityStatsConfig {
     }
 }
 
+<<<<<<< HEAD
 #[derive(Debug, Serialize)]
+=======
+#[derive(Debug, Clone, Serialize)]
+>>>>>>> deploy
 pub struct Range {
     pub min: f64,
     pub max: f64,

@@ -126,10 +126,23 @@ pub struct CalleeDisplayName(pub String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CalleeOfflineMarker;
 
+<<<<<<< HEAD
+=======
+/// This inbound INVITE is a CLUSTER CHILD leg of an existing logical call:
+/// the peer declared the root session id (CC UUI `leg=` intent) and the
+/// proxy seam adopted it. The logical call's quality inspection, recording
+/// attribution and CDR stay on the ROOT session at the dispatching node —
+/// a second inspection tap here would duplicate the transcript with
+/// side labels interpreted from local leg roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterChildLeg;
+
+>>>>>>> deploy
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundTrunkContext {
     pub id: Option<i64>,
     pub name: String,
+    /// Configured signaling next hop, including the outbound proxy when used.
     pub dest: Option<String>,
     pub tenant_id: Option<i64>,
 }
@@ -157,4 +170,20 @@ pub struct TrunkContext {
     pub id: Option<i64>,
     pub name: String,
     pub did_numbers: Vec<String>,
+}
+
+/// INVITE-with-Replaces takeover context (attended transfer executed by the
+/// transferee UA per the REFER-Replaces chain). Carries the verbatim
+/// `Replaces` header value from the inbound INVITE; the session attaches it
+/// to the outbound target leg INVITE so the target UA auto-answers it as a
+/// replacement of its own dialog (no second ring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferReplacesContext {
+    pub header: String,
+    /// True when this INVITE is being DELEGATED to the peer node that owns
+    /// the replaced session (the takeover will run THERE): the outbound
+    /// home-proxy hop must carry the Replaces header verbatim (the peer's
+    /// gate consumes it and runs the local takeover) instead of the usual
+    /// direct-to-registration routing.
+    pub delegate_via_home_proxy: bool,
 }

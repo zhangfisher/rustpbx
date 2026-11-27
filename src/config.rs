@@ -1803,6 +1803,20 @@ pub struct ProxyConfig {
     /// only `Session-ID` headers inherit and every originate gets a fresh id.
     #[serde(default = "default_session_id_inherit_callid")]
     pub session_id_inherit_callid: bool,
+<<<<<<< HEAD
+=======
+    /// Default custom inbound correlation header for the global session id.
+    /// Trunk-sourced INVITEs consult it when the trunk itself has no
+    /// `session_id_header` override. TRUNK-ONLY: registered clients and
+    /// anonymous peers cannot merge calls by planting it. Values are any
+    /// safe caller-chosen string: non-empty, at most 120 chars, characters
+    /// from `A-Za-z0-9._@-` (safe as a Call-ID part, filename component, and
+    /// DB value); unsafe or empty values are skipped with a warning. Non-hex
+    /// values correlate through the internal channels (events / CDR /
+    /// CallMeta) and skip the RFC wire channels (`Session-ID` header / UUI).
+    #[serde(default)]
+    pub session_id_default_header: Option<String>,
+>>>>>>> deploy
     pub t1_timer: Option<u64>,
     pub t1x64_timer: Option<u64>,
     pub ssl_private_key: Option<String>,
@@ -1982,6 +1996,18 @@ pub struct ProxyConfig {
     /// `history_info` overrides this.
     #[serde(default)]
     pub history_info: bool,
+<<<<<<< HEAD
+=======
+    /// Attended-transfer execution path: when enabled (default), the
+    /// transferor's REFER(Replaces) is RELAYED to the transferee UA, which
+    /// executes the standard transferee role — INVITE(Replaces) toward the
+    /// target — and the replacement attaches in-session as a normal bridge
+    /// (no conference room). When disabled (or the transferee's trunk
+    /// disables `refer_replaces`, or the relay fails), the transfer falls
+    /// back to the server-side transfer room.
+    #[serde(default = "default_true")]
+    pub refer_replaces_relay: bool,
+>>>>>>> deploy
     /// SIP conference factory URI. Disabled when unset.
     #[serde(default)]
     pub conference_factory_uri: Option<String>,
@@ -2047,6 +2073,18 @@ pub struct ProxyConfig {
     /// PBX-wide queue wait music (`[proxy] queue_hold_music`). Fills the
     /// queue wait audio when the queue itself has no
     /// `[proxy.queues.<name>.hold].audio_file`; per-queue config wins.
+<<<<<<< HEAD
+=======
+    ///
+    /// When unset, the queue wait audio falls back to the built-in guzheng
+    /// loop `sounds/queue-waiting-8k.wav` (see
+    /// [`ProxyConfig::queue_wait_music`]) — a queued caller should hear
+    /// waiting music, **not** the agent ringback. The ringback
+    /// (`sounds/phone-calling.wav`) is reserved for the phase where an agent
+    /// leg is actually ringing (`queue_agent_ringback_enabled`), so
+    /// "waiting in queue" and "an agent is ringing" are two distinct
+    /// sounds.
+>>>>>>> deploy
     #[serde(default)]
     pub queue_hold_music: Option<String>,
     /// Allow pre-connect queue transfer prompts, including queue and escalation overrides.
@@ -2226,6 +2264,14 @@ pub struct DialplanHints {
     pub bypass_media: Option<bool>,
     pub max_duration: Option<std::time::Duration>,
     pub max_ring_time: Option<std::time::Duration>,
+<<<<<<< HEAD
+=======
+    /// Call-wide max ring/setup time across all sequential targets (failover
+    /// attempts). Overrides `[proxy].max_ring_time` for the whole call and
+    /// never triggers a retry when it expires. Separate from `max_ring_time`,
+    /// which limits an individual target's attempt in a multi-target sequence.
+    pub call_max_ring_time: Option<std::time::Duration>,
+>>>>>>> deploy
     pub enable_sipflow: Option<bool>,
     pub allow_codecs: Option<Vec<String>>,
     pub extensions: http::Extensions,
@@ -2277,6 +2323,10 @@ impl std::fmt::Debug for DialplanHints {
             .field("bypass_media", &self.bypass_media)
             .field("max_duration", &self.max_duration)
             .field("max_ring_time", &self.max_ring_time)
+<<<<<<< HEAD
+=======
+            .field("call_max_ring_time", &self.call_max_ring_time)
+>>>>>>> deploy
             .field("enable_sipflow", &self.enable_sipflow)
             .field("disable_ice_servers", &self.disable_ice_servers)
             .field("media_mode", &self.media_mode)
@@ -2586,6 +2636,26 @@ impl ProxyConfig {
         self.max_subscription_expires.unwrap_or(3600).max(60)
     }
 
+<<<<<<< HEAD
+=======
+    /// Audio the queue app plays while the caller is **waiting** for an
+    /// agent (queued / no agent available / between attempts).
+    ///
+    /// Priority: `queue_hold_music` > built-in
+    /// [`DEFAULT_QUEUE_WAIT_AUDIO`](crate::call::DEFAULT_QUEUE_WAIT_AUDIO)
+    /// (an original piano loop shipped with the PBX). The agent-ringback
+    /// phase keeps its own sound (`DEFAULT_QUEUE_HOLD_AUDIO`, gated by
+    /// `queue_agent_ringback_enabled`), so a caller can tell "I am queued"
+    /// (waiting music) from "an agent's phone is ringing" (ringback).
+    pub fn queue_wait_music(&self) -> Option<String> {
+        Some(
+            self.queue_hold_music
+                .clone()
+                .unwrap_or_else(|| crate::call::DEFAULT_QUEUE_WAIT_AUDIO.to_string()),
+        )
+    }
+
+>>>>>>> deploy
     pub fn session_timer_mode(&self) -> SessionTimerMode {
         if !self.session_timer {
             SessionTimerMode::Off
@@ -2737,6 +2807,10 @@ impl Default for ProxyConfig {
             session_id_length: default_session_id_length(),
             session_id_header_mode: Default::default(),
             session_id_inherit_callid: default_session_id_inherit_callid(),
+<<<<<<< HEAD
+=======
+            session_id_default_header: None,
+>>>>>>> deploy
             modules: Some(vec![
                 "acl".to_string(),
                 "auth".to_string(),
@@ -2808,6 +2882,10 @@ impl Default for ProxyConfig {
             inbound_refer_in_session: true,
             diversion_headers: false,
             history_info: false,
+<<<<<<< HEAD
+=======
+            refer_replaces_relay: true,
+>>>>>>> deploy
             conference_factory_uri: None,
             conference_empty_timeout_secs: default_conference_empty_timeout_secs(),
             route_originated_calls: false,
@@ -3681,6 +3759,153 @@ bucket = "default-recordings"
             config.callrecord.as_ref().unwrap().storage,
             CallRecordStorageConfig::S3 { .. }
         ));
+    }
+
+    /// 排队/等坐席两段声音（产品 2026-11-14）：等待音优先
+    /// `queue_hold_music`，其次 `hold_music`；只有坐席腿真的 180 时才换
+    /// 成 `DEFAULT_QUEUE_HOLD_AUDIO` 回铃音（由 `queue_agent_ringback_enabled`
+    /// 门控）——避免"排队"被听成"坐席在振铃"。
+    #[test]
+    fn queue_wait_music_defaults_to_the_builtin_loop_and_prefers_queue_hold() {
+        // Unconfigured: the built-in piano loop, never the agent ringback.
+        let mut p = ProxyConfig::default();
+        assert_eq!(
+            p.queue_wait_music().as_deref(),
+            Some(crate::call::DEFAULT_QUEUE_WAIT_AUDIO)
+        );
+        assert_ne!(
+            p.queue_wait_music().as_deref(),
+            Some(crate::call::DEFAULT_QUEUE_HOLD_AUDIO)
+        );
+        // `hold_music` alone no longer leaks into the queue waiting audio.
+        p.hold_music = Some("sounds/moh/hold.wav".into());
+        assert_eq!(
+            p.queue_wait_music().as_deref(),
+            Some(crate::call::DEFAULT_QUEUE_WAIT_AUDIO)
+        );
+        // Explicit queue music wins.
+        p.queue_hold_music = Some("sounds/moh/queue.wav".into());
+        assert_eq!(p.queue_wait_music().as_deref(), Some("sounds/moh/queue.wav"));
+        // The built-in file is shipped alongside the ringback.
+        let builtin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join(crate::call::DEFAULT_QUEUE_WAIT_AUDIO);
+        assert!(
+            builtin.is_file(),
+            "missing built-in queue waiting music: {}",
+            builtin.display()
+        );
+    }
+
+    #[test]
+    fn test_proxy_parses_global_audio_defaults() {
+        let toml_str = r#"
+            [proxy]
+            addr = "0.0.0.0"
+            hold_music = "sounds/hold.wav"
+            queue_hold_music = "sounds/moh/kzmusic.wav"
+            queue_transfer_prompt_enabled = false
+            queue_comfort_prompt_enabled = false
+            queue_busy_prompt_enabled = false
+            queue_agent_ringback_enabled = true
+            queue_no_answer_prompt_enabled = false
+            voicemail_greeting = "sounds/voicemail/custom.wav"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("config should parse");
+        assert_eq!(
+            config.proxy.queue_hold_music.as_deref(),
+            Some("sounds/moh/kzmusic.wav")
+        );
+        assert_eq!(
+            config.proxy.voicemail_greeting.as_deref(),
+            Some("sounds/voicemail/custom.wav")
+        );
+        assert_eq!(config.proxy.hold_music.as_deref(), Some("sounds/hold.wav"));
+        assert!(!config.proxy.queue_transfer_prompt_enabled);
+        assert!(!config.proxy.queue_comfort_prompt_enabled);
+        assert!(!config.proxy.queue_busy_prompt_enabled);
+        assert!(config.proxy.queue_agent_ringback_enabled);
+        assert!(!config.proxy.queue_no_answer_prompt_enabled);
+
+        // Unset keys stay None — old configs keep working unchanged.
+        let empty: Config =
+            toml::from_str("[proxy]\naddr = \"0.0.0.0\"\n").expect("minimal config");
+        assert!(empty.proxy.queue_hold_music.is_none());
+        assert!(empty.proxy.voicemail_greeting.is_none());
+        assert!(empty.proxy.hold_music.is_none());
+        assert!(empty.proxy.queue_transfer_prompt_enabled);
+        assert!(empty.proxy.queue_comfort_prompt_enabled);
+        assert!(empty.proxy.queue_busy_prompt_enabled);
+        assert!(!empty.proxy.queue_agent_ringback_enabled);
+        assert!(empty.proxy.queue_no_answer_prompt_enabled);
+    }
+
+    #[test]
+    fn test_config_parses_s3_without_credentials_as_anonymous() {
+        let toml_str = r#"
+            http_addr = "0.0.0.0:8080"
+
+            [proxy]
+            addr = "0.0.0.0"
+
+            [callrecord]
+            type = "s3"
+            vendor = "minio"
+            bucket = "public"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+
+            [recording]
+            enabled = true
+            type = "s3"
+            vendor = "minio"
+            bucket = "public"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+
+            [sipflow]
+            type = "local"
+            root = "./sipflow"
+
+            [sipflow.upload]
+            type = "s3"
+            vendor = "minio"
+            bucket = "public"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+            root = "sipflow"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("Config should parse");
+
+        let CallRecordStorageConfig::S3 {
+            access_key,
+            secret_key,
+            ..
+        } = &config.callrecord.expect("callrecord").storage
+        else {
+            panic!("expected s3 callrecord storage");
+        };
+        assert!(access_key.is_none());
+        assert!(secret_key.is_none());
+
+        let policy = config.recording.expect("recording policy");
+        assert!(policy.access_key.is_none());
+        assert!(policy.secret_key.is_none());
+
+        let upload = match config.sipflow.expect("sipflow") {
+            SipFlowConfig::Local { upload, .. } => upload,
+            SipFlowConfig::Remote { .. } => panic!("expected local sipflow backend"),
+        };
+        let Some(SipFlowUploadConfig::S3 {
+            access_key,
+            secret_key,
+            ..
+        }) = upload
+        else {
+            panic!("expected s3 sipflow upload");
+        };
+        assert!(access_key.is_none());
+        assert!(secret_key.is_none());
     }
 
     #[test]

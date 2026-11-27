@@ -14,7 +14,10 @@ struct LegData {
     media_leg: Option<crate::media::leg::Leg>,
     transport: Option<crate::media::TransportMode>,
     answer: Option<String>,
+<<<<<<< HEAD
     has_video: bool,
+=======
+>>>>>>> deploy
     tasks: Vec<JoinHandle<()>>,
     conference_bridge: Option<ConferenceBridgeHandle>,
     /// Per-leg typed extensions bag — same shape as the session bag, so
@@ -31,7 +34,10 @@ impl LegData {
             media_leg: None,
             transport: None,
             answer: None,
+<<<<<<< HEAD
             has_video: false,
+=======
+>>>>>>> deploy
             tasks: Vec::new(),
             conference_bridge: None,
             extensions: SessionExtensions::new(),
@@ -146,6 +152,7 @@ impl LegRegistry {
     }
 
     pub fn leg_has_video(&self, id: &LegId) -> bool {
+<<<<<<< HEAD
         self.legs.get(id).map(|d| d.has_video).unwrap_or(false)
     }
 
@@ -153,6 +160,11 @@ impl LegRegistry {
         if let Some(data) = self.legs.get_mut(id) {
             data.has_video = has_video;
         }
+=======
+        self.media_leg(id)
+            .and_then(|leg| leg.negotiated())
+            .is_some_and(|profile| !profile.video.is_empty())
+>>>>>>> deploy
     }
 
     pub fn push_task(&mut self, id: LegId, handle: JoinHandle<()>) {

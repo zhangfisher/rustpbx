@@ -445,6 +445,11 @@ impl BuiltinAppFactory {
                 config.ring_timeout = plan.ring_timeout;
                 // Per-call ACD priority from app params / plan (0 = default).
                 config.priority = plan.priority;
+<<<<<<< HEAD
+=======
+                // Wait-for-callback option (default disabled).
+                config.callback = plan.callback.clone().unwrap_or_default();
+>>>>>>> deploy
                 // Build agent locations from resolved URIs
                 let agents: Vec<crate::call::Location> = pending
                     .agent_uris
@@ -493,7 +498,11 @@ impl BuiltinAppFactory {
                     if plan.hold.is_none() {
                         plan.hold = Some(
                             crate::call::QueueHoldConfig::default()
+<<<<<<< HEAD
                                 .with_audio_file(crate::call::DEFAULT_QUEUE_HOLD_AUDIO.to_string()),
+=======
+                                .with_audio_file(crate::call::DEFAULT_QUEUE_WAIT_AUDIO.to_string()),
+>>>>>>> deploy
                         );
                         config.hold = plan.hold.clone();
                     }

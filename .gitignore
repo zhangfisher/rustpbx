@@ -92,13 +92,22 @@ Weixin*.png
 *.log.*
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> deploy
 builds
 autopub-musl
 .output
 autopub
 autopub.exe
+<<<<<<< HEAD
 =======
 
 
 /ddocs
 >>>>>>> origin/main
+=======
+
+/ddocs
+/rustpbx.zip
+>>>>>>> deploy

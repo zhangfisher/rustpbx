@@ -129,6 +129,11 @@ async fn scoped_transfer_review_rejected_route_keeps_concurrency_available() {
                 target: "sip:9000@rustpbx.com".into(),
                 headers: HashMap::new(),
                 application_only: true,
+<<<<<<< HEAD
+=======
+                operator_agent: None,
+                operator_leg_hint: None,
+>>>>>>> deploy
                 completion: None,
             },
             Some(&mut states),

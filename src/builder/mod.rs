@@ -147,6 +147,11 @@ impl AppBuilder {
             return Ok(());
         }
 
+<<<<<<< HEAD
+=======
+        crate::utils::init_instance_identity(&config);
+
+>>>>>>> deploy
         println!("Start at {}", Utc::now());
         println!("{}", version::get_version_info());
 

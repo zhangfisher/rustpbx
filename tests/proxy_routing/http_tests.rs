@@ -61,6 +61,21 @@ mod tests {
         trunks: std::collections::HashMap<String, rustpbx::proxy::routing::TrunkConfig>,
         source_trunk: Option<&str>,
     ) -> Result<rustpbx::call::Dialplan, rustpbx::proxy::call::RouteError> {
+<<<<<<< HEAD
+=======
+        resolve_with_network(response, trunks, Vec::new(), "", source_trunk).await
+    }
+
+    /// As [`resolve_inbound`], with `network_profiles` published through the
+    /// trunk registrar (the live view the router resolves profiles from).
+    async fn resolve_with_network(
+        response: serde_json::Value,
+        trunks: std::collections::HashMap<String, rustpbx::proxy::routing::TrunkConfig>,
+        network_profiles: Vec<rustpbx::config::NetworkProfile>,
+        default_profile_id: &str,
+        source_trunk: Option<&str>,
+    ) -> Result<rustpbx::call::Dialplan, rustpbx::proxy::call::RouteError> {
+>>>>>>> deploy
         let cookie = TransactionCookie::default();
         if let Some(name) = source_trunk {
             cookie.insert_extension(rustpbx::call::TrunkContext {
@@ -85,13 +100,28 @@ mod tests {
             fallback_to_static: false,
             timeout_ms: Some(1000),
         };
+<<<<<<< HEAD
+=======
+        let data_context = data_context(trunks).await;
+        if !network_profiles.is_empty() {
+            data_context.trunk_registrar().set_network_profiles(
+                network_profiles,
+                default_profile_id.to_string(),
+                rustpbx::config::ProxyConfig::default(),
+            );
+        }
+>>>>>>> deploy
         let router = HttpCallRouter::new(
             config,
             ArcSwap::new(Arc::new(RtpConfig::default())),
             ArcSwap::new(Arc::new(MediaProxyMode::None)),
             true,
             None,
+<<<<<<< HEAD
             data_context(trunks).await,
+=======
+            data_context,
+>>>>>>> deploy
         );
 
         let request = rsipstack::sip::Request {
@@ -1308,7 +1338,11 @@ mod tests {
     async fn test_http_router_trunk_targets_inherit_trunk_config_and_retry() {
         let trunks = [
             ("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", Some(vec![408, 503]))),
+<<<<<<< HEAD
             ("carrier-b".to_string(), trunk("sip:10.0.0.2:5080", None)),
+=======
+            ("carrier-b".to_string(), trunk("carrier-b.example.com:5080", None)),
+>>>>>>> deploy
         ]
         .into();
         let plan = resolve_with_trunks(json!({
@@ -1331,7 +1365,15 @@ mod tests {
         assert_eq!(attempts[0].location.aor.to_string(), "sip:target@10.0.0.1:5060");
         assert_eq!(attempts[0].location.destination.as_ref().unwrap().addr.to_string(), "10.0.0.1:5060");
         assert_eq!(attempts[0].location.credential.as_ref().unwrap().username, "acct");
+<<<<<<< HEAD
         assert_eq!(attempts[1].location.aor.to_string(), "sip:8613800000000@10.0.0.2:5080");
+=======
+        assert_eq!(attempts[1].location.aor.to_string(), "sip:8613800000000@carrier-b.example.com:5080");
+        assert_eq!(
+            attempts[1].location.destination.as_ref().unwrap().addr.to_string(),
+            "carrier-b.example.com:5080"
+        );
+>>>>>>> deploy
         assert_eq!(outbound_trunk(&attempts[0]), "carrier-a");
         assert_eq!(outbound_trunk(&attempts[1]), "carrier-b");
         assert_eq!(
@@ -1353,6 +1395,7 @@ mod tests {
     }
 
     #[tokio::test]
+<<<<<<< HEAD
     async fn test_http_router_single_trunk_target_ring_time_limits_call() {
         let trunks = [("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", None))].into();
         let plan = resolve_with_trunks(
@@ -1362,6 +1405,71 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(plan.max_ring_time, Some(std::time::Duration::from_secs(20)));
+=======
+    async fn test_http_router_keeps_trunk_and_call_ring_times_separate() {
+        let cases = [
+            (
+                json!({"action": "forward", "targets": [{"trunk": "carrier-a"}]}),
+                None,
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "targets": [{"trunk": "carrier-a"}],
+                    "max_ring_time": 45
+                }),
+                Some(std::time::Duration::from_secs(45)),
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "strategy": "parallel",
+                    "targets": [{"trunk": "carrier-a"}],
+                }),
+                None,
+            ),
+            (
+                json!({
+                    "action": "forward",
+                    "strategy": "parallel",
+                    "targets": [{"trunk": "carrier-a"}],
+                    "max_ring_time": 45
+                }),
+                Some(std::time::Duration::from_secs(45)),
+            ),
+        ];
+
+        for (response, call_ring_time) in cases {
+            let trunks = [("carrier-a".to_string(), trunk("sip:10.0.0.1:5060", None))].into();
+            let plan = resolve_with_trunks(response, trunks).await.unwrap();
+            assert_eq!(plan.max_ring_time, call_ring_time);
+
+            let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+                panic!("expected sequential targets");
+            };
+            let [attempt] = attempts.as_slice() else {
+                panic!("expected one trunk attempt");
+            };
+            assert_eq!(attempt.max_ring_time, Some(std::time::Duration::from_secs(20)));
+        }
+
+        let mut untimed_trunk = trunk("sip:10.0.0.1:5060", None);
+        untimed_trunk.max_ring_time = None;
+        let plan = resolve_with_trunks(
+            json!({
+                "action": "forward",
+                "strategy": "parallel",
+                "targets": [{"trunk": "carrier-a"}],
+            }),
+            [("carrier-a".to_string(), untimed_trunk)].into(),
+        )
+        .await
+        .unwrap();
+        let DialplanFlow::Targets(DialStrategy::Parallel(targets)) = plan.flow else {
+            panic!("expected parallel targets without an attempt timer");
+        };
+        assert_eq!(targets.len(), 1);
+>>>>>>> deploy
     }
 
     #[tokio::test]
@@ -1465,4 +1573,164 @@ mod tests {
         assert_eq!(attempts[0].hints.as_ref().unwrap().network_profile_id.as_deref(), Some("arrival"));
         assert_eq!(attempts[1].hints.as_ref().unwrap().network_profile_id.as_deref(), Some("dest"));
     }
+<<<<<<< HEAD
+=======
+
+    fn network_profile(id: &str, external_ip: &str, bind_ip: &str) -> rustpbx::config::NetworkProfile {
+        rustpbx::config::NetworkProfile {
+            id: id.to_string(),
+            label: None,
+            description: None,
+            external_ip: Some(external_ip.to_string()),
+            auto_external_ip: None,
+            sip_external_ip: None,
+            auto_sip_external_ip: None,
+            local_networks: Vec::new(),
+            contact_lan_use_bind: false,
+            sip_contact_always_bind: false,
+            bind_ip: Some(bind_ip.to_string()),
+            rtp_start_port: None,
+            rtp_end_port: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_router_caller_media_network_from_arrival_trunk() {
+        // Mirror of the static matcher: the arrival trunk's profile serves
+        // the caller leg, not just the callee attempts.
+        let mut arrival = trunk("sip:192.0.2.9", None);
+        arrival.profile = Some("wan".to_string());
+        let trunks = [("carrier-in".to_string(), arrival)].into();
+        let plan = resolve_with_network(
+            json!({"action": "forward", "targets": ["sip:legacy@example.com"]}),
+            trunks,
+            vec![network_profile("wan", "203.0.113.1", "10.0.0.50")],
+            "wan",
+            Some("carrier-in"),
+        ).await.unwrap();
+        assert_eq!(plan.caller_media_network.external_ip.as_deref(), Some("203.0.113.1"));
+        assert_eq!(plan.caller_media_network.bind_ip.as_deref(), Some("10.0.0.50"));
+
+        // Explicit trunk IPs apply over the profile, as in the static matcher.
+        let mut arrival = trunk("sip:192.0.2.9", None);
+        arrival.profile = Some("wan".to_string());
+        arrival.external_ip = Some("198.51.100.1".to_string());
+        arrival.bind_ip = Some("10.0.0.9".to_string());
+        let trunks = [("carrier-in".to_string(), arrival)].into();
+        let plan = resolve_with_network(
+            json!({"action": "forward", "targets": ["sip:legacy@example.com"]}),
+            trunks,
+            vec![network_profile("wan", "203.0.113.1", "10.0.0.50")],
+            "wan",
+            Some("carrier-in"),
+        ).await.unwrap();
+        assert_eq!(plan.caller_media_network.external_ip.as_deref(), Some("198.51.100.1"));
+        assert_eq!(plan.caller_media_network.bind_ip.as_deref(), Some("10.0.0.9"));
+
+        // No arrival trunk: the caller leg keeps the global baseline.
+        let plan = resolve_with_response(json!({
+            "action": "forward", "targets": ["sip:legacy@example.com"]
+        })).await.unwrap();
+        assert!(plan.caller_media_network.external_ip.is_none());
+        assert!(plan.caller_media_network.bind_ip.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_router_network_profile_replaces_uri_target_profile() {
+        let mut arrival = trunk("sip:192.0.2.9", None);
+        arrival.profile = Some("arrival".to_string());
+        arrival.external_ip = Some("198.51.100.1".to_string());
+        let mut own = trunk("sip:10.0.0.2", None);
+        own.profile = Some("dest".to_string());
+        let trunks = [
+            ("carrier-in".to_string(), arrival),
+            ("own-profile".to_string(), own),
+        ]
+        .into();
+        let plan = resolve_inbound(json!({
+            "action": "forward",
+            "network_profile_id": "wan",
+            "targets": ["sip:legacy@example.com", {"trunk": "own-profile"}]
+        }), trunks, Some("carrier-in")).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        // The URI target dials the response's profile, over the arrival
+        // trunk's; the arrival trunk's explicit IPs stay untouched.
+        let hints = attempts[0].hints.as_ref().expect("attempt hints");
+        assert_eq!(hints.network_profile_id.as_deref(), Some("wan"));
+        assert_eq!(hints.external_ip.as_deref(), Some("198.51.100.1"));
+        // A trunk target keeps its own profile.
+        assert_eq!(attempts[1].hints.as_ref().unwrap().network_profile_id.as_deref(), Some("dest"));
+    }
+
+    #[tokio::test]
+    async fn test_http_router_network_profile_without_arrival_trunk() {
+        // An internal call to a pure-URI target still gets the response's
+        // profile, so Contact / SDP come from that network, not the default.
+        let plan = resolve_with_response(json!({
+            "action": "forward",
+            "network_profile_id": "wan",
+            "targets": ["sip:legacy@example.com"]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        let hints = attempts[0].hints.as_ref().expect("attempt hints");
+        assert_eq!(hints.network_profile_id.as_deref(), Some("wan"));
+        assert!(hints.external_ip.is_none());
+        assert!(hints.bind_ip.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_http_router_network_profile_downgrades_parallel_to_sequential() {
+        // Parallel dialing carries no per-attempt hints, so a profiled
+        // response dials sequentially to keep the profile.
+        let plan = resolve_with_response(json!({
+            "action": "forward",
+            "network_profile_id": "wan",
+            "strategy": "parallel",
+            "targets": ["sip:first@example.com", "sip:second@example.com"]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        assert_eq!(attempts.len(), 2);
+        for attempt in &attempts {
+            assert_eq!(
+                attempt.hints.as_ref().unwrap().network_profile_id.as_deref(),
+                Some("wan")
+            );
+        }
+
+        // Trunk targets only: the response's id is unused (trunk profiles
+        // live in per-attempt hints, which parallel dialing drops — a
+        // pre-existing gap), so parallel dialing is preserved.
+        let trunks = [
+            ("carrier-a".to_string(), trunk("sip:10.0.0.1", None)),
+            ("carrier-b".to_string(), trunk("sip:10.0.0.2", None)),
+        ]
+        .into();
+        let plan = resolve_with_trunks(json!({
+            "action": "forward",
+            "network_profile_id": "wan",
+            "strategy": "parallel",
+            "targets": [{"trunk": "carrier-a"}, {"trunk": "carrier-b"}]
+        }), trunks).await.unwrap();
+        assert!(matches!(plan.flow, DialplanFlow::Targets(DialStrategy::Parallel(_))));
+    }
+
+    #[tokio::test]
+    async fn test_http_router_blank_network_profile_is_ignored() {
+        let plan = resolve_with_response(json!({
+            "action": "forward",
+            "network_profile_id": "  ",
+            "targets": ["sip:legacy@example.com"]
+        })).await.unwrap();
+        let DialplanFlow::Targets(DialStrategy::Sequential(attempts)) = plan.flow else {
+            panic!("expected sequential targets");
+        };
+        assert!(attempts[0].hints.is_none());
+    }
+>>>>>>> deploy
 }

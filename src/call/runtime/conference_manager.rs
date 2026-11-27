@@ -217,6 +217,18 @@ impl ParticipantChannels {
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Sample rate of the conference mix bus.
+///
+/// 16 kHz is the common denominator for the codecs a room can carry: G.722
+/// is native (no conversion), PCMU/PCMA are filtered upsamples, and Opus
+/// (48 kHz) is filtered down once on ingress and once on egress. Mixing at
+/// 8 kHz threw away G.722's wideband half and forced an unfiltered
+/// decimation that folded 4-8 kHz energy back into the voice band.
+pub const CONFERENCE_MIXER_SAMPLE_RATE: u32 = 16_000;
+
+>>>>>>> deploy
 /// Everything owned by one live conference. Room state, audio mixer, and
 /// the max-duration watchdog token share a lifecycle (create → destroy);
 /// folding them into one entry replaces three parallel conference-keyed
@@ -305,11 +317,18 @@ impl ConferenceManager {
         // overwriting a room whose mixer may already be running (a leaked
         // permanently-running task).
         use dashmap::mapref::entry::Entry;
+<<<<<<< HEAD
         // 16 kHz mix bus: G.722 legs (16 kHz PCM) pass through untouched, while
         // 8 kHz PCMU and 48 kHz Opus legs are resampled by the bridge's
         // anti-aliased FIR — downmixing everything to 8 kHz would fold the
         // 4-7 kHz band G.722 exists to carry back into the voice band (aliasing).
         let mixer = Arc::new(ConferenceAudioMixer::new(conf_id.0.clone(), crate::media::conference_mixer::CONFERENCE_MIXER_SAMPLE_RATE));
+=======
+        let mixer = Arc::new(ConferenceAudioMixer::new(
+            conf_id.0.clone(),
+            CONFERENCE_MIXER_SAMPLE_RATE,
+        ));
+>>>>>>> deploy
         match self.conferences.entry(conf_id.clone()) {
             Entry::Vacant(e) => {
                 e.insert(ConferenceState {
@@ -418,6 +437,7 @@ impl ConferenceManager {
         self.conferences.get(conf_id).map(|v| v.room.clone())
     }
 
+<<<<<<< HEAD
     /// Mix-bus sample rate of a live conference. Media bridges resample each
     /// leg's decoded PCM to this rate on ingress and the mixed audio back to
     /// the leg's encoder rate on egress — never hard-code 8 kHz here.
@@ -425,6 +445,8 @@ impl ConferenceManager {
         self.conferences.get(conf_id).map(|s| s.mixer.sample_rate())
     }
 
+=======
+>>>>>>> deploy
     /// Bind an attached SIP participant to its owning session's command queue.
     pub(crate) fn bind_participant_session(
         &self,
@@ -635,6 +657,17 @@ impl ConferenceManager {
         self.leg_attachments
             .get(leg_id)
             .map(|a| ParticipantChannels::new(a.input_tx.clone()))
+<<<<<<< HEAD
+=======
+    }
+
+    /// Sample rate of a room's mix bus, `None` when the room does not exist.
+    /// The DashMap shard guard is dropped before returning (no await here).
+    pub fn conference_sample_rate(&self, conf_id: &ConferenceId) -> Option<u32> {
+        self.conferences
+            .get(conf_id)
+            .map(|state| state.mixer.sample_rate())
+>>>>>>> deploy
     }
 
     /// Get participant output receiver for mixed audio (to participant)

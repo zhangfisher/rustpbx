@@ -372,7 +372,11 @@ async fn match_invite_impl(
         }
         if let Some(max_ring_time) = rule.max_ring_time {
             let hints = hints.get_or_insert_with(DialplanHints::default);
+<<<<<<< HEAD
             hints.max_ring_time =
+=======
+            hints.call_max_ring_time =
+>>>>>>> deploy
                 (max_ring_time > 0).then(|| std::time::Duration::from_secs(max_ring_time as u64));
         }
         if let Some(busy_wait) = rule.action.busy_wait.as_ref().filter(|bw| bw.enabled) {
@@ -1468,7 +1472,11 @@ pub fn stamp_trunk(
 ) -> Result<()> {
     apply_trunk_config(option, trunk)?;
     merge_trunk_media_hints(hints, trunk);
+<<<<<<< HEAD
     attach_outbound_trunk_metadata(hints, trunk_name, trunk);
+=======
+    attach_outbound_trunk_metadata(hints, trunk_name, trunk, option.destination.as_ref());
+>>>>>>> deploy
     Ok(())
 }
 
@@ -1476,24 +1484,30 @@ fn attach_outbound_trunk_metadata(
     hints: &mut Option<DialplanHints>,
     trunk_name: &str,
     trunk: &TrunkConfig,
+    destination: Option<&SipAddr>,
 ) {
     let hints = hints.get_or_insert_with(DialplanHints::default);
     hints.extensions.insert(crate::call::OutboundTrunkContext {
         id: trunk.id,
         name: trunk_name.to_string(),
-        dest: Some(trunk.dest.clone()),
+        dest: destination.map(|address| address.addr.to_string()),
         tenant_id: None,
     });
 }
 
 /// Apply trunk configuration
 pub fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig) -> Result<()> {
+<<<<<<< HEAD
     // Set destination
     let dest_uri: rsipstack::sip::Uri = trunk
         .dest
         .as_str()
         .try_into()
         .map_err(|e| anyhow!("Invalid trunk destination '{}': {:?}", trunk.dest, e))?;
+=======
+    let dest_uri = super::parse_trunk_uri(&trunk.dest)
+        .map_err(|e| anyhow!("Invalid trunk destination '{}': {e}", trunk.dest))?;
+>>>>>>> deploy
 
     let transport = trunk
         .transport
@@ -1508,7 +1522,11 @@ pub fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig) -> Res
         .map(str::trim)
         .filter(|proxy| !proxy.is_empty())
     {
+<<<<<<< HEAD
         Some(proxy) => crate::proxy::trunk_registrar::parse_server_uri(proxy)
+=======
+        Some(proxy) => super::parse_trunk_uri(proxy)
+>>>>>>> deploy
             .map_err(|e| anyhow!("Invalid trunk outbound proxy '{}': {}", proxy, e))?,
         None => dest_uri.clone(),
     };
@@ -1810,19 +1828,39 @@ mod apply_trunk_config_tests {
             ..Default::default()
         };
         let mut option = option();
+<<<<<<< HEAD
         apply_trunk_config(&mut option, &trunk).unwrap();
+=======
+        let mut hints = None;
+        stamp_trunk(&mut option, &mut hints, "carrier", &trunk).unwrap();
+>>>>>>> deploy
 
         let destination = option.destination.unwrap();
         assert_eq!(destination.addr.to_string(), "sbc.carrier.example:5070");
         assert_eq!(destination.r#type, Some(rsipstack::sip::Transport::Tcp));
+<<<<<<< HEAD
+=======
+        let hints = hints.unwrap();
+        let trunk = hints
+            .extensions
+            .get::<crate::call::OutboundTrunkContext>()
+            .unwrap();
+        assert_eq!(trunk.dest.as_deref(), Some("sbc.carrier.example:5070"));
+>>>>>>> deploy
         assert_eq!(option.callee.to_string(), "sip:+15550100@registrar.carrier.example");
         assert_eq!(option.caller.to_string(), "sip:alice@registrar.carrier.example");
     }
 
     #[test]
+<<<<<<< HEAD
     fn sends_to_dest_without_outbound_proxy() {
         let trunk = TrunkConfig {
             dest: "sip:registrar.carrier.example:5080".to_string(),
+=======
+    fn sends_to_bare_hostname_and_port_without_outbound_proxy() {
+        let trunk = TrunkConfig {
+            dest: "registrar.carrier.example:5080".to_string(),
+>>>>>>> deploy
             outbound_proxy: Some("  ".to_string()),
             ..Default::default()
         };
@@ -1832,6 +1870,13 @@ mod apply_trunk_config_tests {
             option.destination.unwrap().addr.to_string(),
             "registrar.carrier.example:5080"
         );
+<<<<<<< HEAD
+=======
+        assert_eq!(
+            option.callee.to_string(),
+            "sip:+15550100@registrar.carrier.example:5080"
+        );
+>>>>>>> deploy
     }
 }
 
